@@ -7,6 +7,11 @@
 //!   solo se hace visible en `finish`. Si el escaneo se cancela o el proceso
 //!   muere, la transacción se hace rollback y no queda rastro.
 //! - Esquema con versión (`PRAGMA user_version = 1`) para poder migrar después.
+//! - **Normalización de separadores**: la BD guarda `C:\a\b` (forma canónica
+//!   del SO) y toda escritura/lectura pasa por
+//!   [`crate::platform::path_norm::normalize_path_separators`], de modo que la
+//!   misma ruta escrita como `C:/a/b` (CLI, bash) y consultada como `C:\a\b`
+//!   (UI de Windows) coinciden.
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +21,7 @@ use crate::domain::scan::{
     DirStat, DirWriter, ScanTotals, SeriesPoint, SnapshotStore, SnapshotSummary, StoreError,
 };
 use crate::domain::UsageSample;
+use crate::platform::path_norm::normalize_path_separators;
 
 /// Esquema actual de la base de datos.
 const SCHEMA_VERSION: i32 = 1;
@@ -121,6 +127,11 @@ impl SqliteStore {
     }
 }
 
+/// Clave canónica de ruta para la BD: separadores normalizados al del SO.
+fn to_key(path: &str) -> String {
+    normalize_path_separators(path)
+}
+
 impl SnapshotStore for SqliteStore {
     fn open_writer(
         &mut self,
@@ -133,7 +144,7 @@ impl SnapshotStore for SqliteStore {
         self.conn
             .execute(
                 "INSERT INTO snapshots(root, started_at) VALUES (?1, ?2)",
-                rusqlite::params![root, started_at],
+                rusqlite::params![to_key(root), started_at],
             )
             .map_err(|e| {
                 // Si el INSERT falla la transacción queda abierta: rollback.
@@ -153,6 +164,7 @@ impl SnapshotStore for SqliteStore {
         root: Option<&str>,
         limit: u32,
     ) -> Result<Vec<SnapshotSummary>, StoreError> {
+        let root = root.map(normalize_path_separators);
         let sql = match root {
             Some(_) => {
                 "SELECT id, root, started_at, duration_ms, total_files, total_bytes, read_errors
@@ -236,12 +248,15 @@ impl SnapshotStore for SqliteStore {
             )
             .map_err(db_err("preparando serie temporal"))?;
         let rows = stmt
-            .query_map(rusqlite::params![root, folder, limit], |row| {
-                Ok(SeriesPoint {
-                    measured_at: row.get(0)?,
-                    size_bytes: non_neg(row.get::<_, i64>(1)?),
-                })
-            })
+            .query_map(
+                rusqlite::params![to_key(root), to_key(folder), limit],
+                |row| {
+                    Ok(SeriesPoint {
+                        measured_at: row.get(0)?,
+                        size_bytes: non_neg(row.get::<_, i64>(1)?),
+                    })
+                },
+            )
             .map_err(db_err("leyendo serie"))?;
         let mut points: Vec<SeriesPoint> = rows
             .map(|row| row.map_err(db_err("leyendo punto de serie")))
@@ -258,7 +273,7 @@ impl SnapshotStore for SqliteStore {
                 "DELETE FROM snapshots WHERE root = ?1 AND id NOT IN (
                     SELECT id FROM snapshots WHERE root = ?1 ORDER BY id DESC LIMIT ?2
                 )",
-                rusqlite::params![root, keep],
+                rusqlite::params![to_key(root), keep],
             )
             .map_err(db_err("podando snapshots"))?;
         Ok(())
@@ -300,7 +315,7 @@ impl DirWriter for SqliteDirWriter<'_> {
             let files = i64::try_from(dir.files).unwrap_or(i64::MAX);
             stmt.execute(rusqlite::params![
                 self.id,
-                dir.path,
+                to_key(&dir.path),
                 size,
                 dir.mtime_unix,
                 files
@@ -507,6 +522,55 @@ mod tests {
 
         assert_eq!(store.list_snapshots(Some("C:\\A"), 10).expect("a").len(), 1);
         assert_eq!(store.list_snapshots(Some("C:\\B"), 10).expect("b").len(), 1);
+    }
+
+    #[test]
+    fn mixed_separators_match_one_canonical_form() {
+        let (_tmp, mut store) = open_tmp();
+        // Escrito con separadores `/` (como llega de bash o del modo CLI).
+        let id = {
+            let mut writer = store.open_writer("C:/Mix", 1_000).expect("writer");
+            write_all(&mut writer, &[("C:/Mix/Sub".into(), 50, 0, 1)]);
+            writer.finish(ScanTotals::default(), 10).expect("finish")
+        };
+
+        // Las lecturas con `\` (como llega de la UI de Windows) encuentran
+        // exactamente lo mismo: una sola forma canónica en la BD.
+        assert_eq!(store.dir_count(id), 1);
+        assert_eq!(
+            store
+                .list_snapshots(Some("C:\\Mix"), 10)
+                .expect("listar")
+                .len(),
+            1
+        );
+        let samples = store.load_dir_samples(id).expect("muestras");
+        assert_eq!(samples[0].path, "C:\\Mix\\Sub");
+        let series = store
+            .folder_series("C:\\Mix", "C:\\Mix\\Sub", 10)
+            .expect("serie");
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].size_bytes, 50);
+
+        // Poda con la forma canónica sobre una raíz guardada con `/`.
+        store.prune("C:\\Mix", 5).expect("podar");
+        assert_eq!(
+            store
+                .list_snapshots(Some("C:\\Mix"), 10)
+                .expect("listar")
+                .len(),
+            1
+        );
+
+        // Segunda escritura con `\` cae en la misma clave: la serie con `/`
+        // sigue encontrando ambos puntos.
+        let mut writer = store.open_writer("C:\\Mix", 2_000).expect("writer 2");
+        write_all(&mut writer, &[("C:\\Mix\\Sub".into(), 80, 0, 1)]);
+        writer.finish(ScanTotals::default(), 5).expect("finish 2");
+        let series = store
+            .folder_series("C:/Mix", "C:/Mix/Sub", 10)
+            .expect("serie 2");
+        assert_eq!(series.len(), 2);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use disky_core::platform::path_norm::normalize_path_separators;
 use disky_core::{
     growth_ranking, journal_status, list_volumes as core_list_volumes, match_by_path,
     recent_records, squarify, walk_tree, GrowthReport, JournalRecord, PlatformError,
@@ -89,8 +90,10 @@ pub fn treemap_nodes(
     };
     drop(store);
 
-    let folder_path = folder.unwrap_or_else(|| root.clone());
-    let prefix = format!("{folder_path}\\");
+    // El snapshot más reciente siempre trae separadores nativos (el store
+    // normaliza al escribir), pero `folder`/`root` vienen del frontend.
+    let folder_path = normalize_path_separators(&folder.unwrap_or_else(|| root.clone()));
+    let prefix = format!("{folder_path}{}", std::path::MAIN_SEPARATOR);
     let folder_size = samples
         .iter()
         .find(|s| s.path == folder_path)
@@ -98,7 +101,10 @@ pub fn treemap_nodes(
 
     let mut children: Vec<TreemapItem> = samples
         .iter()
-        .filter(|s| s.path.starts_with(&prefix) && !s.path[prefix.len()..].contains('\\'))
+        .filter(|s| {
+            s.path.starts_with(&prefix)
+                && !s.path[prefix.len()..].contains(std::path::MAIN_SEPARATOR)
+        })
         .map(|s| TreemapItem {
             path: s.path.clone(),
             size_bytes: s.size_bytes,
@@ -293,7 +299,7 @@ pub fn scan_start(
         state.scanning.store(false, Ordering::SeqCst);
         return Err(format!("La ruta no existe o no es un directorio: `{root}`"));
     }
-    let root = path.display().to_string();
+    let root = normalize_path_separators(&path.display().to_string());
 
     let handle = window.app_handle().clone();
     std::thread::spawn(move || run_scan(handle, root, path));
@@ -538,7 +544,7 @@ pub fn scan_quick_start(
         state.scanning.store(false, Ordering::SeqCst);
         return Err(format!("La ruta no existe o no es un directorio: `{root}`"));
     }
-    let root = path.display().to_string();
+    let root = normalize_path_separators(&path.display().to_string());
     let handle = window.app_handle().clone();
 
     std::thread::spawn(move || {

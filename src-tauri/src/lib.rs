@@ -60,11 +60,13 @@ pub fn elevated_scan(root: &str, out: &str, db: &str) -> i32 {
     if !root_path.is_dir() {
         return fail(format!("La ruta no existe o no es un directorio: `{root}`"));
     }
+    // Clave canónica en la BD: separadores nativos (p. ej. llega `C:/x` desde bash).
+    let root = disky_core::platform::path_norm::normalize_path_separators(root);
 
     let Ok(mut store) = disky_core::SqliteStore::open(std::path::Path::new(db)) else {
         return fail("No se pudo abrir la base de datos de snapshots".into());
     };
-    let Ok(mut writer) = store.open_writer(root, started_at) else {
+    let Ok(mut writer) = store.open_writer(&root, started_at) else {
         return fail("No se pudo iniciar el snapshot".into());
     };
 

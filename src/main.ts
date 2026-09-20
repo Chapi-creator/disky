@@ -236,10 +236,12 @@ function growthPeriodLabel(): string {
 /** Hijos directos de `folder` presentes en el diff (una sola profundidad). */
 function childrenOf(folder: string): GrowthReport[] {
   if (!lastGrowth) return [];
-  const prefix = `${folder}\\`;
+  // El backend guarda rutas con el separador nativo del SO.
+  const sep = navigator.platform.startsWith("Win") ? "\\" : "/";
+  const prefix = `${folder}${sep}`;
   return lastGrowth.rows.filter((row) => {
     if (!row.path.startsWith(prefix)) return false;
-    return !row.path.slice(prefix.length).includes("\\");
+    return !row.path.slice(prefix.length).includes(sep);
   });
 }
 
