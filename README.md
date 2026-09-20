@@ -57,6 +57,16 @@ npm install
 npm run tauri dev
 ```
 
+## Distribución
+
+```bash
+npm run tauri build        # genera instalador NSIS + ejecutable
+```
+
+Artefactos en `target/release/bundle/nsis/`. Nota: sin certificado de firma
+código, SmartScreen mostrará una advertencia la primera vez — es molestia,
+no bloqueo (ver estrategia de costos en el backlog).
+
 ## Calidad
 
 ```bash
