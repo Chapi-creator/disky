@@ -275,6 +275,81 @@ pub struct GrowthDiff {
     pub rows: Vec<GrowthReport>,
 }
 
+/// Arranca el escaneo de **todas las unidades fijas** en secuencia, un hilo
+/// para el lote completo. Por cada unidad emite `scan-all-unit` (arranque de
+/// unidad, con la letra) y reutiliza `scan-progress`/`scan-done` por unidad.
+///
+/// # Errors
+/// `String` si ya hay un escaneo en curso o no hay unidades fijas.
+#[tauri::command]
+pub fn scan_all_start(window: tauri::Window, state: State<'_, AppState>) -> Result<(), String> {
+    if state.scanning.swap(true, Ordering::SeqCst) {
+        return Err("Ya hay un escaneo en curso".into());
+    }
+    state.cancel.store(false, Ordering::SeqCst);
+
+    let fixed: Vec<String> = core_list_volumes()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|v| matches!(v.kind, disky_core::DriveKind::Fixed) && v.total_bytes > 0)
+        .map(|v| format!("{}\\", v.letter))
+        .collect();
+    if fixed.is_empty() {
+        state.scanning.store(false, Ordering::SeqCst);
+        return Err("No hay unidades fijas para escanear".into());
+    }
+
+    let handle = window.app_handle().clone();
+    std::thread::spawn(move || {
+        // State<'_> no puede cruzar al hilo: se re-deriva del handle.
+        let state = handle.state::<AppState>();
+        for (i, root) in fixed.iter().enumerate() {
+            if state.cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let _ = handle.emit(
+                "scan-all-unit",
+                ScanAllUnit {
+                    letter: root.clone(),
+                    index: i + 1,
+                    total: fixed.len(),
+                },
+            );
+            let root_path = PathBuf::from(root);
+            let (snapshot, error) = perform_scan(&handle, &state, root, &root_path);
+            // El evento por unidad: el frontend refresca lo acumulado.
+            let growth = if snapshot.is_some() {
+                let store = lock_store(&state.store);
+                compute_growth(&store, root)
+            } else {
+                None
+            };
+            emit_done(&handle, snapshot, growth, error.clone());
+            if error.is_some() {
+                // Falla o cancelación de la unidad: se continúa con la siguiente
+                // salvo que se haya pedido cancelar.
+                if state.cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        }
+        let _ = handle.emit("scan-all-done", ());
+        state.scanning.store(false, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+/// Aviso de unidad en curso dentro de un escaneo de todas.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanAllUnit {
+    /// Raíz de la unidad (ej. `C:\`).
+    pub letter: String,
+    /// 1-based dentro del lote.
+    pub index: usize,
+    /// Cuántas unidades hay en el lote.
+    pub total: usize,
+}
+
 /// Arranca un escaneo de `root` en un hilo dedicado.
 ///
 /// El progreso llega por el evento `scan-progress` y el resultado por
@@ -401,25 +476,30 @@ pub fn render_error(err: PlatformError) -> String {
 ///
 /// Escribe el snapshot de forma atómica (invisible hasta `finish`), emite
 /// progreso periódico y cierra con el evento `scan-done` en todos los casos.
-fn run_scan(handle: AppHandle, root: String, root_path: PathBuf) {
-    let state = handle.state::<AppState>();
+/// Ejecuta el escaneo de una raíz y lo guarda. Devuelve el snapshot creado
+/// (`None` si se canceló o falló) y el texto de error si lo hubo.
+///
+/// El llamador es dueño del estado del flag `scanning` y del evento final:
+/// esta función solo hace el trabajo de escanear + persistir.
+fn perform_scan(
+    handle: &AppHandle,
+    state: &AppState,
+    root: &str,
+    root_path: &Path,
+) -> (Option<SnapshotSummary>, Option<String>) {
     let started_at = unix_now();
     let started = Instant::now();
 
     let mut store = lock_store(&state.store);
-    let Ok(mut writer) = store.open_writer(&root, started_at) else {
-        emit_done(
-            &handle,
-            None,
+    let Ok(mut writer) = store.open_writer(root, started_at) else {
+        return (
             None,
             Some("No se pudo abrir la base de datos para guardar el escaneo".into()),
         );
-        state.scanning.store(false, Ordering::SeqCst);
-        return;
     };
 
     let scan_result = walk_tree(
-        &root_path,
+        root_path,
         &state.cancel,
         // Un directorio por llamada: el escritor se ocupa del lote.
         &mut |dir| {
@@ -430,34 +510,48 @@ fn run_scan(handle: AppHandle, root: String, root_path: PathBuf) {
         },
     );
 
-    match scan_result {
+    let outcome = match scan_result {
         Ok(totals) => {
             let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
             match writer.finish(totals, duration_ms) {
                 Ok(id) => {
                     let snapshot = SnapshotSummary {
                         id,
-                        root: root.clone(),
+                        root: root.to_owned(),
                         started_at,
                         duration_ms,
                         total_files: totals.files,
                         total_bytes: totals.bytes,
                         read_errors: totals.read_errors,
                     };
-                    let growth = compute_growth(&store, &root);
-                    emit_done(&handle, Some(snapshot), growth, None);
+                    (Some(snapshot), None)
                 }
-                Err(err) => emit_done(&handle, None, None, Some(err.to_string())),
+                Err(err) => (None, Some(err.to_string())),
             }
         }
         // Cancelación: el escritor se descarta y la transacción hace rollback,
         // así que no queda un snapshot a medias.
-        Err(WalkError::Cancelled) => {
-            emit_done(&handle, None, None, Some("Escaneo cancelado".into()));
-        }
-        Err(err) => emit_done(&handle, None, None, Some(err.to_string())),
-    }
+        Err(WalkError::Cancelled) => (None, Some("Escaneo cancelado".into())),
+        Err(err) => (None, Some(err.to_string())),
+    };
 
+    // El guard se suelta al retornar: sin drop explícito (el borrow del
+    // writer sigue vivo en los brazos de error del match).
+    outcome
+}
+
+fn run_scan(handle: AppHandle, root: String, root_path: PathBuf) {
+    let state = handle.state::<AppState>();
+    let (snapshot, error) = perform_scan(&handle, &state, &root, &root_path);
+
+    // Growth fresco para la raíz escaneada (aunque falle, el evento informa).
+    let growth = if snapshot.is_some() {
+        let store = lock_store(&state.store);
+        compute_growth(&store, &root)
+    } else {
+        None
+    };
+    emit_done(&handle, snapshot, growth, error);
     state.scanning.store(false, Ordering::SeqCst);
 }
 

@@ -91,6 +91,13 @@ export interface ScanQuickDonePayload {
   error: string | null;
 }
 
+/** Unidad en curso dentro de un "Escanear todo". */
+export interface ScanAllUnit {
+  letter: string;
+  index: number;
+  total: number;
+}
+
 /** Un rectángulo del treemap listo para pintar en el SVG. */
 export interface TreemapNodeDto {
   path: string;

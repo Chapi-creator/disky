@@ -138,6 +138,7 @@ pub fn run() {
             commands::usn_status,
             commands::usn_recent,
             commands::scan_start,
+            commands::scan_all_start,
             commands::scan_cancel,
             commands::scan_quick_start,
             commands::snapshots_list,

@@ -11,6 +11,7 @@ import type {
   GrowthDiff,
   GrowthReport,
   JournalRecord,
+  ScanAllUnit,
   ScanDonePayload,
   ScanProgress,
   ScanQuickDonePayload,
@@ -35,6 +36,45 @@ let scanProgressEl: HTMLElement | null;
 let scanProgressTextEl: HTMLElement | null;
 let snapshotsEl: HTMLElement | null;
 let growthEl: HTMLElement | null;
+
+/** `true` mientras un "Escanear todo" está en curso. */
+let scanAllActive = false;
+
+/** Botón del escaneo de todas las unidades. */
+let scanAllBtnEl: HTMLButtonElement | null;
+
+/**
+ * Escaneo de todas las unidades fijas: una a la vez, refrescando lo
+ * acumulado tras cada una sin cerrar el estado de progreso.
+ */
+async function startScanAll(): Promise<void> {
+  if (scanAllActive) return;
+  try {
+    await invoke("scan_all_start");
+    scanAllActive = true;
+    if (scanBtnEl) scanBtnEl.disabled = true;
+    if (scanQuickBtnEl) scanQuickBtnEl.disabled = true;
+    if (scanAllBtnEl) scanAllBtnEl.disabled = true;
+    if (scanCancelBtnEl) scanCancelBtnEl.disabled = false;
+    if (scanProgressEl) scanProgressEl.classList.remove("hidden");
+    if (scanProgressTextEl) scanProgressTextEl.textContent = "Preparando el barrido de unidades…";
+  } catch (err) {
+    showScanError(String(err));
+  }
+}
+
+/** Como `handleScanDone`, pero manteniendo el estado ocupado del lote. */
+function handleScanDoneKeepBusy(payload: ScanDonePayload): void {
+  if (payload.snapshot) {
+    void loadSnapshots();
+    void loadGrowth();
+    void refreshTreemapForRoot(payload.snapshot.root);
+  }
+  // Los errores de unidad se muestran sin abortar el resto del lote.
+  if (payload.error && scanProgressTextEl && !payload.error.includes("cancelado")) {
+    scanProgressTextEl.textContent = `${payload.error} — continuando con la siguiente unidad…`;
+  }
+}
 
 /** Último diff recibido del backend; alimenta el drill-down. */
 let lastGrowth: GrowthDiff | null = null;
@@ -545,6 +585,7 @@ window.addEventListener("DOMContentLoaded", () => {
   scanRootEl = document.querySelector("#scan-root");
   scanBtnEl = document.querySelector("#scan-btn");
   scanQuickBtnEl = document.querySelector("#scan-quick-btn");
+  scanAllBtnEl = document.querySelector("#scan-all-btn");
   scanCancelBtnEl = document.querySelector("#scan-cancel-btn");
   scanProgressEl = document.querySelector("#scan-progress");
   scanProgressTextEl = document.querySelector("#scan-progress-text");
@@ -567,6 +608,7 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   scanBtnEl?.addEventListener("click", () => void startScan());
   scanQuickBtnEl?.addEventListener("click", () => void startQuickScan());
+  scanAllBtnEl?.addEventListener("click", () => void startScanAll());
   scanCancelBtnEl?.addEventListener("click", () => void cancelScan());
 
   // Delegación de clics para el drill-down (las filas se recrean a menudo).
@@ -595,6 +637,26 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   void listen<ScanQuickDonePayload>("scan-quick-done", (event) => {
     handleQuickScanDone(event.payload);
+  });
+  void listen<ScanAllUnit>("scan-all-unit", (event) => {
+    const { letter, index, total } = event.payload;
+    if (scanProgressTextEl) {
+      scanProgressTextEl.textContent = `Unidad ${index}/${total}: ${letter} — recorriendo…`;
+    }
+  });
+  void listen<ScanDonePayload>("scan-done", (event) => {
+    // Durante "Escanear todo", el scan-done por unidad refresca sin cerrar
+    // el estado de progreso (el handler normal lo cerraría cada unidad).
+    if (scanAllActive) {
+      handleScanDoneKeepBusy(event.payload);
+    } else {
+      handleScanDone(event.payload);
+    }
+  });
+  void listen<unknown>("scan-all-done", () => {
+    scanAllActive = false;
+    setScanBusy(false, "Escaneo completo de todas las unidades terminado.");
+    window.setTimeout(() => scanProgressEl?.classList.add("hidden"), 3500);
   });
 
   void loadVolumes();
