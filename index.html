@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>disky — ¿qué creció en mi disco?</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <main class="container">
+      <h1>🔍 disky</h1>
+      <p class="subtitle">¿Qué creció en mi disco? — spike USN Journal</p>
+
+      <h2>Volúmenes montados</h2>
+      <table class="volumes-table">
+        <thead>
+          <tr>
+            <th>Unidad</th>
+            <th>Tipo</th>
+            <th>Etiqueta</th>
+            <th>Uso</th>
+            <th>%</th>
+          </tr>
+        </thead>
+        <tbody id="volumes">
+          <tr><td colspan="5">Cargando…</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Escaneo (sin admin)</h2>
+      <p class="hint">
+        Recorre el árbol de directorios con permisos normales y guarda un
+        snapshot en SQLite. Con dos escaneos de la misma raíz, te dice qué
+        creció y por dónde. Sin elevación: las carpetas protegidas se cuentan
+        como error de lectura.
+      </p>
+      <div class="row">
+        <input id="scan-root" value="C:\\" spellcheck="false" />
+        <button type="button" id="scan-btn">Escanear</button>
+        <button type="button" id="scan-quick-btn">Escaneo rápido (admin)</button>
+        <button type="button" id="scan-cancel-btn" disabled>Cancelar</button>
+      </div>
+      <p class="hint">
+        El escaneo rápido pide permisos de administrador (UAC) para leer
+        también las carpetas protegidas; no muestra progreso ni se puede
+        cancelar mientras corre.
+      </p>
+      <div id="scan-progress" class="scan-progress hidden">
+        <div class="bar"><div class="fill"></div></div>
+        <p id="scan-progress-text">Preparando…</p>
+      </div>
+
+      <h3>Escaneos guardados</h3>
+      <table class="volumes-table" id="snapshots-table">
+        <thead>
+          <tr>
+            <th>Raíz</th>
+            <th>Fecha</th>
+            <th>Uso medido</th>
+            <th>Archivos</th>
+            <th>Errores</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="5">Aún no hay escaneos guardados</td></tr>
+        </tbody>
+      </table>
+
+      <h3>¿Qué creció?</h3>
+      <table class="volumes-table" id="growth-table">
+        <thead>
+          <tr>
+            <th>Carpeta</th>
+            <th>Antes</th>
+            <th>Ahora</th>
+            <th>Δ</th>
+            <th>Por día</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="5">Requiere dos escaneos de la misma raíz</td></tr>
+        </tbody>
+      </table>
+
+      <h2>USN Journal (spike)</h2>
+      <p class="hint">
+        Prueba del Change Journal de NTFS: estado del journal y últimos cambios
+        detectados por el kernel. Requiere permisos de administrador.
+      </p>
+      <div class="row">
+        <input id="usn-letter" value="C" maxlength="1" />
+        <button type="button" id="usn-status-btn">Estado del journal</button>
+        <button type="button" id="usn-recent-btn">Últimos registros</button>
+      </div>
+      <div id="usn-status"></div>
+      <table class="volumes-table" id="usn-records">
+        <thead>
+          <tr>
+            <th>Archivo</th>
+            <th>Cambios</th>
+            <th>Cuándo</th>
+            <th>FRN</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="4">Pulsa «Últimos registros» para leer el journal</td></tr>
+        </tbody>
+      </table>
+
+      <form class="row" id="greet-form">
+        <input id="greet-input" placeholder="Tu nombre…" />
+        <button type="submit">Saludar al núcleo</button>
+      </form>
+      <p id="greet-msg"></p>
+    </main>
+  </body>
+</html>
