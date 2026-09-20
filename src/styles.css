@@ -285,3 +285,16 @@ td.path {
   margin: 0 6px;
   font-size: 12px;
 }
+
+/* Timeline: gráfico de líneas del crecimiento. */
+#timeline {
+  width: 100%;
+  height: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+#timeline circle {
+  cursor: help;
+}

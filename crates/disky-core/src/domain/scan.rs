@@ -77,6 +77,16 @@ pub struct SnapshotSummary {
     pub read_errors: u64,
 }
 
+/// Un punto de la serie temporal de una carpeta: su tamaño en un snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[must_use]
+pub struct SeriesPoint {
+    /// Cuándo se tomó la medición (UNIX, segundos).
+    pub measured_at: i64,
+    /// Tamaño roll-up de la carpeta en ese momento.
+    pub size_bytes: u64,
+}
+
 /// Error del store de snapshots.
 ///
 /// El port vive en el dominio pero **no** conoce `SQLite`: el adaptador traduce
@@ -125,6 +135,19 @@ pub trait SnapshotStore {
     /// [`StoreError::UnknownSnapshot`] si el id no existe; [`StoreError::Db`]
     /// si la consulta falla.
     fn load_dir_samples(&self, snapshot_id: u64) -> Result<Vec<UsageSample>, StoreError>;
+
+    /// Serie temporal de `folder` bajo `root`: sus tamaños en los últimos
+    /// `limit` snapshots, en orden temporal ascendente. Los snapshots donde la
+    /// carpeta no existía simplemente no aportan punto.
+    ///
+    /// # Errors
+    /// [`StoreError`] si la consulta falla.
+    fn folder_series(
+        &self,
+        root: &str,
+        folder: &str,
+        limit: u32,
+    ) -> Result<Vec<SeriesPoint>, StoreError>;
 
     /// Elimina los snapshots más viejos de `root`, dejando los últimos `keep`.
     ///

@@ -103,3 +103,10 @@ export interface TreemapNodeDto {
   delta_bytes: number;
   is_files: boolean;
 }
+
+/** Un punto del timeline de una carpeta. */
+export interface TimelinePointDto {
+  measured_at: number;
+  size_bytes: number;
+  delta_bytes: number;
+}

@@ -156,6 +156,49 @@ pub fn treemap_nodes(
         .collect())
 }
 
+/// Punto del timeline de una carpeta: tamaño y delta respecto al punto previo.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TimelinePointDto {
+    /// Cuándo se midió (UNIX, segundos).
+    pub measured_at: i64,
+    /// Tamaño roll-up de la carpeta.
+    pub size_bytes: u64,
+    /// Delta contra el punto anterior de la serie (0 en el primero).
+    pub delta_bytes: i64,
+}
+
+/// Serie temporal de `folder` bajo `root` (últimos `limit` escaneos).
+///
+/// # Errors
+/// `String` si la consulta a la base de datos falla.
+#[tauri::command]
+pub fn timeline_series(
+    state: State<'_, AppState>,
+    root: String,
+    folder: String,
+    limit: Option<u32>,
+) -> Result<Vec<TimelinePointDto>, String> {
+    let store = lock_store(&state.store);
+    let points = store
+        .folder_series(&root, &folder, limit.unwrap_or(20))
+        .map_err(|e| e.to_string())?;
+    drop(store);
+
+    Ok(points
+        .iter()
+        .enumerate()
+        .map(|(i, point)| TimelinePointDto {
+            measured_at: point.measured_at,
+            size_bytes: point.size_bytes,
+            delta_bytes: if i == 0 {
+                0
+            } else {
+                delta_bytes(point.size_bytes, points[i - 1].size_bytes)
+            },
+        })
+        .collect())
+}
+
 /// Tamaño que tenían los archivos sueltos de `folder` en el snapshot anterior.
 fn files_size_of(prev: &HashMap<String, u64>, folder: &str, children_total_now: u64) -> u64 {
     prev.get(folder)

@@ -14,8 +14,8 @@ pub mod domain;
 pub mod platform;
 
 pub use domain::scan::{
-    match_by_path, DirStat, DirWriter, ScanProgress, ScanTotals, SnapshotStore, SnapshotSummary,
-    StoreError,
+    match_by_path, DirStat, DirWriter, ScanProgress, ScanTotals, SeriesPoint, SnapshotStore,
+    SnapshotSummary, StoreError,
 };
 pub use domain::treemap::{squarify, TreemapItem, TreemapNode};
 pub use domain::usn::JournalRecord;

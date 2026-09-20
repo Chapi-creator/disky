@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::domain::scan::{
-    DirStat, DirWriter, ScanTotals, SnapshotStore, SnapshotSummary, StoreError,
+    DirStat, DirWriter, ScanTotals, SeriesPoint, SnapshotStore, SnapshotSummary, StoreError,
 };
 use crate::domain::UsageSample;
 
@@ -216,6 +216,40 @@ impl SnapshotStore for SqliteStore {
             .map_err(db_err("leyendo dirs"))?;
         rows.map(|row| row.map_err(db_err("leyendo fila de dir")))
             .collect()
+    }
+
+    fn folder_series(
+        &self,
+        root: &str,
+        folder: &str,
+        limit: u32,
+    ) -> Result<Vec<SeriesPoint>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT s.started_at, d.size_bytes
+                 FROM snapshots s
+                 JOIN dirs d ON d.snapshot_id = s.id
+                 WHERE s.root = ?1 AND d.path = ?2
+                 ORDER BY s.started_at DESC
+                 LIMIT ?3",
+            )
+            .map_err(db_err("preparando serie temporal"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![root, folder, limit], |row| {
+                Ok(SeriesPoint {
+                    measured_at: row.get(0)?,
+                    size_bytes: non_neg(row.get::<_, i64>(1)?),
+                })
+            })
+            .map_err(db_err("leyendo serie"))?;
+        let mut points: Vec<SeriesPoint> = rows
+            .map(|row| row.map_err(db_err("leyendo punto de serie")))
+            .collect::<Result<_, _>>()?;
+        // Se tomaron los más recientes (DESC); el contrato pide orden temporal
+        // ascendente para dibujar la línea de izquierda a derecha.
+        points.reverse();
+        Ok(points)
     }
 
     fn prune(&mut self, root: &str, keep: u32) -> Result<(), StoreError> {
@@ -473,6 +507,65 @@ mod tests {
 
         assert_eq!(store.list_snapshots(Some("C:\\A"), 10).expect("a").len(), 1);
         assert_eq!(store.list_snapshots(Some("C:\\B"), 10).expect("b").len(), 1);
+    }
+
+    #[test]
+    fn folder_series_returns_ascending_points() {
+        let (_tmp, mut store) = open_tmp();
+        // Tres snapshots de la misma raíz; la carpeta cambia de tamaño en cada uno.
+        let sizes = [(1_000, 100_u64), (2_000, 250), (3_000, 150)];
+        for (started_at, size) in sizes {
+            let mut writer = store.open_writer("C:\\S", started_at).expect("writer");
+            writer
+                .write_dirs(&[
+                    DirStat {
+                        path: "C:\\S\\Carpeta".into(),
+                        size_bytes: size,
+                        mtime_unix: 0,
+                        files: 1,
+                    },
+                    DirStat {
+                        path: "C:\\S\\Otra".into(),
+                        size_bytes: 1,
+                        mtime_unix: 0,
+                        files: 1,
+                    },
+                ])
+                .expect("escribir");
+            writer.finish(ScanTotals::default(), 0).expect("finish");
+        }
+
+        let series = store
+            .folder_series("C:\\S", "C:\\S\\Carpeta", 100)
+            .expect("serie");
+        assert_eq!(
+            series,
+            vec![
+                SeriesPoint {
+                    measured_at: 1_000,
+                    size_bytes: 100
+                },
+                SeriesPoint {
+                    measured_at: 2_000,
+                    size_bytes: 250
+                },
+                SeriesPoint {
+                    measured_at: 3_000,
+                    size_bytes: 150
+                },
+            ]
+        );
+        // Limitar funciona y respeta el orden (los más recientes).
+        let limited = store
+            .folder_series("C:\\S", "C:\\S\\Carpeta", 2)
+            .expect("serie");
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].measured_at, 2_000);
+        // Carpeta que nunca existió: serie vacía, no error.
+        assert!(store
+            .folder_series("C:\\S", "C:\\S\\Nunca", 100)
+            .expect("serie vacía")
+            .is_empty());
     }
 
     #[test]

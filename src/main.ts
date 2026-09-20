@@ -15,6 +15,7 @@ import type {
   ScanProgress,
   ScanQuickDonePayload,
   SnapshotSummary,
+  TimelinePointDto,
   TreemapNodeDto,
   UsnStatus,
   Volume,
@@ -45,6 +46,7 @@ let treemapRoot = "";
 let treemapCrumb: string[] = [];
 let treemapEl: SVGElement | null;
 let treemapCrumbEl: HTMLElement | null;
+let timelineEl: SVGElement | null;
 
 /** Escapa texto arbitrario para insertarlo en HTML de forma segura. */
 function escapeHtml(text: string): string {
@@ -321,7 +323,7 @@ function handleScanDone(payload: ScanDonePayload): void {
   void refreshTreemapForRoot(currentScanRoot());
 }
 
-/** Resultado del escaneo elevado (mismo flujo de refresco que el normal). */
+/** Resultado del escaneo elevado: refresco idéntico al normal. */
 function handleQuickScanDone(payload: ScanQuickDonePayload): void {
   setScanBusy(false);
   if (payload.error) {
@@ -386,6 +388,7 @@ function renderCrumb(): void {
       treemapCrumb = treemapCrumb.slice(0, depth + 1);
       const folder = depth === 0 ? null : treemapCrumb[depth];
       void loadTreemap(folder ?? undefined);
+      void loadTimeline(folder ?? undefined);
     });
   });
 }
@@ -395,6 +398,69 @@ function drillIntoTreemap(path: string): void {
   if (!path) return; // el nodo [archivos] no navega
   treemapCrumb = [...treemapCrumb, path];
   void loadTreemap(path);
+  void loadTimeline(path);
+}
+
+// ── Timeline (gráfico de líneas) ─────────────────────────────────────
+
+/** Dibuja la serie temporal de `folder` siguiendo la carpeta del treemap. */
+async function loadTimeline(folder?: string): Promise<void> {
+  if (!timelineEl) return;
+  const W = 1000;
+  const H = 220;
+  const PAD = 44;
+
+  const empty = (msg: string): void => {
+    if (timelineEl)
+      timelineEl.innerHTML = `<text x="16" y="40" fill="#9aa3b2" font-size="13">${escapeHtml(msg)}</text>`;
+  };
+
+  try {
+    const points = await invoke<TimelinePointDto[]>("timeline_series", {
+      root: treemapRoot,
+      folder: folder ?? treemapRoot,
+      limit: 20,
+    });
+    if (points.length < 2) {
+      empty("Necesita al menos dos escaneos de esta carpeta para dibujar la línea");
+      return;
+    }
+
+    const t0 = points[0].measured_at;
+    const t1 = points[points.length - 1].measured_at;
+    const sizes = points.map((p) => p.size_bytes);
+    const min = Math.min(...sizes);
+    const max = Math.max(...sizes);
+    const spanT = Math.max(t1 - t0, 1);
+    // El eje Y acota entre min y max; si son iguales, centra la línea.
+    const spanY = Math.max(max - min, 1);
+    const xOf = (t: number): number => PAD + ((t - t0) / spanT) * (W - PAD * 2);
+    const yOf = (v: number): number =>
+      H - PAD - ((v - min) / spanY) * (H - PAD * 2);
+
+    const path = points
+      .map((p, i) => `${i === 0 ? "M" : "L"}${xOf(p.measured_at).toFixed(1)},${yOf(p.size_bytes).toFixed(1)}`)
+      .join(" ");
+    const dots = points
+      .map(
+        (p, i) =>
+          `<circle cx="${xOf(p.measured_at).toFixed(1)}" cy="${yOf(p.size_bytes).toFixed(1)}" r="4" fill="${i === points.length - 1 ? "#4f8cff" : "#9aa3b2"}"><title>${escapeHtml(new Date(p.measured_at * 1000).toLocaleString())} · ${formatBytes(p.size_bytes)} (Δ ${formatDelta(p.delta_bytes)})</title></circle>`,
+      )
+      .join("");
+    const gridLines = [min, (min + max) / 2, max]
+      .map(
+        (v) =>
+          `<line x1="${PAD}" y1="${yOf(v).toFixed(1)}" x2="${W - PAD}" y2="${yOf(v).toFixed(1)}" stroke="#262b36" stroke-dasharray="3 4" /><text x="8" y="${(yOf(v) + 4).toFixed(1)}" fill="#9aa3b2" font-size="10">${formatBytes(v)}</text>`,
+      )
+      .join("");
+
+    timelineEl.innerHTML =
+      gridLines +
+      `<path d="${path}" fill="none" stroke="#4f8cff" stroke-width="2" />` +
+      dots;
+  } catch (err) {
+    empty(String(err));
+  }
 }
 
 async function refreshTreemapForRoot(root: string): Promise<void> {
@@ -402,6 +468,7 @@ async function refreshTreemapForRoot(root: string): Promise<void> {
   treemapCrumb = [""];
   renderCrumb();
   await loadTreemap();
+  await loadTimeline();
 }
 
 // ── Arranque ─────────────────────────────────────────────────────────────────
@@ -431,6 +498,7 @@ window.addEventListener("DOMContentLoaded", () => {
   growthEl = document.querySelector("#growth-table tbody");
   treemapEl = document.querySelector("#treemap");
   treemapCrumbEl = document.querySelector("#treemap-crumb");
+  timelineEl = document.querySelector("#timeline");
 
   document.querySelector("#greet-form")?.addEventListener("submit", (e) => {
     e.preventDefault();

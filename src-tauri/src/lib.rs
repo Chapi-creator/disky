@@ -141,6 +141,7 @@ pub fn run() {
             commands::snapshots_list,
             commands::growth_report,
             commands::treemap_nodes,
+            commands::timeline_series,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
