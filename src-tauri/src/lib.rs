@@ -140,6 +140,7 @@ pub fn run() {
             commands::scan_quick_start,
             commands::snapshots_list,
             commands::growth_report,
+            commands::treemap_nodes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

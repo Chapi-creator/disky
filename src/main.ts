@@ -15,6 +15,7 @@ import type {
   ScanProgress,
   ScanQuickDonePayload,
   SnapshotSummary,
+  TreemapNodeDto,
   UsnStatus,
   Volume,
 } from "./api";
@@ -38,6 +39,12 @@ let growthEl: HTMLElement | null;
 let lastGrowth: GrowthDiff | null = null;
 /** Carpeta en la que se hizo drill-down (null = vista completa). */
 let drillPath: string | null = null;
+
+/** Raíz del treemap actual y pila de navegación (breadcrumb). */
+let treemapRoot = "";
+let treemapCrumb: string[] = [];
+let treemapEl: SVGElement | null;
+let treemapCrumbEl: HTMLElement | null;
 
 /** Escapa texto arbitrario para insertarlo en HTML de forma segura. */
 function escapeHtml(text: string): string {
@@ -311,6 +318,7 @@ function handleScanDone(payload: ScanDonePayload): void {
   }
   void loadSnapshots();
   void loadGrowth();
+  void refreshTreemapForRoot(currentScanRoot());
 }
 
 /** Resultado del escaneo elevado (mismo flujo de refresco que el normal). */
@@ -322,6 +330,78 @@ function handleQuickScanDone(payload: ScanQuickDonePayload): void {
   }
   void loadSnapshots();
   void loadGrowth();
+  void refreshTreemapForRoot(currentScanRoot());
+}
+
+// ── Treemap ─────────────────────────────────────────────────────────────
+
+/** Color del rectángulo según el delta: verde creció, naranja encogió, gris neutro. */
+function treemapFill(delta: number): string {
+  if (delta > 0) return "#3f9d63";
+  if (delta < 0) return "#c47f2e";
+  return "#3a4152";
+}
+
+/** Etiqueta visible del nodo (recortada si el rectángulo es angosto). */
+function nodeLabel(node: TreemapNodeDto): string {
+  const chars = Math.max(0, Math.floor(node.w / 7));
+  return node.name.length > chars ? `${node.name.slice(0, Math.max(chars - 1, 1))}…` : node.name;
+}
+
+async function loadTreemap(folder?: string): Promise<void> {
+  if (!treemapEl) return;
+  try {
+    const nodes = await invoke<TreemapNodeDto[]>("treemap_nodes", {
+      root: treemapRoot,
+      folder: folder ?? null,
+    });
+    treemapEl.innerHTML = nodes
+      .map(
+        (node) => `
+      <g class="tm-node" data-path="${escapeHtml(node.path)}">
+        <rect x="${node.x + 1}" y="${node.y + 1}" width="${Math.max(node.w - 2, 0)}" height="${Math.max(node.h - 2, 0)}"
+          rx="4" fill="${treemapFill(node.delta_bytes)}" />
+        <text x="${node.x + 8}" y="${node.y + 20}" fill="#e6e9ef" font-size="13">${escapeHtml(nodeLabel(node))}</text>
+        <text x="${node.x + 8}" y="${node.y + 38}" fill="#9aa3b2" font-size="11">${formatBytes(node.size_bytes)}</text>
+      </g>`,
+      )
+      .join("");
+  } catch (err) {
+    treemapEl.innerHTML = `<text x="16" y="40" class="error">${escapeHtml(String(err))}</text>`;
+  }
+}
+
+/** Pinta el breadcrumb y gestiona el clic en "volver". */
+function renderCrumb(): void {
+  if (!treemapCrumbEl) return;
+  const parts = treemapCrumb.map(
+    (crumb, i) =>
+      `<a href="#" data-depth="${i}" class="crumb-link">${escapeHtml(crumb === "" ? "raíz" : crumb)}</a>`,
+  );
+  treemapCrumbEl.innerHTML = parts.join('<span class="crumb-sep">›</span>');
+  treemapCrumbEl.querySelectorAll("a").forEach((a) => {
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      const depth = Number((a as HTMLAnchorElement).dataset.depth ?? 0);
+      treemapCrumb = treemapCrumb.slice(0, depth + 1);
+      const folder = depth === 0 ? null : treemapCrumb[depth];
+      void loadTreemap(folder ?? undefined);
+    });
+  });
+}
+
+/** Entra a una carpeta del treemap (navegación hacia abajo). */
+function drillIntoTreemap(path: string): void {
+  if (!path) return; // el nodo [archivos] no navega
+  treemapCrumb = [...treemapCrumb, path];
+  void loadTreemap(path);
+}
+
+async function refreshTreemapForRoot(root: string): Promise<void> {
+  treemapRoot = root;
+  treemapCrumb = [""];
+  renderCrumb();
+  await loadTreemap();
 }
 
 // ── Arranque ─────────────────────────────────────────────────────────────────
@@ -349,6 +429,8 @@ window.addEventListener("DOMContentLoaded", () => {
   scanProgressTextEl = document.querySelector("#scan-progress-text");
   snapshotsEl = document.querySelector("#snapshots-table tbody");
   growthEl = document.querySelector("#growth-table tbody");
+  treemapEl = document.querySelector("#treemap");
+  treemapCrumbEl = document.querySelector("#treemap-crumb");
 
   document.querySelector("#greet-form")?.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -370,6 +452,13 @@ window.addEventListener("DOMContentLoaded", () => {
     if (!row) return;
     drillPath = row.getAttribute("data-path");
     renderGrowth();
+  });
+
+  // Treemap: clic en un rectángulo para entrar a la carpeta.
+  treemapEl?.addEventListener("click", (event) => {
+    const group = (event.target as Element).closest("g.tm-node");
+    if (!group) return;
+    drillIntoTreemap(group.getAttribute("data-path") ?? "");
   });
 
   void listen<ScanProgress>("scan-progress", (event) => {

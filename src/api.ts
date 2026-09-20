@@ -90,3 +90,16 @@ export interface ScanQuickDonePayload {
   growth: GrowthDiff | null;
   error: string | null;
 }
+
+/** Un rectángulo del treemap listo para pintar en el SVG. */
+export interface TreemapNodeDto {
+  path: string;
+  name: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  size_bytes: number;
+  delta_bytes: number;
+  is_files: boolean;
+}

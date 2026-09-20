@@ -5,6 +5,7 @@
 //! de modo que los adaptadores (`WinAPI`, USN Journal, UI) solo aportan datos.
 
 pub mod scan;
+pub mod treemap;
 pub mod usn;
 
 use std::collections::BTreeMap;

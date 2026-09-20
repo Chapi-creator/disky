@@ -242,3 +242,46 @@ td.path {
 #growth-back:hover {
   text-decoration: underline;
 }
+
+/* Treemap SVG: rectángulos navegables, breadcrumb y hover. */
+#treemap {
+  width: 100%;
+  height: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.tm-node {
+  cursor: pointer;
+}
+
+.tm-node:hover rect {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+#treemap text {
+  pointer-events: none;
+}
+
+.crumb {
+  margin-top: 0;
+  align-items: center;
+}
+
+.crumb-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 13px;
+}
+
+.crumb-link:hover {
+  text-decoration: underline;
+}
+
+.crumb-sep {
+  color: var(--text-dim);
+  margin: 0 6px;
+  font-size: 12px;
+}

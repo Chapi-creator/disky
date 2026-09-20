@@ -26,15 +26,19 @@ Solo lectura, 100% local, sin servidores.
   por JSON; cubre las carpetas protegidas que el walk normal no puede leer.
 - ✅ **Drill-down**: clic en cualquier carpeta del ranking para ver el crecimiento
   de sus hijos directos (navegable en profundidad, con "volver").
-- 🔲 Siguiente: treemap/timeline visual y drill-down por archivo.
+- ✅ **Treemap squarify** (Bruls et al. 2000): implementación pura en el core
+  (probada: cobertura sin solapes, aspect ratios acotados), SVG en el frontend
+  con colores por crecimiento, breadcrumb y navegación por clic.
+- 🔲 Siguiente: timeline de crecimiento en el tiempo y drill-down por archivo.
 
 ## Roadmap
 
 1. ~~Spike USN Journal~~ ✅ — parser + FSCTL probados; límite de elevación documentado
 2. ~~Escaneo base sin admin + snapshot en SQLite~~ ✅ — walker, store atómico y diff
 3. ~~Escaneo rápido con UAC (opción A)~~ ✅ — hijo elevado con `--elevated-scan`
-4. **Treemap + timeline**: la UI que nadie más tiene
-5. Agente elevado compartido con Frostbyte (opción B), a futuro
+4. ~~Treemap squarify~~ ✅ — core puro + SVG interactivo con breadcrumb
+5. **Timeline**: el crecimiento a lo largo del tiempo, la pieza visual que falta
+6. Agente elevado compartido con Frostbyte (opción B), a futuro
 
 ## Arquitectura (hexagonal)
 

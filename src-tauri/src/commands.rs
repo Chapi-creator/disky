@@ -10,14 +10,15 @@
 // la convención del framework.
 #![allow(clippy::needless_pass_by_value)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use disky_core::{
     growth_ranking, journal_status, list_volumes as core_list_volumes, match_by_path,
-    recent_records, walk_tree, GrowthReport, JournalRecord, PlatformError, SnapshotStore as _,
-    SnapshotSummary, UsnStatus, WalkError,
+    recent_records, squarify, walk_tree, GrowthReport, JournalRecord, PlatformError,
+    SnapshotStore as _, SnapshotSummary, TreemapItem, UsnStatus, WalkError,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -25,6 +26,147 @@ use crate::state::{lock_store, AppState};
 
 /// Máximo de filas del informe de crecimiento enviado a la UI.
 const MAX_GROWTH_ROWS: usize = 50;
+
+/// Lienzo del treemap en coordenadas de layout (el SVG escala con viewBox).
+const TREEMAP_W: f64 = 1_000.0;
+const TREEMAP_H: f64 = 700.0;
+
+/// Nodo del treemap listo para pintar en el SVG.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TreemapNodeDto {
+    /// Ruta de la carpeta (vacía para el nodo sintético `[archivos]`).
+    pub path: String,
+    /// Nombre corto (último componente) para la etiqueta.
+    pub name: String,
+    /// Geometría en el lienzo de [`TREEMAP_W`] × [`TREEMAP_H`].
+    pub x: f64,
+    /// Geometría en el lienzo de [`TREEMAP_W`] × [`TREEMAP_H`].
+    pub y: f64,
+    /// Geometría en el lienzo de [`TREEMAP_W`] × [`TREEMAP_H`].
+    pub w: f64,
+    /// Geometría en el lienzo de [`TREEMAP_W`] × [`TREEMAP_H`].
+    pub h: f64,
+    /// Tamaño roll-up actual.
+    pub size_bytes: u64,
+    /// Delta vs. el snapshot anterior (0 para el primer escaneo).
+    pub delta_bytes: i64,
+    /// `true` para el nodo sintético de archivos sueltos.
+    pub is_files: bool,
+}
+
+/// Treemap de los hijos directos de `folder` (o de la raíz) según el snapshot
+/// más reciente, con los deltas contra el anterior.
+////// Los archivos sueltos de la carpeta (no agrupados en ningún hijo) aparecen
+/// como el nodo sintético `[archivos]`.
+///
+/// # Errors
+/// `String` si la raíz no tiene escaneos o la consulta falla.
+#[tauri::command]
+pub fn treemap_nodes(
+    state: State<'_, AppState>,
+    root: String,
+    folder: Option<String>,
+) -> Result<Vec<TreemapNodeDto>, String> {
+    let store = lock_store(&state.store);
+    let snaps = store
+        .list_snapshots(Some(&root), 2)
+        .map_err(|e| e.to_string())?;
+    let Some(latest) = snaps.first() else {
+        return Err("Aún no hay escaneos de esta raíz".into());
+    };
+    let samples = store
+        .load_dir_samples(latest.id)
+        .map_err(|e| e.to_string())?;
+    let prev: HashMap<String, u64> = if snaps.len() > 1 {
+        store
+            .load_dir_samples(snaps[1].id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|s| (s.path, s.size_bytes))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    drop(store);
+
+    let folder_path = folder.unwrap_or_else(|| root.clone());
+    let prefix = format!("{folder_path}\\");
+    let folder_size = samples
+        .iter()
+        .find(|s| s.path == folder_path)
+        .map_or(0_u64, |s| s.size_bytes);
+
+    let mut children: Vec<TreemapItem> = samples
+        .iter()
+        .filter(|s| s.path.starts_with(&prefix) && !s.path[prefix.len()..].contains('\\'))
+        .map(|s| TreemapItem {
+            path: s.path.clone(),
+            size_bytes: s.size_bytes,
+        })
+        .collect();
+    // squarify exige orden descendente por tamaño.
+    children.sort_by_key(|c| std::cmp::Reverse(c.size_bytes));
+
+    // Nodo sintético: bytes de archivos sueltos (total de la carpeta menos
+    // lo que ya cubren los hijos).
+    let children_total: u64 = children.iter().map(|c| c.size_bytes).sum();
+    let files_node = folder_size.saturating_sub(children_total);
+    if files_node > 0 {
+        children.push(TreemapItem {
+            path: String::new(),
+            size_bytes: files_node,
+        });
+    }
+
+    Ok(squarify(&children, TREEMAP_W, TREEMAP_H)
+        .into_iter()
+        .map(|node| {
+            let is_files = node.path.is_empty();
+            let delta = if is_files {
+                delta_bytes(
+                    files_node,
+                    files_size_of(&prev, &folder_path, children_total),
+                )
+            } else {
+                delta_bytes(
+                    node.size_bytes,
+                    prev.get(node.path.as_str()).copied().unwrap_or(0),
+                )
+            };
+            TreemapNodeDto {
+                name: if is_files {
+                    "[archivos]".to_owned()
+                } else {
+                    node.path
+                        .rsplit('\\')
+                        .next()
+                        .unwrap_or(&node.path)
+                        .to_owned()
+                },
+                path: node.path,
+                x: node.rect.x,
+                y: node.rect.y,
+                w: node.rect.w,
+                h: node.rect.h,
+                size_bytes: node.size_bytes,
+                delta_bytes: delta,
+                is_files,
+            }
+        })
+        .collect())
+}
+
+/// Tamaño que tenían los archivos sueltos de `folder` en el snapshot anterior.
+fn files_size_of(prev: &HashMap<String, u64>, folder: &str, children_total_now: u64) -> u64 {
+    prev.get(folder)
+        .map_or(0, |total| total.saturating_sub(children_total_now))
+}
+
+/// Delta `new − old` con saturación (los tamaños nunca superan `i64::MAX`).
+fn delta_bytes(new: u64, old: u64) -> i64 {
+    let delta = i128::from(new) - i128::from(old);
+    i64::try_from(delta).unwrap_or(if delta > 0 { i64::MAX } else { i64::MIN })
+}
 
 /// Mensaje de bienvenida; queda como ejemplo del patrón command → core.
 #[tauri::command]

@@ -51,6 +51,14 @@
         <p id="scan-progress-text">Preparando…</p>
       </div>
 
+      <h2>Treemap</h2>
+      <p class="hint">
+        Cada rectángulo es una carpeta hija (área = tamaño). Clic para entrar;
+        verde = creció, naranja = se encogió desde el escaneo anterior.
+      </p>
+      <div class="row crumb" id="treemap-crumb"></div>
+      <svg id="treemap" viewBox="0 0 1000 700" role="img" aria-label="Treemap del disco"></svg>
+
       <h3>Escaneos guardados</h3>
       <table class="volumes-table" id="snapshots-table">
         <thead>

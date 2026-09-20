@@ -17,6 +17,7 @@ pub use domain::scan::{
     match_by_path, DirStat, DirWriter, ScanProgress, ScanTotals, SnapshotStore, SnapshotSummary,
     StoreError,
 };
+pub use domain::treemap::{squarify, TreemapItem, TreemapNode};
 pub use domain::usn::JournalRecord;
 pub use domain::{growth_between, growth_ranking, DriveKind, GrowthReport, UsageSample, Volume};
 pub use platform::sqlite::SqliteStore;
