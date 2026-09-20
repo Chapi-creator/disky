@@ -1,0 +1,63 @@
+name: Release
+
+# Se dispara al publicar un tag de versión: v0.1.0, v1.2.3, ...
+# Compila Tauri en modo release, empaqueta NSIS + MSI y los adjunta a la
+# GitHub Release correspondiente (la crea si no existe).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # necesarios para crear la release y subir assets
+
+jobs:
+  build:
+    name: Instaladores Windows (NSIS · MSI)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Clave propia: el perfil release compila dependencias distintas
+          # (LTO) que las del CI de checks, así no se pisan las cachés.
+          key: release
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      # Fail fast: no compilar 10 minutos para descubrir un tag mal puesto.
+      - name: El tag debe coincidir con la versión de tauri.conf.json
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CONF=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "$TAG" != "$CONF" ]; then
+            echo "::error::El tag es v$TAG pero tauri.conf.json declara $CONF."
+            echo "::error::Sube el tag desde la versión correcta o actualiza la versión y vuelve a tagear."
+            exit 1
+          fi
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      # Tauri descarga NSIS automáticamente en el runner; produce ambos bundles.
+      - name: Build de Tauri (release + bundles)
+        run: npm run tauri build
+
+      - name: Listar artefactos generados
+        shell: bash
+        run: |
+          ls -lh target/release/bundle/nsis/
+          ls -lh target/release/bundle/msi/
+
+      - name: Adjuntar instaladores a la GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
+          generate_release_notes: true

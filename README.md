@@ -67,6 +67,20 @@ Artefactos en `target/release/bundle/nsis/`. Nota: sin certificado de firma
 código, SmartScreen mostrará una advertencia la primera vez — es molestia,
 no bloqueo (ver estrategia de costos en el backlog).
 
+### Releases automáticas (CI)
+
+Al empujar un tag de versión se compila y publican los instaladores solos:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+# → GitHub Actions compila en windows-latest y adjunta a la release:
+#   disky_0.1.0_x64-setup.exe (NSIS) y disky_0.1.0_x64_en-US.msi
+```
+
+El workflow (`.github/workflows/release.yml`) valida que el tag coincida con
+la versión de `tauri.conf.json` antes de compilar (fail fast) y genera las
+notas de release automáticamente.
+
 ## Calidad
 
 ```bash
@@ -78,3 +92,5 @@ npx tsc --noEmit                                         # typecheck del fronten
 
 CI (`.github/workflows/ci.yml`): runner Windows elevado que corre los tests de
 integración con `--include-ignored`; frontend en runner separado.
+Releases (`.github/workflows/release.yml`): tag `v*` → instaladores NSIS/MSI
+adjuntos a la GitHub Release.
