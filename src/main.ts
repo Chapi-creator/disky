@@ -47,6 +47,10 @@ let treemapCrumb: string[] = [];
 let treemapEl: SVGElement | null;
 let treemapCrumbEl: HTMLElement | null;
 let timelineEl: SVGElement | null;
+let timelineLegendEl: HTMLElement | null;
+
+/** Nodos del último treemap cargado: alimentan la comparación multi-línea. */
+let lastTreemapNodes: TreemapNodeDto[] = [];
 
 /** Escapa texto arbitrario para insertarlo en HTML de forma segura. */
 function escapeHtml(text: string): string {
@@ -368,8 +372,10 @@ async function loadTreemap(folder?: string): Promise<void> {
       </g>`,
       )
       .join("");
+    lastTreemapNodes = nodes;
   } catch (err) {
     treemapEl.innerHTML = `<text x="16" y="40" class="error">${escapeHtml(String(err))}</text>`;
+    lastTreemapNodes = [];
   }
 }
 
@@ -403,50 +409,77 @@ function drillIntoTreemap(path: string): void {
 
 // ── Timeline (gráfico de líneas) ─────────────────────────────────────
 
-/** Dibuja la serie temporal de `folder` siguiendo la carpeta del treemap. */
+/** Paleta de la comparación: hasta 6 series distinguibles. */
+const SERIES_COLORS = ["#4f8cff", "#3f9d63", "#c47f2e", "#b569c9", "#e0c04f", "#9aa3b2"];
+
+/** Carpeta cuyo timeline se muestra (null = la raíz actual). */
+let timelineFolder: string | null = null;
+
+/** Etiqueta corta de una ruta para la leyenda. */
+function shortName(path: string): string {
+  return path.split("\\").pop() || path;
+}
+
+/**
+ * Dibuja el timeline comparativo: la carpeta vista más sus hijos más grandes
+ * (hasta 5), una línea por carpeta con escala temporal y de bytes comunes.
+ */
 async function loadTimeline(folder?: string): Promise<void> {
-  if (!timelineEl) return;
+  if (folder !== undefined) timelineFolder = folder ?? null;
+  if (!timelineEl || !timelineLegendEl) return;
   const W = 1000;
-  const H = 220;
-  const PAD = 44;
+  const H = 240;
+  const PAD = 52;
 
   const empty = (msg: string): void => {
-    if (timelineEl)
+    if (timelineEl && timelineLegendEl) {
       timelineEl.innerHTML = `<text x="16" y="40" fill="#9aa3b2" font-size="13">${escapeHtml(msg)}</text>`;
+      timelineLegendEl.innerHTML = "";
+    }
   };
 
+  // La carpeta vista + sus hijos directos más grandes (los del treemap ya
+  // vienen ordenados por tamaño), excluyendo el nodo sintético [archivos].
+  const base = timelineFolder ?? treemapRoot;
+  const series: { path: string; label: string }[] = [
+    { path: base, label: base ? shortName(base) : "raíz" },
+    ...lastTreemapNodes
+      .filter((n) => !n.is_files)
+      .slice(0, 5)
+      .map((n) => ({ path: n.path, label: n.name })),
+  ];
+
   try {
-    const points = await invoke<TimelinePointDto[]>("timeline_series", {
-      root: treemapRoot,
-      folder: folder ?? treemapRoot,
-      limit: 20,
-    });
-    if (points.length < 2) {
-      empty("Necesita al menos dos escaneos de esta carpeta para dibujar la línea");
+    const responses = await Promise.all(
+      series.map((s) =>
+        invoke<TimelinePointDto[]>("timeline_series", {
+          root: treemapRoot,
+          folder: s.path,
+          limit: 20,
+        }).catch(() => [] as TimelinePointDto[]),
+      ),
+    );
+
+    const valid = series
+      .map((s, i) => ({ ...s, points: responses[i] }))
+      .filter((s) => s.points.length >= 2);
+    if (valid.length === 0) {
+      empty("Necesita al menos dos escaneos de esta carpeta para dibujar las líneas");
       return;
     }
 
-    const t0 = points[0].measured_at;
-    const t1 = points[points.length - 1].measured_at;
-    const sizes = points.map((p) => p.size_bytes);
-    const min = Math.min(...sizes);
-    const max = Math.max(...sizes);
+    // Escala temporal y de bytes comunes a todas las series.
+    const allTimes = valid.flatMap((s) => s.points.map((p) => p.measured_at));
+    const t0 = Math.min(...allTimes);
+    const t1 = Math.max(...allTimes);
     const spanT = Math.max(t1 - t0, 1);
-    // El eje Y acota entre min y max; si son iguales, centra la línea.
-    const spanY = Math.max(max - min, 1);
     const xOf = (t: number): number => PAD + ((t - t0) / spanT) * (W - PAD * 2);
-    const yOf = (v: number): number =>
-      H - PAD - ((v - min) / spanY) * (H - PAD * 2);
+    const allSizes = valid.flatMap((s) => s.points.map((p) => p.size_bytes));
+    const min = Math.min(...allSizes);
+    const max = Math.max(...allSizes);
+    const spanY = Math.max(max - min, 1);
+    const yOf = (v: number): number => H - PAD - ((v - min) / spanY) * (H - PAD * 2);
 
-    const path = points
-      .map((p, i) => `${i === 0 ? "M" : "L"}${xOf(p.measured_at).toFixed(1)},${yOf(p.size_bytes).toFixed(1)}`)
-      .join(" ");
-    const dots = points
-      .map(
-        (p, i) =>
-          `<circle cx="${xOf(p.measured_at).toFixed(1)}" cy="${yOf(p.size_bytes).toFixed(1)}" r="4" fill="${i === points.length - 1 ? "#4f8cff" : "#9aa3b2"}"><title>${escapeHtml(new Date(p.measured_at * 1000).toLocaleString())} · ${formatBytes(p.size_bytes)} (Δ ${formatDelta(p.delta_bytes)})</title></circle>`,
-      )
-      .join("");
     const gridLines = [min, (min + max) / 2, max]
       .map(
         (v) =>
@@ -454,10 +487,29 @@ async function loadTimeline(folder?: string): Promise<void> {
       )
       .join("");
 
-    timelineEl.innerHTML =
-      gridLines +
-      `<path d="${path}" fill="none" stroke="#4f8cff" stroke-width="2" />` +
-      dots;
+    const paths = valid
+      .map((s, i) => {
+        const color = SERIES_COLORS[i % SERIES_COLORS.length];
+        const d = s.points
+          .map((p, j) => `${j === 0 ? "M" : "L"}${xOf(p.measured_at).toFixed(1)},${yOf(p.size_bytes).toFixed(1)}`)
+          .join(" ");
+        const dots = s.points
+          .map(
+            (p) =>
+              `<circle cx="${xOf(p.measured_at).toFixed(1)}" cy="${yOf(p.size_bytes).toFixed(1)}" r="3.5" fill="${color}"><title>${escapeHtml(s.label)} · ${escapeHtml(new Date(p.measured_at * 1000).toLocaleString())} · ${formatBytes(p.size_bytes)} (Δ ${formatDelta(p.delta_bytes)})</title></circle>`,
+          )
+          .join("");
+        return `<path d="${d}" fill="none" stroke="${color}" stroke-width="2" />${dots}`;
+      })
+      .join("");
+
+    timelineEl.innerHTML = gridLines + paths;
+    timelineLegendEl.innerHTML = valid
+      .map(
+        (s, i) =>
+          `<span class="legend-item"><span class="legend-swatch" style="background:${SERIES_COLORS[i % SERIES_COLORS.length]}"></span>${escapeHtml(s.label)}</span>`,
+      )
+      .join("");
   } catch (err) {
     empty(String(err));
   }
@@ -499,6 +551,7 @@ window.addEventListener("DOMContentLoaded", () => {
   treemapEl = document.querySelector("#treemap");
   treemapCrumbEl = document.querySelector("#treemap-crumb");
   timelineEl = document.querySelector("#timeline");
+  timelineLegendEl = document.querySelector("#timeline-legend");
 
   document.querySelector("#greet-form")?.addEventListener("submit", (e) => {
     e.preventDefault();
