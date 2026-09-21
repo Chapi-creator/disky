@@ -5,6 +5,14 @@ desde la semana pasada y por culpa de quién**: *"Discord creció 6 GB en 3 día
 
 Solo lectura, 100% local, sin servidores.
 
+## Capturas
+
+![Vista completa de disky](docs/screenshots/app-completa.png)
+
+![Treemap: el área de cada rectángulo es su tamaño; verde creció, naranja se encogió](docs/screenshots/treemap.png)
+
+![Timeline de crecimiento comparado](docs/screenshots/timeline-crecimiento.png)
+
 ## Estado
 
 ✅ **MVP completo: escaneo sin admin + UAC + treemap + timeline.**
