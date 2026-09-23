@@ -15,6 +15,11 @@ dist-ssr
 # Cargo
 /target
 
+# Plataformas no usadas: iconos Android/iOS y caché de Python
+/src-tauri/icons/android/
+/src-tauri/icons/ios/
+scripts/__pycache__/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

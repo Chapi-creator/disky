@@ -1,5 +1,7 @@
 # disky — ¿qué creció en mi disco?
 
+<p align="center"><img src="docs/logo/logo.png" alt="disky" width="160"></p>
+
 WinDirStat te dice cuánto pesa cada carpeta *hoy*. disky te dice **qué creció
 desde la semana pasada y por culpa de quién**: *"Discord creció 6 GB en 3 días"*.
 
