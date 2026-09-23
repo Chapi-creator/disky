@@ -11,6 +11,7 @@ import type {
   GrowthDiff,
   GrowthReport,
   JournalRecord,
+  LargestFile,
   ScanAllUnit,
   ScanDonePayload,
   ScanProgress,
@@ -36,6 +37,8 @@ let scanProgressEl: HTMLElement | null;
 let scanProgressTextEl: HTMLElement | null;
 let snapshotsEl: HTMLElement | null;
 let growthEl: HTMLElement | null;
+let growthThresholdEl: HTMLInputElement | null;
+let largestEl: HTMLElement | null;
 
 /** `true` mientras un "Escanear todo" está en curso. */
 let scanAllActive = false;
@@ -66,9 +69,7 @@ async function startScanAll(): Promise<void> {
 /** Como `handleScanDone`, pero manteniendo el estado ocupado del lote. */
 function handleScanDoneKeepBusy(payload: ScanDonePayload): void {
   if (payload.snapshot) {
-    void loadSnapshots();
-    void loadGrowth();
-    void refreshTreemapForRoot(payload.snapshot.root);
+    refreshData(payload.snapshot.root);
   }
   // Los errores de unidad se muestran sin abortar el resto del lote.
   if (payload.error && scanProgressTextEl && !payload.error.includes("cancelado")) {
@@ -237,19 +238,76 @@ function snapshotRow(snapshot: SnapshotSummary): string {
     <td class="num">${formatBytes(snapshot.total_bytes)}</td>
     <td class="num">${snapshot.total_files.toLocaleString()}</td>
     <td class="num">${snapshot.read_errors.toLocaleString()}</td>
+    <td><button type="button" class="row-action" data-delete-snapshot="${snapshot.id}" title="Borrar este escaneo">🗑</button></td>
   </tr>`;
+}
+
+/** Umbral de alerta de crecimiento en bytes (editable en la UI). */
+function growthAlertThresholdBytes(): number | null {
+  if (!growthThresholdEl) return null;
+  return Math.max(0, Number(growthThresholdEl.value) || 0) * 1024 * 1024;
 }
 
 function growthRow(report: GrowthReport): string {
   const cls = report.delta_bytes > 0 ? "delta-pos" : report.delta_bytes < 0 ? "delta-neg" : "";
   const perDay = report.delta_bytes / Math.max(report.elapsed_seconds, 1) * 86_400;
-  return `<tr class="clickable" data-path="${escapeHtml(report.path)}">
+  const threshold = growthAlertThresholdBytes();
+  const alert =
+    threshold !== null &&
+    report.delta_bytes >= threshold &&
+    (report.delta_bytes > 0 || report.new_bytes > 0)
+      ? ' class="grow-alert"'
+      : "";
+  return `<tr${alert} class="clickable" data-path="${escapeHtml(report.path)}">
     <td class="path">${escapeHtml(report.path)}</td>
     <td class="num">${formatBytes(report.old_bytes)}</td>
     <td class="num">${formatBytes(report.new_bytes)}</td>
     <td class="num ${cls}">${formatDelta(report.delta_bytes)}</td>
     <td class="num ${cls}">${formatDelta(Math.round(perDay))}</td>
   </tr>`;
+}
+
+function largestRow(file: LargestFile, index: number): string {
+  const when =
+    file.mtime_unix > 0
+      ? new Date(file.mtime_unix * 1000).toLocaleDateString()
+      : "—";
+  return `<tr>
+    <td class="num">${index + 1}</td>
+    <td class="path">${escapeHtml(file.path)}</td>
+    <td class="num">${formatBytes(file.size_bytes)}</td>
+    <td class="num">${escapeHtml(when)}</td>
+  </tr>`;
+}
+
+/** Vacía la tabla si no queda nada pintable. */
+function emptyTable(el: HTMLElement | null, cols: number, msg: string): void {
+  if (el) el.innerHTML = `<tr><td colspan="${cols}">${msg}</td></tr>`;
+}
+
+/** Carga los archivos más pesados del último snapshot de la raíz actual. */
+async function loadLargest(): Promise<void> {
+  const el = largestEl;
+  if (!el) return;
+  try {
+    const snaps = await invoke<SnapshotSummary[]>("snapshots_list", {
+      root: currentScanRoot(),
+    });
+    const latest = snaps[0];
+    if (!latest) {
+      el.innerHTML = `<tr><td colspan="4">Aún no hay escaneos guardados</td></tr>`;
+      return;
+    }
+    const files = await invoke<LargestFile[]>("largest_files", {
+      snapshotId: latest.id,
+    });
+    el.innerHTML =
+      files.length > 0
+        ? files.map(largestRow).join("")
+        : `<tr><td colspan="4">Este snapshot no registró archivos pesados</td></tr>`;
+  } catch (err) {
+    el.innerHTML = `<tr><td colspan="4" class="error">Error: ${escapeHtml(String(err))}</td></tr>`;
+  }
 }
 
 async function loadSnapshots(): Promise<void> {
@@ -259,9 +317,9 @@ async function loadSnapshots(): Promise<void> {
     snapshotsEl.innerHTML =
       snapshots.length > 0
         ? snapshots.map(snapshotRow).join("")
-        : `<tr><td colspan="5">Aún no hay escaneos guardados</td></tr>`;
+        : `<tr><td colspan="6">Aún no hay escaneos guardados</td></tr>`;
   } catch (err) {
-    snapshotsEl.innerHTML = `<tr><td colspan="5" class="error">Error: ${escapeHtml(String(err))}</td></tr>`;
+    snapshotsEl.innerHTML = `<tr><td colspan="6" class="error">Error: ${escapeHtml(String(err))}</td></tr>`;
   }
 }
 
@@ -286,10 +344,21 @@ function childrenOf(folder: string): GrowthReport[] {
 }
 
 /** Pinta la tabla de crecimiento: vista completa o drill-down. */
+function growthTop3(): string {
+  if (!lastGrowth) return "";
+  const top = [...lastGrowth.rows]
+    .sort((a, b) => b.delta_bytes - a.delta_bytes)
+    .slice(0, 3)
+    .filter((r) => r.delta_bytes > 0);
+  if (top.length === 0) return "";
+  return " · <strong>Más crecieron:</strong> " +
+    top.map((r) => `${escapeHtml(r.path)} (${formatDelta(r.delta_bytes)})`).join(", ");
+}
+
 function renderGrowth(): void {
   if (!growthEl) return;
   if (!lastGrowth) {
-    growthEl.innerHTML = `<tr><td colspan="5">Requiere dos escaneos de la misma raíz</td></tr>`;
+    emptyTable(growthEl, 5, "Requiere dos escaneos de la misma raíz");
     return;
   }
   const period = growthPeriodLabel();
@@ -312,7 +381,7 @@ function renderGrowth(): void {
 
   growthEl.innerHTML =
     lastGrowth.rows.length > 0
-      ? `<tr class="period"><td colspan="5">${period} · clic en una carpeta para ver sus hijos</td></tr>` +
+      ? `<tr class="period"><td colspan="5">${period}${growthTop3()} · clic en una carpeta para ver sus hijos</td></tr>` +
         lastGrowth.rows.map(growthRow).join("")
       : `<tr><td colspan="5">Sin diferencias de tamaño entre los dos escaneos</td></tr>`;
 }
@@ -358,15 +427,21 @@ async function cancelScan(): Promise<void> {
   }
 }
 
+/** Refresco común tras un escaneo: historial, ¿qué creció? y treemap/timeline. */
+function refreshData(root: string): void {
+  void loadSnapshots();
+  void loadGrowth();
+  void loadLargest();
+  void refreshTreemapForRoot(root);
+}
+
 function handleScanDone(payload: ScanDonePayload): void {
   setScanBusy(false);
   if (payload.error) {
     showScanError(payload.error);
     return;
   }
-  void loadSnapshots();
-  void loadGrowth();
-  void refreshTreemapForRoot(currentScanRoot());
+  refreshData(currentScanRoot());
 }
 
 /** Resultado del escaneo elevado: refresco idéntico al normal. */
@@ -376,9 +451,7 @@ function handleQuickScanDone(payload: ScanQuickDonePayload): void {
     showScanError(payload.error);
     return;
   }
-  void loadSnapshots();
-  void loadGrowth();
-  void refreshTreemapForRoot(currentScanRoot());
+  refreshData(currentScanRoot());
 }
 
 // ── Treemap ─────────────────────────────────────────────────────────────
@@ -591,6 +664,8 @@ window.addEventListener("DOMContentLoaded", () => {
   scanProgressTextEl = document.querySelector("#scan-progress-text");
   snapshotsEl = document.querySelector("#snapshots-table tbody");
   growthEl = document.querySelector("#growth-table tbody");
+  growthThresholdEl = document.querySelector("#growth-alert-threshold");
+  largestEl = document.querySelector("#largest-table tbody");
   treemapEl = document.querySelector("#treemap");
   treemapCrumbEl = document.querySelector("#treemap-crumb");
   timelineEl = document.querySelector("#timeline");
@@ -611,12 +686,31 @@ window.addEventListener("DOMContentLoaded", () => {
   scanAllBtnEl?.addEventListener("click", () => void startScanAll());
   scanCancelBtnEl?.addEventListener("click", () => void cancelScan());
 
-  // Delegación de clics para el drill-down (las filas se recrean a menudo).
+  growthThresholdEl?.addEventListener("input", () => renderGrowth());
   growthEl?.addEventListener("click", (event) => {
     const row = (event.target as HTMLElement).closest("tr[data-path]");
     if (!row) return;
     drillPath = row.getAttribute("data-path");
     renderGrowth();
+  });
+
+  snapshotsEl?.addEventListener("click", (event) => {
+    const btn = (event.target as HTMLElement).closest("[data-delete-snapshot]");
+    if (!btn) return;
+    const id = Number(btn.getAttribute("data-delete-snapshot"));
+    const root = btn.closest("tr")?.firstElementChild?.textContent ?? "";
+    const ok = window.confirm(
+      `¿Borrar el escaneo de ${root} (id ${id})? No se puede deshacer.`,
+    );
+    if (!ok) return;
+    void (async () => {
+      try {
+        await invoke("delete_snapshot", { snapshotId: id });
+        await loadSnapshots();
+      } catch (err) {
+        window.alert(`No se pudo borrar el escaneo: ${String(err)}`);
+      }
+    })();
   });
 
   // Treemap: clic en un rectángulo para entrar a la carpeta.
@@ -631,9 +725,6 @@ window.addEventListener("DOMContentLoaded", () => {
     if (scanProgressTextEl) {
       scanProgressTextEl.textContent = `${p.files.toLocaleString()} archivos · ${p.dirs.toLocaleString()} carpetas · ${formatBytes(p.bytes)} · ${p.read_errors.toLocaleString()} errores de lectura`;
     }
-  });
-  void listen<ScanDonePayload>("scan-done", (event) => {
-    handleScanDone(event.payload);
   });
   void listen<ScanQuickDonePayload>("scan-quick-done", (event) => {
     handleQuickScanDone(event.payload);
@@ -661,4 +752,5 @@ window.addEventListener("DOMContentLoaded", () => {
 
   void loadVolumes();
   void loadSnapshots();
+  void loadLargest();
 });

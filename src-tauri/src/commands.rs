@@ -18,8 +18,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use disky_core::platform::path_norm::normalize_path_separators;
 use disky_core::{
     growth_ranking, journal_status, list_volumes as core_list_volumes, match_by_path,
-    recent_records, squarify, walk_tree, GrowthReport, JournalRecord, PlatformError,
-    SnapshotStore as _, SnapshotSummary, TreemapItem, UsnStatus, WalkError,
+    recent_records, squarify, walk_tree, DirStat, GrowthReport, JournalRecord, LargestFile,
+    PlatformError, SnapshotStore as _, SnapshotSummary, SqliteStore, TreemapItem, UsnStatus,
+    WalkError,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -75,12 +76,15 @@ pub fn treemap_nodes(
     let Some(latest) = snaps.first() else {
         return Err("Aún no hay escaneos de esta raíz".into());
     };
+    // Solo la carpeta vista y su primer nivel: una consulta por prefijo en vez
+    // de cargar el snapshot completo en cada drill-down.
+    let folder_view = normalize_path_separators(&folder.clone().unwrap_or_else(|| root.clone()));
     let samples = store
-        .load_dir_samples(latest.id)
+        .load_dir_samples_prefixed(latest.id, &folder_view)
         .map_err(|e| e.to_string())?;
     let prev: HashMap<String, u64> = if snaps.len() > 1 {
         store
-            .load_dir_samples(snaps[1].id)
+            .load_dir_samples_prefixed(snaps[1].id, &folder_view)
             .map_err(|e| e.to_string())?
             .into_iter()
             .map(|s| (s.path, s.size_bytes))
@@ -91,8 +95,8 @@ pub fn treemap_nodes(
     drop(store);
 
     // El snapshot más reciente siempre trae separadores nativos (el store
-    // normaliza al escribir), pero `folder`/`root` vienen del frontend.
-    let folder_path = normalize_path_separators(&folder.unwrap_or_else(|| root.clone()));
+    // normaliza al escribir); `folder_view` ya viene normalizado.
+    let folder_path = folder_view;
     let prefix = format!("{folder_path}{}", std::path::MAIN_SEPARATOR);
     let folder_size = samples
         .iter()
@@ -260,6 +264,8 @@ pub struct ScanDonePayload {
     pub snapshot: Option<SnapshotSummary>,
     /// Crecimiento entre los dos snapshots más recientes de la raíz.
     pub growth: Option<GrowthDiff>,
+    /// Archivos más pesados del snapshot (vacío si no hay snapshot).
+    pub largest: Vec<LargestFile>,
     /// Mensaje de error accionable, si falló o se canceló.
     pub error: Option<String>,
 }
@@ -316,15 +322,14 @@ pub fn scan_all_start(window: tauri::Window, state: State<'_, AppState>) -> Resu
                 },
             );
             let root_path = PathBuf::from(root);
-            let (snapshot, error) = perform_scan(&handle, &state, root, &root_path);
+            let (snapshot, largest, error) = perform_scan(&handle, &state, root, &root_path);
             // El evento por unidad: el frontend refresca lo acumulado.
             let growth = if snapshot.is_some() {
-                let store = lock_store(&state.store);
-                compute_growth(&store, root)
+                compute_growth_root(&state, root)
             } else {
                 None
             };
-            emit_done(&handle, snapshot, growth, error.clone());
+            emit_done(&handle, snapshot, growth, largest, error.clone());
             if error.is_some() {
                 // Falla o cancelación de la unidad: se continúa con la siguiente
                 // salvo que se haya pedido cancelar.
@@ -409,6 +414,18 @@ pub fn snapshots_list(
         .map_err(|e| e.to_string())
 }
 
+/// Elimina un snapshot (y sus directorios y top-N) por su id.
+///
+/// Idempotente: borrar un id inexistente es un no-op.
+///
+/// # Errors
+/// `String` si el borrado en la base de datos falla.
+#[tauri::command]
+pub fn delete_snapshot(state: State<'_, AppState>, snapshot_id: u64) -> Result<(), String> {
+    let mut store = lock_store(&state.store);
+    store.delete_snapshot(snapshot_id).map_err(|e| e.to_string())
+}
+
 /// Comparación de los dos snapshots más recientes de `root`.
 ///
 /// Devuelve `None` si hay menos de dos snapshots de esa raíz.
@@ -448,6 +465,19 @@ pub fn growth_report(
     }))
 }
 
+/// Archivos más pesados de un snapshot (los recogió el walker como top-N).
+///
+/// # Errors
+/// `String` si la consulta a la base de datos falla.
+#[tauri::command]
+pub fn largest_files(
+    state: State<'_, AppState>,
+    snapshot_id: u64,
+) -> Result<Vec<LargestFile>, String> {
+    let store = lock_store(&state.store);
+    store.load_top_files(snapshot_id).map_err(|e| e.to_string())
+}
+
 /// Traduce errores del core a mensajes accionables para la UI.
 #[must_use]
 pub fn render_error(err: PlatformError) -> String {
@@ -474,44 +504,65 @@ pub fn render_error(err: PlatformError) -> String {
 
 /// Cuerpo del escaneo, ejecutado en un hilo dedicado.
 ///
-/// Escribe el snapshot de forma atómica (invisible hasta `finish`), emite
-/// progreso periódico y cierra con el evento `scan-done` en todos los casos.
-/// Ejecuta el escaneo de una raíz y lo guarda. Devuelve el snapshot creado
-/// (`None` si se canceló o falló) y el texto de error si lo hubo.
+/// Abre una **conexión `SQLite` propia** en vez de bloquear el store global: WAL
+/// permite un escritor + N lectores concurrentes, así que la UI puede seguir
+/// consultando (`treemap_nodes`, `snapshots_list`...) mientras el walk corre.
+/// El snapshot es atómico (invisible hasta `finish`), emite progreso periódico
+/// y cierra con el evento `scan-done` en todos los casos.
 ///
-/// El llamador es dueño del estado del flag `scanning` y del evento final:
-/// esta función solo hace el trabajo de escanear + persistir.
+/// Devuelve el snapshot creado (`None` si se canceló o falló), los archivos
+/// más pesados y el texto de error si lo hubo. El llamador es dueño del flag
+/// `scanning` y del evento final.
 fn perform_scan(
     handle: &AppHandle,
     state: &AppState,
     root: &str,
     root_path: &Path,
-) -> (Option<SnapshotSummary>, Option<String>) {
+) -> (Option<SnapshotSummary>, Vec<LargestFile>, Option<String>) {
     let started_at = unix_now();
     let started = Instant::now();
 
-    let mut store = lock_store(&state.store);
-    let Ok(mut writer) = store.open_writer(root, started_at) else {
+    let Ok(mut store) = SqliteStore::open(&state.db_path) else {
         return (
             None,
+            Vec::new(),
             Some("No se pudo abrir la base de datos para guardar el escaneo".into()),
         );
     };
+    let Ok(mut writer) = store.open_writer(root, started_at) else {
+        return (
+            None,
+            Vec::new(),
+            Some("No se pudo iniciar el snapshot del escaneo".into()),
+        );
+    };
 
+    // Búfer de directorios: escribe en la BD en lotes en vez de fila a fila.
+    let mut batch: Vec<DirStat> = Vec::with_capacity(DIR_BATCH);
     let scan_result = walk_tree(
         root_path,
         &state.cancel,
-        // Un directorio por llamada: el escritor se ocupa del lote.
         &mut |dir| {
-            let _ = writer.write_dirs(std::slice::from_ref(&dir));
+            batch.push(dir);
+            if batch.len() >= DIR_BATCH {
+                let _ = writer.write_dirs(&batch);
+                batch.clear();
+            }
         },
         &mut |progress| {
             let _ = handle.emit("scan-progress", progress);
         },
     );
+    // El resto del lote (y en cancelación, también: el writer descartado
+    // hace rollback, así que escribir el resto aquí solo gasta CPU).
+    if !batch.is_empty() {
+        let _ = writer.write_dirs(&batch);
+    }
 
     let outcome = match scan_result {
         Ok(totals) => {
+            let (top, total_files, total_bytes, read_errors) =
+                (totals.top.clone(), totals.files, totals.bytes, totals.read_errors);
             let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
             match writer.finish(totals, duration_ms) {
                 Ok(id) => {
@@ -520,38 +571,40 @@ fn perform_scan(
                         root: root.to_owned(),
                         started_at,
                         duration_ms,
-                        total_files: totals.files,
-                        total_bytes: totals.bytes,
-                        read_errors: totals.read_errors,
+                        total_files,
+                        total_bytes,
+                        read_errors,
                     };
-                    (Some(snapshot), None)
+                    (Some(snapshot), top, None)
                 }
-                Err(err) => (None, Some(err.to_string())),
+                Err(err) => (None, Vec::new(), Some(err.to_string())),
             }
         }
         // Cancelación: el escritor se descarta y la transacción hace rollback,
         // así que no queda un snapshot a medias.
-        Err(WalkError::Cancelled) => (None, Some("Escaneo cancelado".into())),
-        Err(err) => (None, Some(err.to_string())),
+        Err(WalkError::Cancelled) => (None, Vec::new(), Some("Escaneo cancelado".into())),
+        Err(err) => (None, Vec::new(), Some(err.to_string())),
     };
 
-    // El guard se suelta al retornar: sin drop explícito (el borrow del
-    // writer sigue vivo en los brazos de error del match).
+    // La conexión dedicada se cierra al soltar `store`: el guard global del
+    // Mutex ya no existe y los lectores de la UI nunca se bloquearon.
     outcome
 }
 
+/// Directorios por lote al escribir el snapshot (compromiso latencia/memoria).
+const DIR_BATCH: usize = 512;
+
 fn run_scan(handle: AppHandle, root: String, root_path: PathBuf) {
     let state = handle.state::<AppState>();
-    let (snapshot, error) = perform_scan(&handle, &state, &root, &root_path);
+    let (snapshot, largest, error) = perform_scan(&handle, &state, &root, &root_path);
 
     // Growth fresco para la raíz escaneada (aunque falle, el evento informa).
     let growth = if snapshot.is_some() {
-        let store = lock_store(&state.store);
-        compute_growth(&store, &root)
+        compute_growth_root(&state, &root)
     } else {
         None
     };
-    emit_done(&handle, snapshot, growth, error);
+    emit_done(&handle, snapshot, growth, largest, error);
     state.scanning.store(false, Ordering::SeqCst);
 }
 
@@ -579,11 +632,21 @@ fn compute_growth(store: &disky_core::SqliteStore, root: &str) -> Option<GrowthD
     })
 }
 
+/// Abre una conexión propia para leer el growth (el hilo llamador puede ser el
+/// de un escaneo que retiene el store global; WAL permite leer en paralelo).
+fn compute_growth_root(state: &AppState, root: &str) -> Option<GrowthDiff> {
+    let Ok(store) = SqliteStore::open(&state.db_path) else {
+        return None;
+    };
+    compute_growth(&store, root)
+}
+
 /// Emite `scan-done` con el payload completo.
 fn emit_done(
     handle: &AppHandle,
     snapshot: Option<SnapshotSummary>,
     growth: Option<GrowthDiff>,
+    largest: Vec<LargestFile>,
     error: Option<String>,
 ) {
     let _ = handle.emit(
@@ -591,6 +654,7 @@ fn emit_done(
         ScanDonePayload {
             snapshot,
             growth,
+            largest,
             error,
         },
     );
@@ -603,6 +667,8 @@ pub struct ScanQuickDonePayload {
     pub snapshot: Option<SnapshotSummary>,
     /// Crecimiento refrescado contra los dos snapshots más recientes.
     pub growth: Option<GrowthDiff>,
+    /// Archivos más pesados del snapshot (vacío si no hay snapshot).
+    pub largest: Vec<LargestFile>,
     /// Mensaje accionable (UAC cancelado, hijo falló, resultado corrupto...).
     pub error: Option<String>,
 }
@@ -698,18 +764,29 @@ fn finish_quick_scan(handle: &AppHandle, state: &State<'_, AppState>, root: &str
     }
 
     // El hijo guardó el snapshot en la misma BD: lo recargamos para la UI.
-    let store = lock_store(&state.store);
+    let Ok(store) = SqliteStore::open(&state.db_path) else {
+        emit_quick_error(
+            handle,
+            "No se pudo leer la base de datos tras el escaneo elevado".into(),
+        );
+        return;
+    };
     let snapshot = store
         .list_snapshots(Some(root), 1)
         .ok()
         .and_then(|s| s.into_iter().next());
     let growth = compute_growth(&store, root);
+    let largest = snapshot
+        .as_ref()
+        .and_then(|s| store.load_top_files(s.id).ok())
+        .unwrap_or_default();
     drop(store);
     let _ = handle.emit(
         "scan-quick-done",
         ScanQuickDonePayload {
             snapshot,
             growth,
+            largest,
             error: None,
         },
     );
@@ -722,13 +799,21 @@ fn emit_quick_error(handle: &AppHandle, error: String) {
         ScanQuickDonePayload {
             snapshot: None,
             growth: None,
+            largest: Vec::new(),
             error: Some(error),
         },
     );
 }
 
 /// Escapa un argumento con comillas dobles para la línea de comandos de Windows.
+///
+/// Rechaza `"` embebidos (rutas legales de Windows no los contienen): envolver
+/// un path que contenga una comilla rompería la estructura de `lpParameters`
+/// en `ShellExecuteExW` (inyección de argumentos al hijo elevado). Fail-closed.
 fn quote_arg(value: &str) -> String {
+    if value.contains('"') {
+        return String::new();
+    }
     format!("\"{value}\"")
 }
 

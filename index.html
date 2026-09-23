@@ -73,14 +73,21 @@
             <th>Uso medido</th>
             <th>Archivos</th>
             <th>Errores</th>
+            <th></th>
           </tr>
         </thead>
         <tbody>
-          <tr><td colspan="5">Aún no hay escaneos guardados</td></tr>
+          <tr><td colspan="6">Aún no hay escaneos guardados</td></tr>
         </tbody>
       </table>
 
-      <h3>¿Qué creció?</h3>
+      <h3>¿Qué creció?
+        <span class="hint-inline">
+          Alertar si crecieron más de
+          <input id="growth-alert-threshold" type="number" min="0" step="100" value="100" aria-label="Umbral de alerta en MB" />
+          MB por scan
+        </span>
+      </h3>
       <table class="volumes-table" id="growth-table">
         <thead>
           <tr>
@@ -93,6 +100,25 @@
         </thead>
         <tbody>
           <tr><td colspan="5">Requiere dos escaneos de la misma raíz</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Archivos más pesados</h3>
+      <p class="hint">
+        Top 50 archivos por tamaño del último escaneo. Se recogen durante el
+        recorrido, así que no agrandan la base de datos.
+      </p>
+      <table class="volumes-table" id="largest-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Archivo</th>
+            <th>Tamaño</th>
+            <th>Modificado</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="4">Aún no hay escaneos guardados</td></tr>
         </tbody>
       </table>
 

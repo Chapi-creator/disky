@@ -18,13 +18,14 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::domain::scan::{
-    DirStat, DirWriter, ScanTotals, SeriesPoint, SnapshotStore, SnapshotSummary, StoreError,
+    DirStat, DirWriter, LargestFile, ScanTotals, SeriesPoint, SnapshotStore, SnapshotSummary,
+    StoreError,
 };
 use crate::domain::UsageSample;
 use crate::platform::path_norm::normalize_path_separators;
 
 /// Esquema actual de la base de datos.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// Ruta por defecto de la base de datos: `%LOCALAPPDATA%\disky\snapshots.db`
 /// en Windows, `~/.local/state/disky/snapshots.db` en el resto.
@@ -97,6 +98,14 @@ impl SqliteStore {
                 PRIMARY KEY (snapshot_id, path)
             );
             CREATE INDEX IF NOT EXISTS idx_dirs_path ON dirs(path);
+            CREATE TABLE IF NOT EXISTS top_files (
+                snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+                path        TEXT NOT NULL,
+                size_bytes  INTEGER NOT NULL,
+                mtime_unix  INTEGER NOT NULL,
+                PRIMARY KEY (snapshot_id, path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_top_files_size ON top_files(snapshot_id, size_bytes);
             PRAGMA foreign_keys = ON;",
         )
         .map_err(db_err("creando esquema"))?;
@@ -267,6 +276,59 @@ impl SnapshotStore for SqliteStore {
         Ok(points)
     }
 
+    fn load_dir_samples_prefixed(
+        &self,
+        snapshot_id: u64,
+        prefix: &str,
+    ) -> Result<Vec<UsageSample>, StoreError> {
+        let prefix = to_key(prefix);
+        // Rango cerrado [prefix, prefix + max] sobre el índice de `path`: lee
+        // solo las filas bajo el prefijo (p. ej. los hijos de una carpeta para
+        // el treemap) sin escanear el snapshot completo.
+        // El upper bound es el prefijo con su último BYTE incrementado. Se
+        // calcula sobre bytes (no `char`): con prefijos no-ASCII el último
+        // byte puede ser >0x7F y `(byte+1) as char` fabricaría un char
+        // inválido o partiría un codepoint UTF-8 a la mitad (Upper suelto
+        // malformado = resultados incorrectos). 0xFF... = rango abierto.
+        let upper = {
+            let mut bytes = prefix.clone().into_bytes();
+            let Some(last) = bytes.pop() else {
+                return Ok(Vec::new()); // prefijo vacío: ningún path lo empieza
+            };
+            if last == 0xFF {
+                None // prefijo termina en 0xFF → sin upper (abierto)
+            } else {
+                bytes.push(last + 1);
+                // `last+1 <= 0xFE`; si `last` era ASCII el resultado sigue
+                // siendo un prefijo válido. Si `last` era >0x7F (multi-byte),
+                // `last+1` ya no es un sufijo UTF-8 válido: `from_utf8` falla
+                // y devolvemos abierto (fail-safe, sin resultados rotos).
+                String::from_utf8(bytes).ok()
+            }
+        };
+        let sql =
+            "SELECT d.path, s.started_at, d.size_bytes FROM dirs d JOIN snapshots s ON s.id = d.snapshot_id
+             WHERE d.snapshot_id = ?1 AND d.path >= ?2 AND (?3 IS NULL OR d.path < ?3)";
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(db_err("preparando consulta prefijada de dirs"))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![to_db(snapshot_id), prefix, upper],
+                |row| {
+                    Ok(UsageSample {
+                        path: row.get(0)?,
+                        measured_at: row.get(1)?,
+                        size_bytes: non_neg(row.get::<_, i64>(2)?),
+                    })
+                },
+            )
+            .map_err(db_err("leyendo dirs prefijados"))?;
+        rows.map(|row| row.map_err(db_err("leyendo fila de dir prefijada")))
+            .collect()
+    }
+
     fn prune(&mut self, root: &str, keep: u32) -> Result<(), StoreError> {
         self.conn
             .execute(
@@ -277,6 +339,36 @@ impl SnapshotStore for SqliteStore {
             )
             .map_err(db_err("podando snapshots"))?;
         Ok(())
+    }
+
+    fn delete_snapshot(&mut self, snapshot_id: u64) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM snapshots WHERE id = ?1",
+                [to_db(snapshot_id)],
+            )
+            .map_err(db_err("borrando snapshot"))?;
+        Ok(())
+    }
+
+    fn load_top_files(&self, snapshot_id: u64) -> Result<Vec<LargestFile>, StoreError> {
+        let sql = "SELECT path, size_bytes, mtime_unix FROM top_files
+                   WHERE snapshot_id = ?1 ORDER BY size_bytes DESC, path ASC";
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(db_err("preparando consulta de top_files"))?;
+        let rows = stmt
+            .query_map([to_db(snapshot_id)], |row| {
+                Ok(LargestFile {
+                    path: row.get(0)?,
+                    size_bytes: non_neg(row.get::<_, i64>(1)?),
+                    mtime_unix: row.get(2)?,
+                })
+            })
+            .map_err(db_err("leyendo top_files"))?;
+        rows.map(|row| row.map_err(db_err("leyendo fila de top_files")))
+            .collect()
     }
 }
 
@@ -330,6 +422,16 @@ impl DirWriter for SqliteDirWriter<'_> {
         totals: ScanTotals,
         duration_ms: i64,
     ) -> Result<u64, StoreError> {
+        for file in &totals.top {
+            let size = i64::try_from(file.size_bytes).unwrap_or(i64::MAX);
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO top_files(snapshot_id, path, size_bytes, mtime_unix)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![self.id, to_key(&file.path), size, file.mtime_unix],
+                )
+                .map_err(db_err("insertando archivo del top-N"))?;
+        }
         self.conn
             .execute(
                 "UPDATE snapshots
@@ -425,6 +527,7 @@ mod tests {
                         dirs: 3,
                         bytes: 300,
                         read_errors: 1,
+                        top: Vec::new(),
                     },
                     1_500,
                 )
@@ -522,6 +625,35 @@ mod tests {
 
         assert_eq!(store.list_snapshots(Some("C:\\A"), 10).expect("a").len(), 1);
         assert_eq!(store.list_snapshots(Some("C:\\B"), 10).expect("b").len(), 1);
+    }
+
+    #[test]
+    fn delete_snapshot_removes_cascade() {
+        let (_tmp, mut store) = open_tmp();
+        for started_at in [1, 2] {
+            let mut writer = store.open_writer("C:\\P", started_at).expect("writer");
+            write_all(&mut writer, &[("C:\\P\\x".into(), 10, 0, 1)]);
+            writer.finish(ScanTotals::default(), 0).expect("finish");
+        }
+        let snaps = store.list_snapshots(Some("C:\\P"), 10).expect("listar");
+        assert_eq!(snaps.len(), 2);
+        let deleted_id = snaps[0].id;
+        store.delete_snapshot(deleted_id).expect("borrar");
+
+        let snaps = store.list_snapshots(Some("C:\\P"), 10).expect("listar");
+        assert_eq!(snaps.len(), 1);
+        assert_ne!(snaps[0].id, deleted_id);
+        assert_eq!(
+            store.load_dir_samples(deleted_id),
+            Err(StoreError::UnknownSnapshot(deleted_id))
+        );
+    }
+
+    #[test]
+    fn delete_snapshot_is_idempotent() {
+        let (_tmp, mut store) = open_tmp();
+        store.delete_snapshot(999).expect("borrar inexistente es no-op");
+        assert_eq!(store.list_snapshots(None, 10).expect("listar").len(), 0);
     }
 
     #[test]
@@ -633,6 +765,82 @@ mod tests {
     }
 
     #[test]
+    fn load_dir_samples_prefixed_matches_full_load_filtered() {
+        let (_tmp, mut store) = open_tmp();
+        let id = {
+            let mut w = store.open_writer("C:\\Pfx", 1_000).expect("w");
+            write_all(
+                &mut w,
+                &[
+                    ("C:\\Pfx".into(), 999, 0, 1),
+                    ("C:\\Pfx\\Hijo1".into(), 100, 0, 1),
+                    ("C:\\Pfx\\Hijo1\\Nieto".into(), 60, 0, 1),
+                    ("C:\\Pfx\\Hijo2".into(), 200, 0, 1),
+                    ("C:\\Otra".into(), 5, 0, 1),
+                    ("C:\\PfxZ".into(), 7, 0, 1), // comparte prefijo corto, no es hija
+                ],
+            );
+            w.finish(ScanTotals::default(), 0).expect("finish")
+        };
+
+        let prefixed = store
+            .load_dir_samples_prefixed(id, "C:\\Pfx\\")
+            .expect("prefijada");
+        let expected: Vec<String> = store
+            .load_dir_samples(id)
+            .expect("completa")
+            .into_iter()
+            .filter(|s| s.path.starts_with("C:\\Pfx\\"))
+            .map(|s| s.path)
+            .collect();
+        let got: Vec<String> = prefixed.iter().map(|s| s.path.clone()).collect();
+
+        assert_eq!(got, expected);
+        assert_eq!(got.len(), 3); // Hijo1, Nieto, Hijo2 — sin PfxZ ni Otra
+        assert!(got.contains(&"C:\\Pfx\\Hijo1\\Nieto".to_string()));
+    }
+
+    #[test]
+    fn load_dir_samples_prefixed_upper_bound_utf8_safe() {
+        // Regresión: el upper bound se calculaba con `(byte+1) as char`; con
+        // prefijos no-ASCII (>0x7F) eso pateaba el slice a mitad de un
+        // codepoint y/o frabricaba un char inválido (p. ej. `C:\Á` → `\u{C3C4}`),
+        // excluyendo hijos reales del drill-down. Ahora: bytes + from_utf8,
+        // abriendo el rango si el incremento no es UTF-8 válido.
+        let (_tmp, mut store) = open_tmp();
+        let prefix = "C:\\Á"; // último byte 0xC1 (>0x7F)
+        let id = {
+            let mut w = store.open_writer(prefix, 1_000).expect("w");
+            write_all(
+                &mut w,
+                &[
+                    ("C:\\Á".into(), 999, 0, 1),
+                    ("C:\\Á\\Hijo1".into(), 100, 0, 1),
+                    ("C:\\Á\\Hijo1\\Nieto".into(), 60, 0, 1),
+                    ("C:\\ÁZ".into(), 7, 0, 1), // comparte prefijo, no hija
+                    ("C:\\B".into(), 5, 0, 1),
+                ],
+            );
+            w.finish(ScanTotals::default(), 0).expect("finish")
+        };
+
+        let prefixed = store
+            .load_dir_samples_prefixed(id, "C:\\Á\\")
+            .expect("prefijada utf8");
+        let expected: Vec<String> = store
+            .load_dir_samples(id)
+            .expect("completa")
+            .into_iter()
+            .filter(|s| s.path.starts_with("C:\\Á\\"))
+            .map(|s| s.path)
+            .collect();
+        let got: Vec<String> = prefixed.iter().map(|s| s.path.clone()).collect();
+
+        assert_eq!(got, expected);
+        assert!(got.contains(&"C:\\Á\\Hijo1\\Nieto".to_string()));
+    }
+
+    #[test]
     fn two_snapshots_diff_end_to_end() {
         // El caso de uso real: escanear hoy y mañana, y preguntar qué creció.
         let (_tmp, mut store) = open_tmp();
@@ -730,5 +938,49 @@ mod tests {
         assert_eq!(delta_of("estable"), -100);
         assert_eq!(root_delta, 1_500 - 100 + 700);
         assert!(ranking.iter().all(|r| !r.path.ends_with("nueva")));
+    }
+
+    #[test]
+    fn top_files_roundtrip_and_ordered() {
+        let (_tmp, mut store) = open_tmp();
+        let totals = ScanTotals {
+            top: vec![
+                LargestFile {
+                    path: "C:\\Datos\\a.bin".into(),
+                    size_bytes: 100,
+                    mtime_unix: 1,
+                },
+                LargestFile {
+                    path: "C:\\Datos\\b.bin".into(),
+                    size_bytes: 900,
+                    mtime_unix: 2,
+                },
+                LargestFile {
+                    path: "C:\\Datos\\c.bin".into(),
+                    size_bytes: 500,
+                    mtime_unix: 3,
+                },
+            ],
+            ..ScanTotals::default()
+        };
+        let id = {
+            let w = store.open_writer("C:\\Datos", 1_700_000_000).expect("w");
+            w.finish(totals, 0).expect("finish")
+        };
+
+        let got = store.load_top_files(id).expect("load");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].path, "C:\\Datos\\b.bin", "el mayor primero");
+        assert_eq!(got[0].size_bytes, 900);
+        assert_eq!(got[1].path, "C:\\Datos\\c.bin");
+        assert_eq!(got[2].path, "C:\\Datos\\a.bin");
+
+        let id2 = {
+            let w = store.open_writer("C:\\Datos", 1_700_086_400).expect("w");
+            w.finish(ScanTotals::default(), 0).expect("finish")
+        };
+        assert!(store.load_top_files(id2).expect("load vacío").is_empty());
+        store.prune("C:\\Datos", 1).expect("prune");
+        assert!(store.load_top_files(id).expect("prune cascada").is_empty());
     }
 }

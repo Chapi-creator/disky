@@ -30,7 +30,7 @@ pub struct DirStat {
 }
 
 /// Totales de un escaneo completado.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[must_use]
 pub struct ScanTotals {
     /// Archivos visitados.
@@ -41,6 +41,22 @@ pub struct ScanTotals {
     pub bytes: u64,
     /// Entradas que no se pudieron leer (permisos, carreras con el FS...).
     pub read_errors: u64,
+    /// Los archivos más pesados del escaneo, ordenados desc por peso.
+    pub top: Vec<LargestFile>,
+}
+
+/// Un archivo individual por peso: lo recoge el walker mientras recorre el
+/// árbol (top-N, no todos), para "¿qué archivo ocupa más?". Ordenado
+/// descendentemente por `size_bytes`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[must_use]
+pub struct LargestFile {
+    /// Ruta absoluta del archivo.
+    pub path: String,
+    /// Tamaño en bytes.
+    pub size_bytes: u64,
+    /// Última modificación (UNIX, segundos; 0 si no se pudo leer).
+    pub mtime_unix: i64,
 }
 
 /// Progreso de un escaneo en curso (para eventos de UI).
@@ -149,11 +165,48 @@ pub trait SnapshotStore {
         limit: u32,
     ) -> Result<Vec<SeriesPoint>, StoreError>;
 
+    /// Carga los directorios de un snapshot cuya ruta empieza por `prefix`,
+    /// como [`UsageSample`] listos para filtrar hijos directos en la UI.
+    ///
+    /// Pensado para el treemap: una consulta de rango por el índice de `path`
+    /// en lugar de cargar el snapshot completo por cada drill-down.
+    ///
+    /// # Errors
+    /// [`StoreError`] si la consulta falla.
+    fn load_dir_samples_prefixed(
+        &self,
+        snapshot_id: u64,
+        prefix: &str,
+    ) -> Result<Vec<UsageSample>, StoreError> {
+        // Por defecto delega en la carga completa y filtra: los adaptadores
+        // pueden redefinirlo con una consulta de rango real.
+        Ok(self
+            .load_dir_samples(snapshot_id)?
+            .into_iter()
+            .filter(|s| s.path.starts_with(prefix))
+            .collect())
+    }
+
     /// Elimina los snapshots más viejos de `root`, dejando los últimos `keep`.
     ///
     /// # Errors
     /// [`StoreError`] si el borrado falla.
     fn prune(&mut self, root: &str, keep: u32) -> Result<(), StoreError>;
+
+    /// Elimina un snapshot concreto (y sus directorios y top-N, en cascada).
+    ///
+    /// No es un error borrar un id inexistente: es idempotente.
+    ///
+    /// # Errors
+    /// [`StoreError::Db`] si el borrado falla.
+    fn delete_snapshot(&mut self, snapshot_id: u64) -> Result<(), StoreError>;
+
+    /// Carga los archivos más pesados de un snapshot (top-N recogido por el
+    /// walker), ordenados descendentemente por peso.
+    ///
+    /// # Errors
+    /// [`StoreError`] si la consulta falla.
+    fn load_top_files(&self, snapshot_id: u64) -> Result<Vec<LargestFile>, StoreError>;
 }
 
 /// Escritura incremental de un snapshot en curso (post-orden de directorios).

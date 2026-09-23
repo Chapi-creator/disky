@@ -70,6 +70,13 @@ export interface GrowthReport {
   elapsed_seconds: number;
 }
 
+/** Un archivo individual por peso (top-N del escaneo). */
+export interface LargestFile {
+  path: string;
+  size_bytes: number;
+  mtime_unix: number;
+}
+
 /** Comparación de los dos snapshots más recientes de una raíz. */
 export interface GrowthDiff {
   old: SnapshotSummary;
@@ -81,6 +88,7 @@ export interface GrowthDiff {
 export interface ScanDonePayload {
   snapshot: SnapshotSummary | null;
   growth: GrowthDiff | null;
+  largest: LargestFile[];
   error: string | null;
 }
 
@@ -88,6 +96,7 @@ export interface ScanDonePayload {
 export interface ScanQuickDonePayload {
   snapshot: SnapshotSummary | null;
   growth: GrowthDiff | null;
+  largest: LargestFile[];
   error: string | null;
 }
 

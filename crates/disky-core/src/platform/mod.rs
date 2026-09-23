@@ -6,6 +6,7 @@
 use crate::domain::Volume;
 
 pub mod elevate;
+pub mod mft;
 pub mod path_norm;
 pub mod sqlite;
 pub mod usn;

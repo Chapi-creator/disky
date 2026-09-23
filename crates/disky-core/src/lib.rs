@@ -14,13 +14,14 @@ pub mod domain;
 pub mod platform;
 
 pub use domain::scan::{
-    match_by_path, DirStat, DirWriter, ScanProgress, ScanTotals, SeriesPoint, SnapshotStore,
-    SnapshotSummary, StoreError,
+    match_by_path, DirStat, DirWriter, LargestFile, ScanProgress, ScanTotals, SeriesPoint,
+    SnapshotStore, SnapshotSummary, StoreError,
 };
 pub use domain::treemap::{squarify, TreemapItem, TreemapNode};
 pub use domain::usn::JournalRecord;
 pub use domain::{growth_between, growth_ranking, DriveKind, GrowthReport, UsageSample, Volume};
 pub use platform::sqlite::SqliteStore;
+pub use platform::mft::{mft_scan, MftError};
 pub use platform::usn::{journal_status, recent_records, UsnStatus};
 pub use platform::walk::{walk_tree, WalkError};
 pub use platform::{list_volumes, PlatformError};

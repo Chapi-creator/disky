@@ -71,18 +71,51 @@ pub fn elevated_scan(root: &str, out: &str, db: &str) -> i32 {
     };
 
     let cancel = std::sync::atomic::AtomicBool::new(false);
-    let Ok(totals) = disky_core::walk_tree(
-        &root_path,
-        &cancel,
-        &mut |dir| {
-            let _ = writer.write_dirs(std::slice::from_ref(&dir));
-        },
-        &mut |_| {},
-    ) else {
-        return fail("El escaneo elevado no pudo completarse".into());
+
+    // Fase 3: leer la MFT es más rápido que el walker y corre en el proceso
+    // elevado. Si el volumen no es NTFS o el formato sorprende, se cae al
+    // walker (sin admin) que siempre funciona. Los directorios del MFT se
+    // acumulan en memoria y solo se persisten si el escaneo completo triunfa:
+    // un fallo a mitad no debe dejar rastro mezclado en el snapshot.
+    let totals = {
+        let mut dirs: Vec<disky_core::DirStat> = Vec::new();
+        match disky_core::mft_scan(
+            &root_path,
+            &cancel,
+            &mut |dir| dirs.push(dir),
+            &mut |_| {},
+        ) {
+            Ok(totals) => {
+                for dir in &dirs {
+                    if writer.write_dirs(std::slice::from_ref(dir)).is_err() {
+                        return fail("El snapshot (MFT) no pudo guardarse".into());
+                    }
+                }
+                totals
+            }
+            Err(e) => {
+                let err_label = e.to_string();
+                drop(dirs); // descartar el intento fallido de MFT
+                match disky_core::walk_tree(
+                    &root_path,
+                    &cancel,
+                    &mut |dir| {
+                        let _ = writer.write_dirs(std::slice::from_ref(&dir));
+                    },
+                    &mut |_| {},
+                ) {
+                    Ok(totals) => totals,
+                    Err(walk_err) => {
+                        return fail(format!("{err_label} (walk: {walk_err})"));
+                    }
+                }
+            }
+        }
     };
 
     let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+    let (total_files, total_bytes, read_errors) =
+        (totals.files, totals.bytes, totals.read_errors);
     match writer.finish(totals, duration_ms) {
         Ok(id) => {
             write_result(
@@ -90,9 +123,9 @@ pub fn elevated_scan(root: &str, out: &str, db: &str) -> i32 {
                 &ElevatedResult {
                     ok: true,
                     snapshot_id: Some(id),
-                    total_files: totals.files,
-                    total_bytes: totals.bytes,
-                    read_errors: totals.read_errors,
+                    total_files,
+                    total_bytes,
+                    read_errors,
                     duration_ms,
                     error: None,
                 },
@@ -142,7 +175,9 @@ pub fn run() {
             commands::scan_cancel,
             commands::scan_quick_start,
             commands::snapshots_list,
+            commands::delete_snapshot,
             commands::growth_report,
+            commands::largest_files,
             commands::treemap_nodes,
             commands::timeline_series,
         ])
