@@ -10,7 +10,7 @@
   <body>
     <main class="container">
       <h1>🔍 disky</h1>
-      <p class="subtitle">¿Qué creció en mi disco? — spike USN Journal</p>
+      <p class="subtitle">¿Qué creció en mi disco?</p>
 
       <h2>Volúmenes montados</h2>
       <table class="volumes-table">
@@ -28,24 +28,26 @@
         </tbody>
       </table>
 
-      <h2>Escaneo (sin admin)</h2>
+      <h2>Escaneo</h2>
       <p class="hint">
-        Recorre el árbol de directorios con permisos normales y guarda un
-        snapshot en SQLite. Con dos escaneos de la misma raíz, te dice qué
-        creció y por dónde. Sin elevación: las carpetas protegidas se cuentan
-        como error de lectura.
+        Dos formas de escanear:
+        <strong>Normal</strong>: recorre todo con tus permisos (sin UAC), pero
+        las carpetas protegidas del sistema se cuentan como errores de lectura.
+        <strong>Completo (admin)</strong>: además lee el interior de esas
+        carpetas protegidas (WinSxS, System Volume, etc.). Usa UAC solo si te
+        faltan datos ahí.
       </p>
       <div class="row">
         <input id="scan-root" value="C:\\" spellcheck="false" />
-        <button type="button" id="scan-btn">Escanear</button>
-        <button type="button" id="scan-quick-btn">Escaneo rápido (admin)</button>
-        <button type="button" id="scan-all-btn">Escanear todo</button>
+        <button type="button" id="scan-btn">Escanear esta carpeta (sin admin)</button>
+        <button type="button" id="scan-quick-btn">Completo incl. carpetas protegidas (admin)</button>
+        <button type="button" id="scan-all-btn">Escanear todas las unidades (sin admin)</button>
         <button type="button" id="scan-cancel-btn" disabled>Cancelar</button>
       </div>
       <p class="hint">
-        El escaneo rápido pide permisos de administrador (UAC) para leer
-        también las carpetas protegidas; no muestra progreso ni se puede
-        cancelar mientras corre.
+        El escaneo completo pide permisos de administrador (UAC) para leer
+        también las carpetas protegidas del sistema; no muestra progreso ni se
+        puede cancelar mientras corre.
       </p>
       <div id="scan-progress" class="scan-progress hidden">
         <div class="bar"><div class="fill"></div></div>
@@ -72,8 +74,42 @@
             <th>Fecha</th>
             <th>Uso medido</th>
             <th>Archivos</th>
-            <th>Errores</th>
+            <th title="Carpetas protegidas que no se pudieron leer sin admin">Errores</th>
             <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="6">Aún no hay escaneos guardados</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Historial
+        <span class="hint-inline">
+          Raíz
+          <select id="history-root" aria-label="Raíz a mostrar"></select>
+          agrupar por
+          <select id="history-group" aria-label="Agrupación del historial">
+            <option value="all">Todos</option>
+            <option value="day">Días</option>
+            <option value="month">Meses</option>
+            <option value="year">Años</option>
+          </select>
+        </span>
+      </h3>
+      <p class="hint">
+        Cómo cambió tu almacenamiento con el tiempo: cada fila es un escaneo
+        (o el último de su período), con el cambio desde el anterior, por día y
+        desde tu primer escaneo (la línea base).
+      </p>
+      <table class="volumes-table" id="history-table">
+        <thead>
+          <tr>
+            <th>Cuándo</th>
+            <th>Tamaño</th>
+            <th>Δ</th>
+            <th>Δ/día</th>
+            <th>vs base</th>
+            <th>Archivos</th>
           </tr>
         </thead>
         <tbody>
@@ -119,31 +155,6 @@
         </thead>
         <tbody>
           <tr><td colspan="4">Aún no hay escaneos guardados</td></tr>
-        </tbody>
-      </table>
-
-      <h2>USN Journal (spike)</h2>
-      <p class="hint">
-        Prueba del Change Journal de NTFS: estado del journal y últimos cambios
-        detectados por el kernel. Requiere permisos de administrador.
-      </p>
-      <div class="row">
-        <input id="usn-letter" value="C" maxlength="1" />
-        <button type="button" id="usn-status-btn">Estado del journal</button>
-        <button type="button" id="usn-recent-btn">Últimos registros</button>
-      </div>
-      <div id="usn-status"></div>
-      <table class="volumes-table" id="usn-records">
-        <thead>
-          <tr>
-            <th>Archivo</th>
-            <th>Cambios</th>
-            <th>Cuándo</th>
-            <th>FRN</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr><td colspan="4">Pulsa «Últimos registros» para leer el journal</td></tr>
         </tbody>
       </table>
 

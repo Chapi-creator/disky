@@ -25,6 +25,14 @@ struct ElevatedResult {
     error: Option<String>,
 }
 
+/// Traza temporal de diagnóstico del hijo elevado (ver dónde se atasca).
+#[cfg(debug_assertions)]
+fn trace_elevated(msg: &str) {
+    eprintln!("[elev] {msg}");
+}
+#[cfg(not(debug_assertions))]
+fn trace_elevated(_msg: &str) {}
+
 /// Modo hijo elevado: escanea `root`, guarda el snapshot en la BD indicada y
 /// escribe el resultado en `out`. Devuelve el código de salida del proceso.
 ///
@@ -34,6 +42,7 @@ struct ElevatedResult {
 #[must_use]
 #[allow(clippy::expect_used)]
 pub fn elevated_scan(root: &str, out: &str, db: &str) -> i32 {
+    trace_elevated("arranca hijo");
     let started = std::time::Instant::now();
     let started_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -71,6 +80,7 @@ pub fn elevated_scan(root: &str, out: &str, db: &str) -> i32 {
     };
 
     let cancel = std::sync::atomic::AtomicBool::new(false);
+    trace_elevated("abierto y writer OK");
 
     // Fase 3: leer la MFT es más rápido que el walker y corre en el proceso
     // elevado. Si el volumen no es NTFS o el formato sorprende, se cae al
@@ -79,6 +89,7 @@ pub fn elevated_scan(root: &str, out: &str, db: &str) -> i32 {
     // un fallo a mitad no debe dejar rastro mezclado en el snapshot.
     let totals = {
         let mut dirs: Vec<disky_core::DirStat> = Vec::new();
+        trace_elevated("antes de mft_scan");
         match disky_core::mft_scan(
             &root_path,
             &cancel,
@@ -86,6 +97,7 @@ pub fn elevated_scan(root: &str, out: &str, db: &str) -> i32 {
             &mut |_| {},
         ) {
             Ok(totals) => {
+                trace_elevated("mft_scan OK");
                 for dir in &dirs {
                     if writer.write_dirs(std::slice::from_ref(dir)).is_err() {
                         return fail("El snapshot (MFT) no pudo guardarse".into());
@@ -168,8 +180,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::greet,
             commands::list_volumes,
-            commands::usn_status,
-            commands::usn_recent,
             commands::scan_start,
             commands::scan_all_start,
             commands::scan_cancel,

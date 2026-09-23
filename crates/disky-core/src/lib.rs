@@ -21,7 +21,7 @@ pub use domain::treemap::{squarify, TreemapItem, TreemapNode};
 pub use domain::usn::JournalRecord;
 pub use domain::{growth_between, growth_ranking, DriveKind, GrowthReport, UsageSample, Volume};
 pub use platform::sqlite::SqliteStore;
-pub use platform::mft::{mft_scan, MftError};
+pub use platform::mft::{mft_available, mft_scan, MftError};
 pub use platform::usn::{journal_status, recent_records, UsnStatus};
 pub use platform::walk::{walk_tree, WalkError};
 pub use platform::{list_volumes, PlatformError};

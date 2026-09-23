@@ -13,6 +13,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -141,6 +142,142 @@ pub fn walk_tree(
 /// Top-N de archivos más pesados: min-heap de `(peso, mtime, ruta)`.
 type TopHeap = BinaryHeap<Reverse<(u64, i64, String)>>;
 
+/// Una entrada de directorio con sus metadatos ya resueltos.
+struct RawEntry {
+    name: OsString,
+    is_dir: bool,
+    is_symlink: bool,
+    size: u64,
+    mtime: i64,
+}
+
+/// Lista `path` en una sola pasada resolviendo nombre, tipo, tamaño y mtime
+/// **sin** syscall extra por archivo. En Windows usa `FindFirstFileW`, que
+/// entrega todo junto; el fallback `std::fs` (CI/otros SO) repite el patrón
+/// anterior con `read_dir` + `metadata`.
+fn list_dir(path: &Path) -> Result<Vec<RawEntry>, ()> {
+    #[cfg(windows)]
+    {
+        list_dir_win32(path)
+    }
+    #[cfg(not(windows))]
+    {
+        list_dir_std(path)
+    }
+}
+
+/// Versión Win32 de [`list_dir`]: `FindFirstFileW` devuelve `WIN32_FIND_DATAW`
+/// con atributos, tamaño y fechas en la misma llamada.
+#[cfg(windows)]
+fn list_dir_win32(path: &Path) -> Result<Vec<RawEntry>, ()> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FindClose, FindFirstFileW,
+        FindNextFileW, WIN32_FIND_DATAW,
+    };
+
+    // Patrón de búsqueda: el prefijo verbatim `\\?\` evita el límite de 260
+    // caracteres (std lo añade solo; `FindFirstFileW` no). La ruta ya viene
+    // normalizada con separadores `\`, así que el prefijo es seguro.
+    let raw = path.as_os_str().encode_wide().collect::<Vec<u16>>();
+    let mut pattern = Vec::with_capacity(raw.len() + 8);
+    let is_unc = raw.len() >= 2 && raw[0] == '\\' as u16 && raw[1] == '\\' as u16;
+    if is_unc {
+        // UNC: `\\server\share\...` → `\\?\UNC\server\share\...`
+        pattern.extend(r"\\?\UNC\".encode_utf16());
+        pattern.extend(raw.iter().skip(2).copied());
+    } else {
+        pattern.extend(r"\\?\".encode_utf16());
+        pattern.extend(raw);
+    }
+    if pattern.last().copied() != Some('\\' as u16) {
+        pattern.push('\\' as u16);
+    }
+    pattern.push('*' as u16);
+    pattern.push(0);
+
+    let mut find_data = WIN32_FIND_DATAW::default();
+    let handle = match unsafe {
+        FindFirstFileW(windows::core::PCWSTR(pattern.as_ptr()), &raw mut find_data)
+    } {
+        Ok(h) => h,
+        // Directorio vacío: se reporta como lista vacía, no como error.
+        Err(e) if e.code().0 & 0xFFFF == 2 => return Ok(Vec::new()),
+        Err(_) => return Err(()),
+    };
+
+    let mut out = Vec::new();
+    let mut done = false;
+    while !done {
+        let name_len = find_data
+            .cFileName
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(find_data.cFileName.len());
+        let name = OsString::from_wide(&find_data.cFileName[..name_len]);
+        if name != "." && name != ".." {
+            let flags = find_data.dwFileAttributes;
+            out.push(RawEntry {
+                name,
+                is_dir: flags & FILE_ATTRIBUTE_DIRECTORY.0 != 0,
+                is_symlink: flags & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0,
+                size: (u64::from(find_data.nFileSizeHigh) << 32)
+                    | u64::from(find_data.nFileSizeLow),
+                mtime: filetime_to_unix(find_data.ftLastWriteTime),
+            });
+        }
+        match unsafe { FindNextFileW(handle, &raw mut find_data) } {
+            Ok(()) => {}
+            Err(_) => done = true,
+        }
+    }
+    let _ = unsafe { FindClose(handle) };
+    Ok(out)
+}
+
+/// FILETIME (100 ns desde 1601, tiempo UTC) → segundos UNIX; 0 si la fecha es
+/// anterior a la época (cdebe ser imposible para archivos reales).
+#[cfg(windows)]
+fn filetime_to_unix(ft: windows::Win32::Foundation::FILETIME) -> i64 {
+    let hundred_ns = (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
+    let unix_offset = 11_644_473_600_u64; // segundos entre 1601 y 1970
+    i64::try_from(hundred_ns / 10_000_000)
+        .map(|secs| secs.saturating_sub(i64::try_from(unix_offset).unwrap_or(0)))
+        .unwrap_or_default()
+}
+
+/// Fallback portable de [`list_dir`] para SO no Windows: `read_dir` + metadatos
+/// por archivo (2 syscalls por entrada, es aceptable fuera del caso objetivo).
+#[cfg(not(windows))]
+fn list_dir_std(path: &Path) -> Result<Vec<RawEntry>, ()> {
+    let entries = fs::read_dir(path).map_err(|_| ())?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Err(());
+        };
+        let Ok(file_type) = entry.file_type() else {
+            return Err(());
+        };
+        let is_symlink = file_type.is_symlink();
+        let meta = entry.metadata().map_err(|_| ())?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .and_then(|d| i64::try_from(d.as_secs()).ok())
+            .unwrap_or_default();
+        out.push(RawEntry {
+            name: entry.file_name(),
+            is_dir: file_type.is_dir(),
+            is_symlink,
+            size: meta.len(),
+            mtime,
+        });
+    }
+    Ok(out)
+}
+
 /// Un directorio en curso: acumula su propio peso y espera a sus hijos.
 struct Node {
     path: PathBuf,
@@ -239,7 +376,7 @@ fn process_node(shared: &WalkShared<'_>, node: Arc<Node>, top: &mut TopHeap) {
         return;
     }
 
-    let Ok(entries) = fs::read_dir(&node.path) else {
+    let Ok(entries) = list_dir(&node.path) else {
         // Sin permisos o carrera con el FS: la carpeta se emite vacía y el
         // escaneo sigue. Así la UI muestra el hueco en vez de fallar todo.
         shared.errors.fetch_add(1, Ordering::Relaxed);
@@ -250,15 +387,7 @@ fn process_node(shared: &WalkShared<'_>, node: Arc<Node>, top: &mut TopHeap) {
 
     for entry in entries {
         shared.seen.fetch_add(1, Ordering::Relaxed);
-        let Ok(entry) = entry else {
-            shared.errors.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        let Ok(file_type) = entry.file_type() else {
-            shared.errors.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        if file_type.is_symlink() {
+        if entry.is_symlink {
             // Ni se recorre ni se emite: su contenido pertenece al destino.
             continue;
         }
@@ -267,16 +396,9 @@ fn process_node(shared: &WalkShared<'_>, node: Arc<Node>, top: &mut TopHeap) {
             break;
         }
 
-        let entry_path = entry.path();
-        if file_type.is_dir() {
-            let child_mtime = entry
-                .metadata()
-                .ok()
-                .and_then(|meta| meta.modified().ok())
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-                .unwrap_or_default();
-            let child = Arc::new(Node::new(entry_path, child_mtime, Some(Arc::clone(&node))));
+        let entry_path = node.path.join(&entry.name);
+        if entry.is_dir {
+            let child = Arc::new(Node::new(entry_path, entry.mtime, Some(Arc::clone(&node))));
             node.pending.fetch_add(1, Ordering::SeqCst);
             shared.inflight.fetch_add(1, Ordering::SeqCst);
             shared
@@ -288,23 +410,10 @@ fn process_node(shared: &WalkShared<'_>, node: Arc<Node>, top: &mut TopHeap) {
             continue;
         }
 
-        // `DirEntry::metadata` no sigue enlaces y en Windows sale del listado
-        // del directorio: sin syscall extra por archivo.
-        let Ok(meta) = entry.metadata() else {
-            shared.errors.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        let size = meta.len();
-        let file_mtime = meta
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-            .unwrap_or_default();
-        push_top(top, size, file_mtime, &entry_path);
-        node.sub_bytes.fetch_add(size, Ordering::SeqCst);
+        push_top(top, entry.size, entry.mtime, &entry_path);
+        node.sub_bytes.fetch_add(entry.size, Ordering::SeqCst);
         node.sub_files.fetch_add(1, Ordering::SeqCst);
-        shared.bytes.fetch_add(size, Ordering::Relaxed);
+        shared.bytes.fetch_add(entry.size, Ordering::Relaxed);
         shared.files.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -549,5 +658,42 @@ mod tests {
         assert_eq!(weights[0], 60, "el mayor primero");
         assert_eq!(weights[49], 11, "el menor del top-N retenido");
         assert!(!weights.contains(&10), "fuera del top-N");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win32_list_dir_matches_stdlib() {
+        // El listado FindFirstFileW debe coincidir (nombre, tamaño, dir) con lo
+        // que ve la stdlib en la misma carpeta; así no regresamos basura/carrera.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::create_dir_all(root.join("sub")).expect("crear dirs");
+        write_file(&root.join("a.txt"), 100);
+        write_file(&root.join("sub").join("b.bin"), 2_000);
+        // Longitud por encima de 260 chars: solo el patrón verbatim la aguanta.
+        let long = root.join("long-".repeat(40));
+        write_file(&long, 7);
+
+        let win = list_dir(root).expect("list_dir win32");
+        let mut std_entries = Vec::new();
+        for e in fs::read_dir(root).expect("read_dir") {
+            let e = e.expect("entry");
+            let meta = e.metadata().expect("metadata");
+            std_entries.push((e.file_name(), meta.is_dir(), meta.len()));
+        }
+
+        let mut got: Vec<(OsString, bool, u64)> = win
+            .into_iter()
+            .map(|e| (e.name.clone(), e.is_dir, e.size))
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        std_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got, std_entries, "dirs, archivos y tamaños idénticos");
+
+        let sub = list_dir(&root.join("sub")).expect("list_dir sub");
+        assert_eq!(sub.len(), 1);
+        assert_eq!(sub[0].name, "b.bin");
+        assert_eq!(sub[0].size, 2_000);
+        assert!(!sub[0].is_dir);
     }
 }

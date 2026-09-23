@@ -22,26 +22,6 @@ export type DriveKind =
   | "ram_disk"
   | "unknown";
 
-/** Estado del USN Journal de un volumen. */
-export interface UsnStatus {
-  journal_id: number;
-  next_usn: number;
-  first_usn: number;
-  max_usn: number;
-  max_size: number;
-}
-
-/** Un registro del USN Journal ya parseado. */
-export interface JournalRecord {
-  frn: number;
-  parent_frn: number;
-  usn: number;
-  timestamp_unix: number;
-  reasons: number;
-  reason_labels: string[];
-  file_name: string;
-}
-
 /** Progreso periódico de un escaneo (evento `scan-progress`). */
 export interface ScanProgress {
   files: number;

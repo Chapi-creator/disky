@@ -11,15 +11,16 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use disky_core::platform::path_norm::normalize_path_separators;
 use disky_core::{
-    growth_ranking, journal_status, list_volumes as core_list_volumes, match_by_path,
-    recent_records, squarify, walk_tree, DirStat, GrowthReport, JournalRecord, LargestFile,
-    PlatformError, SnapshotStore as _, SnapshotSummary, SqliteStore, TreemapItem, UsnStatus,
+    growth_ranking, list_volumes as core_list_volumes, match_by_path,
+    squarify, walk_tree, DirStat, DirWriter, GrowthReport, LargestFile,
+    MftError, PlatformError, SnapshotStore as _, SnapshotSummary, SqliteStore, TreemapItem,
     WalkError,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -234,26 +235,6 @@ pub fn greet(name: &str) -> String {
 #[tauri::command]
 pub fn list_volumes() -> Result<Vec<disky_core::Volume>, String> {
     core_list_volumes().map_err(render_error)
-}
-
-/// Estado del USN Journal de una unidad (`"C"`, `"d"`, ...).
-///
-/// # Errors
-/// [`PlatformError`] renderizado como `String` para el frontend.
-#[tauri::command]
-pub fn usn_status(letter: &str) -> Result<UsnStatus, String> {
-    journal_status(letter).map_err(render_error)
-}
-
-/// Los registros más recientes del USN Journal de una unidad.
-///
-/// `max_records` limita la respuesta (por defecto 15); los más nuevos al final.
-///
-/// # Errors
-/// [`PlatformError`] renderizado como `String` para el frontend.
-#[tauri::command]
-pub fn usn_recent(letter: &str, max_records: Option<usize>) -> Result<Vec<JournalRecord>, String> {
-    recent_records(letter, max_records.unwrap_or(15)).map_err(render_error)
 }
 
 /// Payload del evento `scan-done`: resultado del escaneo y crecimiento vs. el
@@ -502,6 +483,15 @@ pub fn render_error(err: PlatformError) -> String {
     }
 }
 
+/// Empuja un dir al búfer y lo vuelca a la BD cada [`DIR_BATCH`] entradas.
+fn flush_dir(writer: &mut dyn DirWriter, batch: &mut Vec<DirStat>, dir: DirStat) {
+    batch.push(dir);
+    if batch.len() >= DIR_BATCH {
+        let _ = writer.write_dirs(batch);
+        batch.clear();
+    }
+}
+
 /// Cuerpo del escaneo, ejecutado en un hilo dedicado.
 ///
 /// Abre una **conexión `SQLite` propia** en vez de bloquear el store global: WAL
@@ -539,20 +529,62 @@ fn perform_scan(
 
     // Búfer de directorios: escribe en la BD en lotes en vez de fila a fila.
     let mut batch: Vec<DirStat> = Vec::with_capacity(DIR_BATCH);
-    let scan_result = walk_tree(
-        root_path,
-        &state.cancel,
-        &mut |dir| {
-            batch.push(dir);
-            if batch.len() >= DIR_BATCH {
-                let _ = writer.write_dirs(&batch);
-                batch.clear();
-            }
-        },
-        &mut |progress| {
-            let _ = handle.emit("scan-progress", progress);
-        },
-    );
+    // El MFT (rápido, segundos) se usa cuando corremos elevados; si no, el
+    // walker. Ambos emiten DirStat en post-orden, así que el margen es idéntico.
+    let use_mft = root
+        .chars()
+        .next()
+        .filter(char::is_ascii_alphabetic)
+        .is_some_and(|c| disky_core::mft_available(c.to_ascii_uppercase()));
+    let mut scan_result = if use_mft {
+        disky_core::mft_scan(
+            root_path,
+            &state.cancel,
+            &mut |dir| flush_dir(writer.as_mut(), &mut batch, dir),
+            &mut |_| {},
+        )
+        .map_err(ScanError::Mft)
+    } else {
+        walk_tree(
+            root_path,
+            &state.cancel,
+            &mut |dir| flush_dir(writer.as_mut(), &mut batch, dir),
+            &mut |progress| {
+                let _ = handle.emit("scan-progress", progress);
+            },
+        )
+        .map_err(ScanError::Walk)
+    };
+
+    // Si el MFT falló (y no fue cancelación), se descarta el intento (rollback
+    // al soltar `writer`) y se reintenta con el walker, que siempre funciona.
+    let mft_error = match &scan_result {
+        Err(ScanError::Mft(err)) if !matches!(err, MftError::Cancelled) => Some(err.to_string()),
+        _ => None,
+    };
+    if let Some(mft_error) = mft_error {
+        drop(writer);
+        let Ok(new_writer) = store.open_writer(root, started_at) else {
+            return (
+                None,
+                Vec::new(),
+                Some(format!(
+                    "Falló el MFT ({mft_error}) y tampoco se pudo abrir el snapshot para reintentar"
+                )),
+            );
+        };
+        writer = new_writer;
+        batch.clear();
+        scan_result = walk_tree(
+            root_path,
+            &state.cancel,
+            &mut |dir| flush_dir(writer.as_mut(), &mut batch, dir),
+            &mut |progress| {
+                let _ = handle.emit("scan-progress", progress);
+            },
+        )
+        .map_err(ScanError::Walk);
+    }
     // El resto del lote (y en cancelación, también: el writer descartado
     // hace rollback, así que escribir el resto aquí solo gasta CPU).
     if !batch.is_empty() {
@@ -582,13 +614,28 @@ fn perform_scan(
         }
         // Cancelación: el escritor se descarta y la transacción hace rollback,
         // así que no queda un snapshot a medias.
-        Err(WalkError::Cancelled) => (None, Vec::new(), Some("Escaneo cancelado".into())),
-        Err(err) => (None, Vec::new(), Some(err.to_string())),
+        Err(scan_error) => (None, Vec::new(), Some(scan_error.to_string())),
     };
 
     // La conexión dedicada se cierra al soltar `store`: el guard global del
     // Mutex ya no existe y los lectores de la UI nunca se bloquearon.
     outcome
+}
+
+/// Error unificado de un escaneo (MFT o walker). La cancelación ya trae su
+/// propio texto (`MftError::Cancelled` / `WalkError::Cancelled`).
+enum ScanError {
+    Walk(WalkError),
+    Mft(MftError),
+}
+
+impl fmt::Display for ScanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScanError::Walk(err) => err.fmt(f),
+            ScanError::Mft(err) => err.fmt(f),
+        }
+    }
 }
 
 /// Directorios por lote al escribir el snapshot (compromiso latencia/memoria).

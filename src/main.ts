@@ -10,7 +10,6 @@ import { listen } from "@tauri-apps/api/event";
 import type {
   GrowthDiff,
   GrowthReport,
-  JournalRecord,
   LargestFile,
   ScanAllUnit,
   ScanDonePayload,
@@ -19,16 +18,12 @@ import type {
   SnapshotSummary,
   TimelinePointDto,
   TreemapNodeDto,
-  UsnStatus,
   Volume,
 } from "./api";
 
 let greetInputEl: HTMLInputElement | null;
 let greetMsgEl: HTMLElement | null;
 let volumesEl: HTMLElement | null;
-let usnLetterEl: HTMLInputElement | null;
-let usnStatusEl: HTMLElement | null;
-let usnRecordsEl: HTMLElement | null;
 let scanRootEl: HTMLInputElement | null;
 let scanBtnEl: HTMLButtonElement | null;
 let scanQuickBtnEl: HTMLButtonElement | null;
@@ -36,6 +31,9 @@ let scanCancelBtnEl: HTMLButtonElement | null;
 let scanProgressEl: HTMLElement | null;
 let scanProgressTextEl: HTMLElement | null;
 let snapshotsEl: HTMLElement | null;
+let historyRootEl: HTMLSelectElement | null;
+let historyGroupEl: HTMLSelectElement | null;
+let historyEl: HTMLElement | null;
 let growthEl: HTMLElement | null;
 let growthThresholdEl: HTMLInputElement | null;
 let largestEl: HTMLElement | null;
@@ -147,62 +145,7 @@ async function loadVolumes(): Promise<void> {
   }
 }
 
-// ── Spike: USN Journal ───────────────────────────────────────────────────────
-
-function currentLetter(): string {
-  return usnLetterEl?.value.trim() || "C";
-}
-
-function renderUsnStatus(status: UsnStatus): string {
-  return `
-    <dl class="usn-status">
-      <div><dt>Journal ID</dt><dd>${status.journal_id}</dd></div>
-      <div><dt>NextUsn</dt><dd>${status.next_usn}</dd></div>
-      <div><dt>FirstUsn</dt><dd>${status.first_usn}</dd></div>
-      <div><dt>Tamaño máx.</dt><dd>${formatBytes(status.max_size)}</dd></div>
-    </dl>`;
-}
-
-async function loadUsnStatus(): Promise<void> {
-  if (!usnStatusEl) return;
-  try {
-    const status = await invoke<UsnStatus>("usn_status", { letter: currentLetter() });
-    usnStatusEl.innerHTML = renderUsnStatus(status);
-  } catch (err) {
-    usnStatusEl.innerHTML = `<span class="error">${escapeHtml(String(err))}</span>`;
-  }
-}
-
-function recordRow(record: JournalRecord): string {
-  const when =
-    record.timestamp_unix > 0
-      ? new Date(record.timestamp_unix * 1000).toLocaleTimeString()
-      : "—";
-  return `<tr>
-    <td>${escapeHtml(record.file_name)}</td>
-    <td>${record.reason_labels.map(escapeHtml).join(", ")}</td>
-    <td>${when}</td>
-    <td class="num">${record.frn.toString(16)}</td>
-  </tr>`;
-}
-
-async function loadUsnRecords(): Promise<void> {
-  if (!usnRecordsEl) return;
-  try {
-    const records = await invoke<JournalRecord[]>("usn_recent", {
-      letter: currentLetter(),
-      maxRecords: 15,
-    });
-    usnRecordsEl.innerHTML =
-      records.length > 0
-        ? records.map(recordRow).join("")
-        : `<tr><td colspan="4">Sin registros recientes: el journal está al día</td></tr>`;
-  } catch (err) {
-    usnRecordsEl.innerHTML = `<tr><td colspan="4" class="error">${escapeHtml(String(err))}</td></tr>`;
-  }
-}
-
-// ── Escaneo sin admin ──────────────────────────────────────────────────
+// ── Escaneo ─────────────────────────────────────────────────────────
 
 function currentScanRoot(): string {
   return scanRootEl?.value.trim() || "C:\\";
@@ -323,6 +266,117 @@ async function loadSnapshots(): Promise<void> {
   }
 }
 
+// ── Historial (cómo cambió el almacenamiento en el tiempo) ───────────────────
+
+/** Snapshots del historial: cache para re-dibujar al cambiar de grupo. */
+let historySnapshots: SnapshotSummary[] = [];
+
+/** Raíz seleccionada en el historial. */
+let historyRoot = "";
+
+/** Etiqueta de período para `day`/`month`/`year` (es-es). */
+function periodLabel(group: string, ts: number): string {
+  const d = new Date(ts * 1000);
+  return new Intl.DateTimeFormat("es", {
+    ...(group === "day" ? { day: "2-digit", month: "short", year: "numeric" } : {}),
+    ...(group === "month" ? { month: "long", year: "numeric" } : {}),
+    ...(group === "year" ? { year: "numeric" } : {}),
+  }).format(d);
+}
+
+/**
+ * Agrupa los snapshots por período (día, mes, año) y conserva el **último** de
+ * cada período, en orden cronológico. `all` devuelve todos.
+ */
+function bucketSnapshots(group: string, snaps: SnapshotSummary[]): SnapshotSummary[] {
+  if (group === "all") return snaps;
+  const keyOf = (ts: number): string => periodLabel(group, ts);
+  const last: Map<string, SnapshotSummary> = new Map();
+  for (const s of snaps) last.set(keyOf(s.started_at), s);
+  return [...last.values()].sort((a, b) => a.started_at - b.started_at);
+}
+
+/** Fila del historial: un punto de la serie (cada escaneo o período). */
+function historyRow(point: SnapshotSummary, prev: SnapshotSummary | null, isBase: boolean): string {
+  const when = new Date(point.started_at * 1000).toLocaleString();
+  const seconds = Math.round(point.duration_ms / 1000);
+  const delta = prev
+    ? point.total_bytes - prev.total_bytes
+    : 0;
+  const elapsed = prev ? Math.max(point.started_at - prev.started_at, 1) : 1;
+  const perDay = Math.round((delta / elapsed) * 86_400);
+  const vsBase = point.total_bytes - (baseBytes);
+  const cls = delta > 0 ? "delta-pos" : delta < 0 ? "delta-neg" : "";
+  const baseBadge = isBase ? ' <span class="badge-base">base</span>' : "";
+  return `<tr>
+    <td>${when} (${seconds}s)${baseBadge}</td>
+    <td class="num">${formatBytes(point.total_bytes)}</td>
+    <td class="num ${cls}">${formatDelta(delta)}</td>
+    <td class="num ${cls}">${formatDelta(perDay)}</td>
+    <td class="num ${vsBase > 0 ? "delta-pos" : vsBase < 0 ? "delta-neg" : ""}">${formatDelta(vsBase)}</td>
+    <td class="num">${point.total_files.toLocaleString()}</td>
+  </tr>`;
+}
+
+/** Bytes de la línea base (primer snapshot) de la raíz del historial. */
+let baseBytes = 0;
+
+/** Carga raíces con snapshots y pinta el historial de la raíz elegida. */
+async function loadHistory(): Promise<void> {
+  if (!historyEl) return;
+  try {
+    historySnapshots = await invoke<SnapshotSummary[]>("snapshots_list");
+    const roots = [...new Set(historySnapshots.map((s) => s.root))].sort();
+    if (!roots.includes(historyRoot)) historyRoot = roots[0] ?? "";
+    if (historyRootEl) {
+      const selected = historyRootEl.value;
+      historyRootEl.innerHTML = roots
+        .map((r) => `<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`)
+        .join("");
+      historyRootEl.disabled = roots.length === 0;
+      if (roots.includes(selected)) historyRoot = selected;
+      historyRootEl.value = historyRoot;
+    }
+    renderHistory();
+  } catch (err) {
+    historyEl.innerHTML = `<tr><td colspan="6" class="error">Error: ${escapeHtml(String(err))}</td></tr>`;
+  }
+}
+
+/** Re-dibuja el historial con la raíz y grupo actuales (basado en cache). */
+function renderHistory(): void {
+  if (!historyEl) return;
+  const group = historyGroupEl?.value ?? "all";
+  const snaps = bucketSnapshots(
+    group,
+    historySnapshots
+      .filter((s) => s.root === historyRoot)
+      .sort((a, b) => a.started_at - b.started_at),
+  );
+  if (snaps.length === 0) {
+    historyEl.innerHTML = `<tr><td colspan="6">Aún no hay escaneos de esta raíz</td></tr>`;
+    return;
+  }
+  baseBytes = snaps[0].total_bytes;
+  historyEl.innerHTML =
+    `<tr class="period"><td colspan="6">Línea base: ${escapeHtml(formatBytes(baseBytes))} · agrupación: ${escapeHtml(group)}</td></tr>` +
+    snaps.map((s, i) => historyRow(s, i > 0 ? snaps[i - 1] : null, i === 0)).join("");
+}
+
+/** `true` mientras ya se disparó el escaneo de línea base del primer uso. */
+let baselineTriggered = false;
+
+/**
+ * Primer uso (BD sin snapshots): arranca el "Escanear todo" para que exista la
+ * línea base desde la que se comparará todo lo demás.
+ */
+async function ensureBaseline(): Promise<void> {
+  if (baselineTriggered) return;
+  const snaps = await invoke<SnapshotSummary[]>("snapshots_list");
+  baselineTriggered = true;
+  if (snaps.length === 0) void startScanAll();
+}
+
 /** Etiqueta del período comparado del último diff. */
 function growthPeriodLabel(): string {
   if (!lastGrowth) return "";
@@ -430,6 +484,7 @@ async function cancelScan(): Promise<void> {
 /** Refresco común tras un escaneo: historial, ¿qué creció? y treemap/timeline. */
 function refreshData(root: string): void {
   void loadSnapshots();
+  void loadHistory();
   void loadGrowth();
   void loadLargest();
   void refreshTreemapForRoot(root);
@@ -652,9 +707,6 @@ window.addEventListener("DOMContentLoaded", () => {
   greetInputEl = document.querySelector("#greet-input");
   greetMsgEl = document.querySelector("#greet-msg");
   volumesEl = document.querySelector("#volumes");
-  usnLetterEl = document.querySelector("#usn-letter");
-  usnStatusEl = document.querySelector("#usn-status");
-  usnRecordsEl = document.querySelector("#usn-records");
   scanRootEl = document.querySelector("#scan-root");
   scanBtnEl = document.querySelector("#scan-btn");
   scanQuickBtnEl = document.querySelector("#scan-quick-btn");
@@ -663,6 +715,9 @@ window.addEventListener("DOMContentLoaded", () => {
   scanProgressEl = document.querySelector("#scan-progress");
   scanProgressTextEl = document.querySelector("#scan-progress-text");
   snapshotsEl = document.querySelector("#snapshots-table tbody");
+  historyRootEl = document.querySelector("#history-root");
+  historyGroupEl = document.querySelector("#history-group");
+  historyEl = document.querySelector("#history-table tbody");
   growthEl = document.querySelector("#growth-table tbody");
   growthThresholdEl = document.querySelector("#growth-alert-threshold");
   largestEl = document.querySelector("#largest-table tbody");
@@ -675,18 +730,14 @@ window.addEventListener("DOMContentLoaded", () => {
     e.preventDefault();
     void greet();
   });
-  document.querySelector("#usn-status-btn")?.addEventListener("click", () => {
-    void loadUsnStatus();
-  });
-  document.querySelector("#usn-recent-btn")?.addEventListener("click", () => {
-    void loadUsnRecords();
-  });
   scanBtnEl?.addEventListener("click", () => void startScan());
   scanQuickBtnEl?.addEventListener("click", () => void startQuickScan());
   scanAllBtnEl?.addEventListener("click", () => void startScanAll());
   scanCancelBtnEl?.addEventListener("click", () => void cancelScan());
 
   growthThresholdEl?.addEventListener("input", () => renderGrowth());
+  historyRootEl?.addEventListener("change", () => void loadHistory());
+  historyGroupEl?.addEventListener("change", () => renderHistory());
   growthEl?.addEventListener("click", (event) => {
     const row = (event.target as HTMLElement).closest("tr[data-path]");
     if (!row) return;
@@ -752,5 +803,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   void loadVolumes();
   void loadSnapshots();
+  void loadHistory();
   void loadLargest();
+  void ensureBaseline();
 });

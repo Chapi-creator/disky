@@ -504,6 +504,17 @@ fn resolve_frn(
     Ok(cur)
 }
 
+/// ¿Se puede leer el `$MFT` del volumen `letter` en este proceso?
+///
+/// Abrir `\\.\X:` con `GENERIC_READ` exige elevación; si el proceso corre como
+/// admin, el handle abre y podemos usar [`mft_scan`] in-process (muy rápido) en
+/// vez del walker. Un `false` no es un error de escaneo: solo indica que toca
+/// el fallback sin admin.
+#[must_use]
+pub fn mft_available(letter: char) -> bool {
+    VolumeHandle::open(letter).is_ok()
+}
+
 /// Escanea el subárbol de `root` leyendo el `$MFT` del volumen.
 ///
 /// Emite `DirStat` en post-orden (igual contrato que [`super::walk::walk_tree`]).

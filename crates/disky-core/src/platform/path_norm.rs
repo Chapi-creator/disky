@@ -10,14 +10,23 @@
 //! No se toca nada más: mayúsculas, `\\?\` ni unidades — la comparación exacta
 //! de `String` es deliberada (simple, testeada y suficiente para el diff).
 
-/// Sustituye los separadores `/` por el separador nativo del SO.
+/// Sustituye los separadores `/` por el separador nativo del SO y colapsa los
+/// separadores finales repetidos (`C:\\` → `C:\`), para que una raíz tipeada
+/// como `C:\\` coincida con la forma canónica `C:\` del volumen. No toca
+/// `\\?\` ni los prefijos UNC (que empiezan con doble barra, no la terminan).
 ///
 /// En Unix no transforma nada: `/` es el único separador válido y cualquier
 /// `\` sería parte legítima de un nombre de archivo.
 #[must_use]
 pub fn normalize_path_separators(path: &str) -> String {
     if cfg!(windows) {
-        path.replace('/', "\\")
+        let converted = path.replace('/', "\\");
+        let collapsed = converted.trim_end_matches('\\');
+        if collapsed.len() == converted.len() {
+            converted
+        } else {
+            format!("{collapsed}\\")
+        }
     } else {
         path.to_owned()
     }
@@ -35,6 +44,15 @@ mod tests {
             "C:\\Users\\Breiner\\Projects"
         );
         assert_eq!(normalize_path_separators("C:/Mix/Sub"), "C:\\Mix\\Sub");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn collapses_trailing_separators() {
+        assert_eq!(normalize_path_separators("C:\\\\"), "C:\\");
+        assert_eq!(normalize_path_separators("C:\\Users\\\\"), "C:\\Users\\");
+        assert_eq!(normalize_path_separators("C:\\Users"), "C:\\Users");
+        assert_eq!(normalize_path_separators("C:\\"), "C:\\");
     }
 
     #[cfg(windows)]
