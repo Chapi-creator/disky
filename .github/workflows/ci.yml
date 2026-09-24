@@ -19,8 +19,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy estricto (pedantic + deny)
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Tests del core (incluye pruebas de integración que exigen elevación; el runner ya la tiene)
-        run: cargo test -p disky-core -- --include-ignored
+      # Los tests `#[ignore]` de MFT/USN exigen acceso a dispositivo en `C:`,
+      # que el runner virtual de GitHub no permite: se corren en una máquina
+      # local elevada (cargo test -p disky-core -- --include-ignored).
+      - name: Tests del core
+        run: cargo test -p disky-core
 
   frontend:
     name: Frontend (tsc · vite build)
