@@ -507,7 +507,7 @@ impl From<rusqlite::Error> for StoreError {
 
 /// Compacta el WAL de la BD usando una conexión temporal (residuo de un cierre
 /// forzado a mitad de escaneo). No bloquea: si otra conexión tiene una lectura
-/// activa, SQLite devuelve `busy` y lo deja para el próximo arranque.
+/// activa, `SQLite` devuelve `busy` y lo deja para el próximo arranque.
 ///
 /// # Errors
 /// [`StoreError::Db`] si no se puede abrir la BD.

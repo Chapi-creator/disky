@@ -370,8 +370,10 @@ fn consider_file_name(attr: &[u8], best: &mut Option<(u8, String, u64, u64, i64)
         return;
     }
     let name_u16: Vec<u16> = value[0x3A..0x3A + name_len * 2]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     let name = String::from_utf16_lossy(&name_u16);
 

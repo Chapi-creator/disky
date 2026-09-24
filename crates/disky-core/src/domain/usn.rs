@@ -113,8 +113,10 @@ pub fn parse_usn_record_v2(buf: &[u8]) -> Option<(JournalRecord, usize)> {
         return None;
     }
     let name_u16: Vec<u16> = buf[name_off..name_end]
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect();
 
     Some((
