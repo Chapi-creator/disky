@@ -10,6 +10,7 @@ import { listen } from "@tauri-apps/api/event";
 import type {
   GrowthDiff,
   GrowthReport,
+  LargestDir,
   LargestFile,
   ScanAllUnit,
   ScanDonePayload,
@@ -37,6 +38,7 @@ let historyEl: HTMLElement | null;
 let growthEl: HTMLElement | null;
 let growthThresholdEl: HTMLInputElement | null;
 let largestEl: HTMLElement | null;
+let largestDirsEl: HTMLElement | null;
 
 /** `true` mientras un "Escanear todo" está en curso. */
 let scanAllActive = false;
@@ -223,6 +225,15 @@ function largestRow(file: LargestFile, index: number): string {
   </tr>`;
 }
 
+function largestDirsRow(dir: LargestDir, index: number): string {
+  return `<tr>
+    <td class="num">${index + 1}</td>
+    <td class="path">${escapeHtml(dir.path)}</td>
+    <td class="num">${formatBytes(dir.size_bytes)}</td>
+    <td class="num">${dir.files.toLocaleString()}</td>
+  </tr>`;
+}
+
 /** Vacía la tabla si no queda nada pintable. */
 function emptyTable(el: HTMLElement | null, cols: number, msg: string): void {
   if (el) el.innerHTML = `<tr><td colspan="${cols}">${msg}</td></tr>`;
@@ -248,6 +259,31 @@ async function loadLargest(): Promise<void> {
       files.length > 0
         ? files.map(largestRow).join("")
         : `<tr><td colspan="4">Este snapshot no registró archivos pesados</td></tr>`;
+  } catch (err) {
+    el.innerHTML = `<tr><td colspan="4" class="error">Error: ${escapeHtml(String(err))}</td></tr>`;
+  }
+}
+
+/** Carga las carpetas más pesadas del último snapshot de la raíz actual. */
+async function loadLargestDirs(): Promise<void> {
+  const el = largestDirsEl;
+  if (!el) return;
+  try {
+    const snaps = await invoke<SnapshotSummary[]>("snapshots_list", {
+      root: currentScanRoot(),
+    });
+    const latest = snaps[0];
+    if (!latest) {
+      el.innerHTML = `<tr><td colspan="4">Aún no hay escaneos guardados</td></tr>`;
+      return;
+    }
+    const dirs = await invoke<LargestDir[]>("largest_dirs", {
+      snapshotId: latest.id,
+    });
+    el.innerHTML =
+      dirs.length > 0
+        ? dirs.map(largestDirsRow).join("")
+        : `<tr><td colspan="4">Este snapshot no registró carpetas pesadas</td></tr>`;
   } catch (err) {
     el.innerHTML = `<tr><td colspan="4" class="error">Error: ${escapeHtml(String(err))}</td></tr>`;
   }
@@ -487,6 +523,7 @@ function refreshData(root: string): void {
   void loadHistory();
   void loadGrowth();
   void loadLargest();
+  void loadLargestDirs();
   void refreshTreemapForRoot(root);
 }
 
@@ -721,6 +758,7 @@ window.addEventListener("DOMContentLoaded", () => {
   growthEl = document.querySelector("#growth-table tbody");
   growthThresholdEl = document.querySelector("#growth-alert-threshold");
   largestEl = document.querySelector("#largest-table tbody");
+  largestDirsEl = document.querySelector("#largest-dirs");
   treemapEl = document.querySelector("#treemap");
   treemapCrumbEl = document.querySelector("#treemap-crumb");
   timelineEl = document.querySelector("#timeline");
@@ -804,6 +842,9 @@ window.addEventListener("DOMContentLoaded", () => {
   void loadVolumes();
   void loadSnapshots();
   void loadHistory();
-  void loadLargest();
+  // Los listados "más pesados" son los queries costosos del arranque: se
+  // difieren un tick para que volúmenes y snapshots pinten primero.
+  window.setTimeout(() => void loadLargest(), 0);
+  window.setTimeout(() => void loadLargestDirs(), 0);
   void ensureBaseline();
 });

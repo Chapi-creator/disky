@@ -59,6 +59,19 @@ pub struct LargestFile {
     pub mtime_unix: i64,
 }
 
+/// Una carpeta por tamaño (roll-up de todo su subárbol): el top-N de un
+/// snapshot, ordenado descendentemente por `size_bytes`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[must_use]
+pub struct LargestDir {
+    /// Ruta absoluta de la carpeta.
+    pub path: String,
+    /// Bytes de todos los archivos descendentes.
+    pub size_bytes: u64,
+    /// Archivos descendentes (la carpeta y sus subcarpetas).
+    pub files: u64,
+}
+
 /// Progreso de un escaneo en curso (para eventos de UI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[must_use]
@@ -207,6 +220,13 @@ pub trait SnapshotStore {
     /// # Errors
     /// [`StoreError`] si la consulta falla.
     fn load_top_files(&self, snapshot_id: u64) -> Result<Vec<LargestFile>, StoreError>;
+
+    /// Carga las carpetas más pesadas de un snapshot (excluyendo la raíz),
+    /// ordenadas descendentemente por tamaño. `limit` acota el top-N.
+    ///
+    /// # Errors
+    /// [`StoreError`] si la consulta falla.
+    fn load_top_dirs(&self, snapshot_id: u64, limit: u32) -> Result<Vec<LargestDir>, StoreError>;
 }
 
 /// Escritura incremental de un snapshot en curso (post-orden de directorios).

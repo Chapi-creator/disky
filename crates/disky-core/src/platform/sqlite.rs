@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::domain::scan::{
-    DirStat, DirWriter, LargestFile, ScanTotals, SeriesPoint, SnapshotStore, SnapshotSummary,
-    StoreError,
+    DirStat, DirWriter, LargestDir, LargestFile, ScanTotals, SeriesPoint, SnapshotStore,
+    SnapshotSummary, StoreError,
 };
 use crate::domain::UsageSample;
 use crate::platform::path_norm::normalize_path_separators;
@@ -98,6 +98,7 @@ impl SqliteStore {
                 PRIMARY KEY (snapshot_id, path)
             );
             CREATE INDEX IF NOT EXISTS idx_dirs_path ON dirs(path);
+            CREATE INDEX IF NOT EXISTS idx_dirs_size ON dirs(snapshot_id, size_bytes DESC);
             CREATE TABLE IF NOT EXISTS top_files (
                 snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
                 path        TEXT NOT NULL,
@@ -224,7 +225,7 @@ impl SnapshotStore for SqliteStore {
         }
         let mut stmt = self
             .conn
-            .prepare("SELECT path, started_at, size_bytes FROM dirs d JOIN snapshots s ON s.id = d.snapshot_id WHERE d.snapshot_id = ?1")
+            .prepare("SELECT path, started_at, size_bytes FROM dirs d JOIN snapshots s ON s.id = d.snapshot_id WHERE d.snapshot_id = ?1 ORDER BY d.path")
             .map_err(db_err("preparando consulta de dirs"))?;
         let rows = stmt
             .query_map([to_db(snapshot_id)], |row| {
@@ -308,7 +309,8 @@ impl SnapshotStore for SqliteStore {
         };
         let sql =
             "SELECT d.path, s.started_at, d.size_bytes FROM dirs d JOIN snapshots s ON s.id = d.snapshot_id
-             WHERE d.snapshot_id = ?1 AND d.path >= ?2 AND (?3 IS NULL OR d.path < ?3)";
+             WHERE d.snapshot_id = ?1 AND d.path >= ?2 AND (?3 IS NULL OR d.path < ?3)
+             ORDER BY d.path";
         let mut stmt = self
             .conn
             .prepare(sql)
@@ -368,6 +370,31 @@ impl SnapshotStore for SqliteStore {
             })
             .map_err(db_err("leyendo top_files"))?;
         rows.map(|row| row.map_err(db_err("leyendo fila de top_files")))
+            .collect()
+    }
+
+    fn load_top_dirs(&self, snapshot_id: u64, limit: u32) -> Result<Vec<LargestDir>, StoreError> {
+        // Excluye la propia raíz (siempre sería #1 y es trivial); el JOIN
+        // evita que el comando resuelva la raíz del snapshot por separado.
+        let sql = "SELECT d.path, d.size_bytes, d.files FROM dirs d
+                   JOIN snapshots s ON s.id = d.snapshot_id
+                   WHERE d.snapshot_id = ?1 AND d.path <> s.root
+                   ORDER BY d.size_bytes DESC
+                   LIMIT ?2";
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(db_err("preparando consulta de top_dirs"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![to_db(snapshot_id), limit], |row| {
+                Ok(LargestDir {
+                    path: row.get(0)?,
+                    size_bytes: non_neg(row.get::<_, i64>(1)?),
+                    files: non_neg(row.get::<_, i64>(2)?),
+                })
+            })
+            .map_err(db_err("leyendo top_dirs"))?;
+        rows.map(|row| row.map_err(db_err("leyendo fila de top_dirs")))
             .collect()
     }
 }
@@ -449,6 +476,12 @@ impl DirWriter for SqliteDirWriter<'_> {
         self.conn
             .execute_batch("COMMIT")
             .map_err(db_err("confirmando snapshot"))?;
+        // Flush del WAL a la BD principal: la transacción gigante del escaneo
+        // no permite auto-checkpoint mientras está abierta, así que se fuerza
+        // aquí. Si el proceso muere después, el WAL residual es minúsculo.
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .map_err(db_err("compactando WAL tras el escaneo"))?;
         self.finished = true;
         Ok(non_neg(self.id))
     }
@@ -473,6 +506,20 @@ impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
         Self::Db(e.to_string())
     }
+}
+
+/// Compacta el WAL de la BD usando una conexión temporal (residuo de un cierre
+/// forzado a mitad de escaneo). No bloquea: si otra conexión tiene una lectura
+/// activa, SQLite devuelve `busy` y lo deja para el próximo arranque.
+///
+/// # Errors
+/// [`StoreError::Db`] si no se puede abrir la BD.
+pub fn truncate_wal(path: &Path) -> Result<(), StoreError> {
+    let conn = Connection::open(path)
+        .map_err(|e| StoreError::Db(format!("abriendo {}: {e}", path.display())))?;
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .map_err(db_err("compactando WAL"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -982,5 +1029,47 @@ mod tests {
         assert!(store.load_top_files(id2).expect("load vacío").is_empty());
         store.prune("C:\\Datos", 1).expect("prune");
         assert!(store.load_top_files(id).expect("prune cascada").is_empty());
+    }
+
+    #[test]
+    fn top_dirs_ordered_desc_excluding_root() {
+        let (_tmp, mut store) = open_tmp();
+        let id = {
+            let mut w = store.open_writer("C:\\Base", 1_000).expect("w");
+            write_all(
+                &mut w,
+                &[
+                    ("C:\\Base".into(), 999, 0, 5),
+                    ("C:\\Base\\Grande".into(), 500, 0, 10),
+                    ("C:\\Base\\Medio".into(), 200, 0, 3),
+                    ("C:\\Base\\Pequeno".into(), 30, 0, 1),
+                ],
+            );
+            w.finish(ScanTotals::default(), 0).expect("finish")
+        };
+
+        let top = store.load_top_dirs(id, 50).expect("top dirs");
+        assert_eq!(top.len(), 3, "la raíz se excluye del top");
+        assert_eq!(top[0].path, "C:\\Base\\Grande");
+        assert_eq!(top[0].size_bytes, 500);
+        assert_eq!(top[0].files, 10);
+        assert_eq!(top[1].path, "C:\\Base\\Medio");
+        assert_eq!(top[2].path, "C:\\Base\\Pequeno");
+
+        // El límite recorta desde el mayor.
+        let limited = store.load_top_dirs(id, 2).expect("limit");
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].size_bytes, 500);
+        assert_eq!(limited[1].size_bytes, 200);
+
+        // Snapshot sin hijos (solo la raíz): lista vacía, sin error.
+        let bare = {
+            let w = store.open_writer("C:\\Vacio", 2_000).expect("w");
+            w.finish(ScanTotals::default(), 0).expect("finish")
+        };
+        assert!(store
+            .load_top_dirs(bare, 50)
+            .expect("vacío es válido")
+            .is_empty());
     }
 }

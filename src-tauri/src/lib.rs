@@ -174,7 +174,16 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let db_path = data_dir.join("snapshots.db");
             let store = disky_core::SqliteStore::open(&db_path)?;
-            app.manage(state::AppState::new(store, db_path));
+            app.manage(state::AppState::new(store, db_path.clone()));
+
+            // Compacta el WAL residual de un cierre forzado sin bloquear la
+            // apertura de la ventana (conexión propia, fuera del hilo de setup).
+            std::thread::Builder::new()
+                .name("wal-checkpoint".into())
+                .spawn(move || {
+                    let _ = disky_core::truncate_wal(&db_path);
+                })
+                .expect("no se pudo crear el hilo de checkpoint");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -188,6 +197,7 @@ pub fn run() {
             commands::delete_snapshot,
             commands::growth_report,
             commands::largest_files,
+            commands::largest_dirs,
             commands::treemap_nodes,
             commands::timeline_series,
         ])

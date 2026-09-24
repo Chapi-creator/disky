@@ -16,6 +16,10 @@
   box-sizing: border-box;
 }
 
+html {
+  background: var(--bg);
+}
+
 body {
   margin: 0;
   font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
@@ -358,4 +362,39 @@ td.path {
   height: 4px;
   border-radius: 2px;
   display: inline-block;
+}
+
+/* Secciones plegables de los "más pesados" (details/summary nativo). */
+.collapsible {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-top: 20px;
+}
+
+.collapsible > summary {
+  cursor: pointer;
+  user-select: none;
+  padding: 10px 14px;
+  list-style: none;
+}
+
+.collapsible > summary::-webkit-details-marker {
+  display: none;
+}
+
+.collapsible > summary:hover {
+  background: rgba(79, 140, 255, 0.06);
+}
+
+.collapsible > summary h3 {
+  display: inline;
+  margin: 0;
+  color: var(--text);
+  text-transform: none;
+}
+
+.collapsible .hint,
+.collapsible .volumes-table {
+  margin: 0 14px 14px;
+  width: calc(100% - 28px);
 }

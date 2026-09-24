@@ -139,24 +139,53 @@
         </tbody>
       </table>
 
-      <h3>Archivos más pesados</h3>
-      <p class="hint">
-        Top 50 archivos por tamaño del último escaneo. Se recogen durante el
-        recorrido, así que no agrandan la base de datos.
-      </p>
-      <table class="volumes-table" id="largest-table">
-        <thead>
-          <tr>
-            <th>#</th>
-            <th>Archivo</th>
-            <th>Tamaño</th>
-            <th>Modificado</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr><td colspan="4">Aún no hay escaneos guardados</td></tr>
-        </tbody>
-      </table>
+      <details class="collapsible">
+        <summary>
+          <h3>Archivos más pesados</h3>
+          <span class="hint-inline">Top 50 por tamaño · expandir/contraer</span>
+        </summary>
+        <p class="hint">
+          Top 50 archivos por tamaño del último escaneo. Se recogen durante el
+          recorrido, así que no agrandan la base de datos.
+        </p>
+        <table class="volumes-table" id="largest-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Archivo</th>
+              <th>Tamaño</th>
+              <th>Modificado</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td colspan="4">Aún no hay escaneos guardados</td></tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details class="collapsible">
+        <summary>
+          <h3>Carpetas más pesadas</h3>
+          <span class="hint-inline">Top 50 por tamaño · expandir/contraer</span>
+        </summary>
+        <p class="hint">
+          Top 50 carpetas por tamaño del último escaneo. El tamaño de cada
+          carpeta incluye todo su subárbol.
+        </p>
+        <table class="volumes-table" id="largest-dirs-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Carpeta</th>
+              <th>Tamaño</th>
+              <th>Archivos</th>
+            </tr>
+          </thead>
+          <tbody id="largest-dirs">
+            <tr><td colspan="4">Aún no hay escaneos guardados</td></tr>
+          </tbody>
+        </table>
+      </details>
 
       <form class="row" id="greet-form">
         <input id="greet-input" placeholder="Tu nombre…" />

@@ -57,6 +57,13 @@ export interface LargestFile {
   mtime_unix: number;
 }
 
+/** Una carpeta por tamaño (roll-up de su subárbol, top-N del snapshot). */
+export interface LargestDir {
+  path: string;
+  size_bytes: number;
+  files: number;
+}
+
 /** Comparación de los dos snapshots más recientes de una raíz. */
 export interface GrowthDiff {
   old: SnapshotSummary;

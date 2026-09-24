@@ -19,7 +19,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use disky_core::platform::path_norm::normalize_path_separators;
 use disky_core::{
     growth_ranking, list_volumes as core_list_volumes, match_by_path,
-    squarify, walk_tree, DirStat, DirWriter, GrowthReport, LargestFile,
+    squarify, walk_tree, DirStat, DirWriter, GrowthReport, LargestDir, LargestFile,
     MftError, PlatformError, SnapshotStore as _, SnapshotSummary, SqliteStore, TreemapItem,
     WalkError,
 };
@@ -29,6 +29,9 @@ use crate::state::{lock_store, AppState};
 
 /// Máximo de filas del informe de crecimiento enviado a la UI.
 const MAX_GROWTH_ROWS: usize = 50;
+
+/// Máximo de carpetas del listado "más pesadas" enviado a la UI.
+const MAX_LARGEST_DIRS: u32 = 50;
 
 /// Lienzo del treemap en coordenadas de layout (el SVG escala con viewBox).
 const TREEMAP_W: f64 = 1_000.0;
@@ -457,6 +460,22 @@ pub fn largest_files(
 ) -> Result<Vec<LargestFile>, String> {
     let store = lock_store(&state.store);
     store.load_top_files(snapshot_id).map_err(|e| e.to_string())
+}
+
+/// Carpetas más pesadas de un snapshot (roll-up de su subárbol), ordenadas
+/// descendentemente por tamaño y sin incluir la raíz.
+///
+/// # Errors
+/// `String` si la consulta a la base de datos falla.
+#[tauri::command]
+pub fn largest_dirs(
+    state: State<'_, AppState>,
+    snapshot_id: u64,
+) -> Result<Vec<LargestDir>, String> {
+    let store = lock_store(&state.store);
+    store
+        .load_top_dirs(snapshot_id, MAX_LARGEST_DIRS)
+        .map_err(|e| e.to_string())
 }
 
 /// Traduce errores del core a mensajes accionables para la UI.
