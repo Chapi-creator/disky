@@ -17,7 +17,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
+use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -95,8 +95,7 @@ pub fn walk_tree(
         .unwrap_or_else(PoisonError::into_inner)
         .push_back(root_node);
 
-    let worker_count = thread::available_parallelism()
-        .map_or(1, |n| n.get().clamp(1, 16));
+    let worker_count = thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 16));
     let mut heaps: Vec<TopHeap> = (0..worker_count).map(|_| TopHeap::new()).collect();
 
     thread::scope(|scope| {
@@ -172,8 +171,8 @@ fn list_dir(path: &Path) -> Result<Vec<RawEntry>, ()> {
 fn list_dir_win32(path: &Path) -> Result<Vec<RawEntry>, ()> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FindClose, FindFirstFileW,
-        FindNextFileW, WIN32_FIND_DATAW,
+        FindClose, FindFirstFileW, FindNextFileW, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, WIN32_FIND_DATAW,
     };
 
     // Patrón de búsqueda: el prefijo verbatim `\\?\` evita el límite de 260
@@ -353,7 +352,10 @@ fn worker(shared: &WalkShared<'_>, top: &mut TopHeap) {
                 if shared.inflight.load(Ordering::Relaxed) == 0 {
                     return;
                 }
-                queue = shared.wake.wait(queue).unwrap_or_else(PoisonError::into_inner);
+                queue = shared
+                    .wake
+                    .wait(queue)
+                    .unwrap_or_else(PoisonError::into_inner);
             }
         };
         process_node(shared, node, top);
@@ -460,8 +462,7 @@ fn collapse(shared: &WalkShared<'_>, node: Arc<Node>) {
         };
         parent.sub_bytes.fetch_add(bytes, Ordering::SeqCst);
         parent.sub_files.fetch_add(files, Ordering::SeqCst);
-        if parent.pending.fetch_sub(1, Ordering::SeqCst) == 1
-            && parent.done.load(Ordering::SeqCst)
+        if parent.pending.fetch_sub(1, Ordering::SeqCst) == 1 && parent.done.load(Ordering::SeqCst)
         {
             current = Some(Arc::clone(parent));
         }
@@ -640,13 +641,8 @@ mod tests {
             write_file(&root.join(format!("f{i:03}.dat")), i);
         }
 
-        let totals = walk_tree(
-            root,
-            &AtomicBool::new(false),
-            &mut |_| {},
-            &mut |_| {},
-        )
-        .expect("walk ok");
+        let totals =
+            walk_tree(root, &AtomicBool::new(false), &mut |_| {}, &mut |_| {}).expect("walk ok");
 
         assert_eq!(totals.files, 60);
         let weights = totals

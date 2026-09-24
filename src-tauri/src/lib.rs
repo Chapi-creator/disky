@@ -90,12 +90,7 @@ pub fn elevated_scan(root: &str, out: &str, db: &str) -> i32 {
     let totals = {
         let mut dirs: Vec<disky_core::DirStat> = Vec::new();
         trace_elevated("antes de mft_scan");
-        match disky_core::mft_scan(
-            &root_path,
-            &cancel,
-            &mut |dir| dirs.push(dir),
-            &mut |_| {},
-        ) {
+        match disky_core::mft_scan(&root_path, &cancel, &mut |dir| dirs.push(dir), &mut |_| {}) {
             Ok(totals) => {
                 trace_elevated("mft_scan OK");
                 for dir in &dirs {
@@ -126,8 +121,7 @@ pub fn elevated_scan(root: &str, out: &str, db: &str) -> i32 {
     };
 
     let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-    let (total_files, total_bytes, read_errors) =
-        (totals.files, totals.bytes, totals.read_errors);
+    let (total_files, total_bytes, read_errors) = (totals.files, totals.bytes, totals.read_errors);
     match writer.finish(totals, duration_ms) {
         Ok(id) => {
             write_result(

@@ -188,26 +188,26 @@ fn read_at(handle: HANDLE, offset: u64, buf: &mut [u8]) -> Result<(), PlatformEr
 
 /// Parsea el boot sector NTFS (primeros 512 bytes del volumen).
 #[allow(clippy::cast_sign_loss)] // `raw as u64` solo ocurre con raw > 0
-    fn parse_boot(boot: &[u8]) -> Option<BootInfo> {
-        if boot.len() < 0x48 || &boot[0x03..0x0B] != b"NTFS    " {
-            return None;
-        }
-        let bytes_per_sector = u64::from(u16::from_le_bytes(boot[0x0B..0x0D].try_into().ok()?));
-        let sectors_per_cluster = u64::from(boot[0x0D]);
-        let cluster_bytes = bytes_per_sector * sectors_per_cluster;
-        let mft_lcn = u64::from_le_bytes(boot[0x30..0x38].try_into().ok()?);
+fn parse_boot(boot: &[u8]) -> Option<BootInfo> {
+    if boot.len() < 0x48 || &boot[0x03..0x0B] != b"NTFS    " {
+        return None;
+    }
+    let bytes_per_sector = u64::from(u16::from_le_bytes(boot[0x0B..0x0D].try_into().ok()?));
+    let sectors_per_cluster = u64::from(boot[0x0D]);
+    let cluster_bytes = bytes_per_sector * sectors_per_cluster;
+    let mft_lcn = u64::from_le_bytes(boot[0x30..0x38].try_into().ok()?);
 
-        // Clusters por registro: positivo = clusters; negativo = 2^-n bytes.
-        #[allow(clippy::cast_possible_wrap)] // 0x40 es el que decide el signo
-        let raw = boot[0x40].cast_signed();
-        #[allow(clippy::comparison_chain, clippy::cast_lossless)] // orden de precedencia intencional
-        let record_size = if raw > 0 {
-            cluster_bytes.checked_mul(raw as u64)?
-        } else if raw < 0 {
-            1u64 << -(i32::from(raw))
-        } else {
-            1024 // valor predeterminado histórico de NTFS
-        };
+    // Clusters por registro: positivo = clusters; negativo = 2^-n bytes.
+    #[allow(clippy::cast_possible_wrap)] // 0x40 es el que decide el signo
+    let raw = boot[0x40].cast_signed();
+    #[allow(clippy::comparison_chain, clippy::cast_lossless)] // orden de precedencia intencional
+    let record_size = if raw > 0 {
+        cluster_bytes.checked_mul(raw as u64)?
+    } else if raw < 0 {
+        1u64 << -(i32::from(raw))
+    } else {
+        1024 // valor predeterminado histórico de NTFS
+    };
     let record_size = usize::try_from(record_size).ok()?;
     if record_size < 64 || cluster_bytes == 0 {
         return None;
@@ -393,7 +393,9 @@ fn mft_extents(rec0: &[u8]) -> Result<Vec<(u64, u64)>, MftError> {
     if rec0.len() < 0x28 || &rec0[0..4] != b"FILE" {
         return Err(MftError::BadMft("registro 0 inválido".into()));
     }
-    let first_attr = usize::from(u16::from_le_bytes(rec0[0x14..0x16].try_into().unwrap_or([0; 2])));
+    let first_attr = usize::from(u16::from_le_bytes(
+        rec0[0x14..0x16].try_into().unwrap_or([0; 2]),
+    ));
     let end = u32::from_le_bytes(rec0[0x18..0x1C].try_into().unwrap_or([0; 4])) as usize;
     let mut off = first_attr;
     while off + 8 <= end.min(rec0.len()) {
@@ -410,12 +412,14 @@ fn mft_extents(rec0: &[u8]) -> Result<Vec<(u64, u64)>, MftError> {
         // $DATA no-residente: el run list vive desde `mp_off` hasta el final
         // del atributo y termina en un byte 0.
         if attr_type == ATTR_DATA && attr.len() > 0x22 && attr[8] == 1 {
-            let mp_off = usize::from(u16::from_le_bytes(attr[0x20..0x22].try_into().unwrap_or([0; 2])));
+            let mp_off = usize::from(u16::from_le_bytes(
+                attr[0x20..0x22].try_into().unwrap_or([0; 2]),
+            ));
             let map = attr
                 .get(mp_off..)
                 .ok_or_else(|| MftError::BadMft("run list fuera de rango".into()))?;
-            let runs = parse_runlist(map)
-                .ok_or_else(|| MftError::BadMft("run list ilegible".into()))?;
+            let runs =
+                parse_runlist(map).ok_or_else(|| MftError::BadMft("run list ilegible".into()))?;
             return Ok(runs);
         }
         off += attr_len;
@@ -554,8 +558,7 @@ pub fn mft_scan(
         .map(str::to_owned)
         .collect();
 
-    let target =
-        resolve_frn(&components, &entries, &children).map_err(MftError::PathNotFound)?;
+    let target = resolve_frn(&components, &entries, &children).map_err(MftError::PathNotFound)?;
 
     // Post-orden iterativo sobre los directorios del subárbol.
     let mut postorder: Vec<u64> = Vec::new();
@@ -816,7 +819,10 @@ mod tests {
         raw.truncate(first_len);
         raw[0x18..0x1C].copy_from_slice(&le_u32(first_len as u32)); // used size
 
-        let name2: Vec<u8> = "documentos.txt".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let name2: Vec<u8> = "documentos.txt"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
         let value2_len = 0x3A + name2.len();
         let attr2_len = 0x18 + value2_len;
         let base = raw.len();
@@ -930,11 +936,7 @@ mod tests {
         assert_eq!(dirs[0].path, "C:\\Usuarios");
         assert_eq!(dirs[0].files, 2);
         assert_eq!(dirs[0].size_bytes, 400);
-        let top_paths: Vec<&str> = totals
-            .top
-            .iter()
-            .map(|f| f.path.as_str())
-            .collect();
+        let top_paths: Vec<&str> = totals.top.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(top_paths, ["C:\\Usuarios\\b.bin", "C:\\Usuarios\\a.txt"]);
     }
 
@@ -945,20 +947,26 @@ mod tests {
         // colgar 30 bajo la raíz para que el post-orden sea [21,22,31,30,12].
         let mut entries = entries;
         let mut children = children;
-        entries.insert(30, FileRecord {
-            parent_frn: 12,
-            name: "Deep".into(),
-            is_dir: true,
-            size: 0,
-            mtime_unix: 0,
-        });
-        entries.insert(31, FileRecord {
-            parent_frn: 30,
-            name: "c.dat".into(),
-            is_dir: false,
-            size: 50,
-            mtime_unix: 0,
-        });
+        entries.insert(
+            30,
+            FileRecord {
+                parent_frn: 12,
+                name: "Deep".into(),
+                is_dir: true,
+                size: 0,
+                mtime_unix: 0,
+            },
+        );
+        entries.insert(
+            31,
+            FileRecord {
+                parent_frn: 30,
+                name: "c.dat".into(),
+                is_dir: false,
+                size: 50,
+                mtime_unix: 0,
+            },
+        );
         children.get_mut(&12).expect("hijos de 12").push(30);
         children.insert(30, vec![31]);
 

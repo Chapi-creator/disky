@@ -345,10 +345,7 @@ impl SnapshotStore for SqliteStore {
 
     fn delete_snapshot(&mut self, snapshot_id: u64) -> Result<(), StoreError> {
         self.conn
-            .execute(
-                "DELETE FROM snapshots WHERE id = ?1",
-                [to_db(snapshot_id)],
-            )
+            .execute("DELETE FROM snapshots WHERE id = ?1", [to_db(snapshot_id)])
             .map_err(db_err("borrando snapshot"))?;
         Ok(())
     }
@@ -699,7 +696,9 @@ mod tests {
     #[test]
     fn delete_snapshot_is_idempotent() {
         let (_tmp, mut store) = open_tmp();
-        store.delete_snapshot(999).expect("borrar inexistente es no-op");
+        store
+            .delete_snapshot(999)
+            .expect("borrar inexistente es no-op");
         assert_eq!(store.list_snapshots(None, 10).expect("listar").len(), 0);
     }
 

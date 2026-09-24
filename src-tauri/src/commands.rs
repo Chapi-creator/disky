@@ -18,10 +18,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use disky_core::platform::path_norm::normalize_path_separators;
 use disky_core::{
-    growth_ranking, list_volumes as core_list_volumes, match_by_path,
-    squarify, walk_tree, DirStat, DirWriter, GrowthReport, LargestDir, LargestFile,
-    MftError, PlatformError, SnapshotStore as _, SnapshotSummary, SqliteStore, TreemapItem,
-    WalkError,
+    growth_ranking, list_volumes as core_list_volumes, match_by_path, squarify, walk_tree, DirStat,
+    DirWriter, GrowthReport, LargestDir, LargestFile, MftError, PlatformError, SnapshotStore as _,
+    SnapshotSummary, SqliteStore, TreemapItem, WalkError,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -407,7 +406,9 @@ pub fn snapshots_list(
 #[tauri::command]
 pub fn delete_snapshot(state: State<'_, AppState>, snapshot_id: u64) -> Result<(), String> {
     let mut store = lock_store(&state.store);
-    store.delete_snapshot(snapshot_id).map_err(|e| e.to_string())
+    store
+        .delete_snapshot(snapshot_id)
+        .map_err(|e| e.to_string())
 }
 
 /// Comparación de los dos snapshots más recientes de `root`.
@@ -612,8 +613,12 @@ fn perform_scan(
 
     let outcome = match scan_result {
         Ok(totals) => {
-            let (top, total_files, total_bytes, read_errors) =
-                (totals.top.clone(), totals.files, totals.bytes, totals.read_errors);
+            let (top, total_files, total_bytes, read_errors) = (
+                totals.top.clone(),
+                totals.files,
+                totals.bytes,
+                totals.read_errors,
+            );
             let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
             match writer.finish(totals, duration_ms) {
                 Ok(id) => {
