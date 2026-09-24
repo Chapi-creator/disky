@@ -803,7 +803,18 @@ pub fn scan_quick_start(
             Err(disky_core::platform::elevate::ElevateError::Cancelled) => {
                 emit_quick_error(&handle, "Elevación cancelada por el usuario".into());
             }
-            Err(err) => emit_quick_error(&handle, err.to_string()),
+            Err(err) => {
+                // El hijo a veces deja el JSON con el motivo real (exit 2):
+                // priorizar ese detalle sobre "código de salida N".
+                let detail = std::fs::read_to_string(&out_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<ElevatedJson>(&s).ok())
+                    .and_then(|j| j.error)
+                    .filter(|s| !s.trim().is_empty());
+                let _ = std::fs::remove_file(&out_path);
+                let msg = detail.unwrap_or_else(|| err.to_string());
+                emit_quick_error(&handle, msg);
+            }
         }
     });
     Ok(())
@@ -880,7 +891,11 @@ fn quote_arg(value: &str) -> String {
     if value.contains('"') {
         return String::new();
     }
-    format!("\"{value}\"")
+    // Windows CommandLineToArgvW: un `\` pegado a la comilla final la escapa
+    // (la raíz `C:\` fusionaba todo el comando en un arg). Duplicar las barras
+    // finales las vuelve literales y la comilla cierra.
+    let n = value.bytes().rev().take_while(|&b| b == b'\\').count();
+    format!("\"{value}{}\"", "\\".repeat(n))
 }
 
 /// Segundos UNIX actuales (0 si el reloj del sistema está antes del epoch).
@@ -892,4 +907,17 @@ fn unix_now() -> i64 {
             .unwrap_or_default(),
     )
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quote_arg;
+
+    #[test]
+    fn quote_arg_escapes_trailing_backslashes() {
+        // La raíz `C:\` debe parsearse como un argumento único, no fusionar el resto.
+        assert_eq!(quote_arg(r"C:\"), r#""C:\\""#);
+        assert_eq!(quote_arg(r"C:\Users"), r#""C:\Users""#);
+        assert_eq!(quote_arg(""), r#""""#);
+    }
 }
