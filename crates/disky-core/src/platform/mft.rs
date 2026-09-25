@@ -49,6 +49,11 @@ const TOP_N: usize = 50;
 /// Tamaño máximo de cada lectura del `$MFT`.
 const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
+/// Tamaño máximo aceptado para un registro de la MFT (64 KiB, el tope real
+/// de NTFS). Más arriba el boot sector está corrupto: se rechaza en vez de
+/// intentar un `vec![0u8; …]` de gigabytes.
+const MAX_RECORD_SIZE: usize = 64 * 1024;
+
 /// FRN convencional de la raíz de un volumen NTFS.
 const NTFS_ROOT_FRN: u64 = 5;
 
@@ -204,12 +209,20 @@ fn parse_boot(boot: &[u8]) -> Option<BootInfo> {
     let record_size = if raw > 0 {
         cluster_bytes.checked_mul(raw as u64)?
     } else if raw < 0 {
-        1u64 << -(i32::from(raw))
+        // `-(raw)` llega hasta 128 (byte 0x80..): un shift ≥ 64 fuera de rango
+        // haría panic de Rust en `1u64 << shift` — boot sector corrupto.
+        let shift = -(i32::from(raw));
+        if shift >= 64 {
+            return None;
+        }
+        1u64 << shift
     } else {
         1024 // valor predeterminado histórico de NTFS
     };
     let record_size = usize::try_from(record_size).ok()?;
-    if record_size < 64 || cluster_bytes == 0 {
+    // Un registro real de NTFS va de 0x100 a 64 KiB; acotar impide que un boot
+    // corrupto provoque una asignación de cientos de MB en `vec![0u8; …]`.
+    if !(64..=MAX_RECORD_SIZE).contains(&record_size) || cluster_bytes == 0 {
         return None;
     }
     Some(BootInfo {
@@ -479,7 +492,20 @@ fn read_mft_index(letter: char) -> Result<MftIndex, MftError> {
                         .push(this_frn);
                     entries.insert(this_frn, file_rec);
                 } else {
-                    read_errors += 1;
+                    // `None` es lo NORMAL en un volumen real: ranuras sin
+                    // usar (borrados/compactación) y registros de extensión
+                    // (ficheros con lista de atributos). Solo un registro "en
+                    // uso" sin `$FILE_NAME` legible es una lectura defectuosa.
+                    let in_use_base = rec.len() >= 0x28
+                        && rec[0..4] == *b"FILE"
+                        && u16::from_le_bytes(rec[0x16..0x18].try_into().unwrap_or_default())
+                            & FLAG_IN_USE
+                            != 0
+                        && u64::from_le_bytes(rec[0x20..0x28].try_into().unwrap_or([0xFF; 8]))
+                            == u64::MAX;
+                    if in_use_base {
+                        read_errors += 1;
+                    }
                 }
             }
             frn += (want / info.record_size) as u64;
@@ -773,6 +799,27 @@ mod tests {
     fn rejects_non_ntfs_boot() {
         let boot = [0u8; 512];
         assert_eq!(parse_boot(&boot), None);
+    }
+
+    #[test]
+    fn rejects_corrupt_record_size_shift() {
+        fn boot_with(record_byte: u8) -> Vec<u8> {
+            let mut boot = vec![0u8; 512];
+            boot[3..11].copy_from_slice(b"NTFS    ");
+            boot[0x0B..0x0D].copy_from_slice(&le_u16(512));
+            boot[0x0D] = 8;
+            boot[0x30..0x38].copy_from_slice(&le_u64(4));
+            boot[0x40] = record_byte;
+            boot
+        }
+        // 0xE0 = -32 → 1 << 32 ≈ 4 GiB de "registro": se rechaza sin panic.
+        assert_eq!(parse_boot(&boot_with(0xE0)), None);
+        // 0x80 = -128 → shift 128: el guard evita el panic por overflow.
+        assert_eq!(parse_boot(&boot_with(0x80)), None);
+        // Tamaño positivo absurdo: se rechaza por el tope de 64 KiB.
+        let mut huge = boot_with(0x0A); // raw = 10 clusters/registro
+        huge[0x0D] = 244; // 244 sectores/cluster × 512 = 124 928 × 10 > tope
+        assert_eq!(parse_boot(&huge), None);
     }
 
     #[test]

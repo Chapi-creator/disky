@@ -184,15 +184,21 @@ pub fn rollup_by_child(prefix: &str, samples: &[UsageSample]) -> BTreeMap<String
     let mut rollup: BTreeMap<String, u64> = BTreeMap::new();
 
     for sample in samples {
+        // El límite es de separador: `C:\Users` no debe arrastrar a su hermano
+        // `C:\Users2\...` ni incluirse a sí mismo.
         let Some(rest) = sample
             .path
             .strip_prefix(prefix)
-            .map(|rest| rest.trim_start_matches(['\\', '/']))
-            .filter(|rest| !rest.is_empty())
+            .filter(|rest| !rest.is_empty() && rest.starts_with(['\\', '/']))
         else {
             continue;
         };
-        let Some(first_component) = rest.split(['\\', '/']).next().filter(|c| !c.is_empty()) else {
+        let some_first = rest.trim_start_matches(['\\', '/']);
+        let Some(first_component) = some_first
+            .split(['\\', '/'])
+            .next()
+            .filter(|c| !c.is_empty())
+        else {
             continue;
         };
         *rollup
@@ -311,6 +317,23 @@ mod tests {
             rollup_by_child("C:\\Discord\\", &samples)["C:\\Discord\\Cache"],
             500
         );
+    }
+
+    #[test]
+    fn rollup_does_not_swallow_sibling_prefixes() {
+        let samples = vec![
+            sample("C:\\Users\\A", BASE, 100),
+            sample("C:\\Users\\Breiner", BASE, 50),
+            sample("C:\\Users2\\B", BASE, 999),
+            sample("C:\\Users", BASE, 1),
+        ];
+
+        let rollup = rollup_by_child("C:\\Users", &samples);
+
+        assert_eq!(rollup.get("C:\\Users\\A"), Some(&100));
+        assert_eq!(rollup.get("C:\\Users\\Breiner"), Some(&50));
+        assert_eq!(rollup.len(), 2);
+        assert!(!rollup.contains_key("C:\\Users2\\B"));
     }
 
     #[test]

@@ -93,6 +93,11 @@ let timelineLegendEl: HTMLElement | null;
 /** Nodos del último treemap cargado: alimentan la comparación multi-línea. */
 let lastTreemapNodes: TreemapNodeDto[] = [];
 
+/** Tokens de secuencia: la respuesta a un drill-down viejo no pinta sobre uno
+ *  nuevo (las consultas IPC llegan fuera de orden). */
+let treemapSeq = 0;
+let timelineSeq = 0;
+
 /** Escapa texto arbitrario para insertarlo en HTML de forma segura. */
 function escapeHtml(text: string): string {
   const map: Record<string, string> = {
@@ -159,6 +164,27 @@ function setScanBusy(busy: boolean, progressText = "Preparando…"): void {
   if (scanCancelBtnEl) scanCancelBtnEl.disabled = !busy;
   if (scanProgressEl) scanProgressEl.classList.toggle("hidden", !busy);
   if (scanProgressTextEl) scanProgressTextEl.textContent = progressText;
+  // Un escaneo nuevo anula cualquier auto-ocultado pendiente: no ocultar el
+  // panel a mitad de un barrido activo.
+  if (busy) cancelHideProgress();
+}
+
+/** Timer de auto-ocultado del panel de progreso (ninguno = nunca se oculta). */
+let progressHideTimer: number | null = null;
+
+function scheduleHideProgress(delay: number): void {
+  if (progressHideTimer !== null) window.clearTimeout(progressHideTimer);
+  progressHideTimer = window.setTimeout(() => {
+    scanProgressEl?.classList.add("hidden");
+    progressHideTimer = null;
+  }, delay);
+}
+
+function cancelHideProgress(): void {
+  if (progressHideTimer !== null) {
+    window.clearTimeout(progressHideTimer);
+    progressHideTimer = null;
+  }
 }
 
 /** Muestra un error del escaneo en la zona de progreso, con auto-ocultado. */
@@ -166,7 +192,7 @@ function showScanError(message: string): void {
   if (!scanProgressEl || !scanProgressTextEl) return;
   scanProgressEl.classList.remove("hidden");
   scanProgressTextEl.innerHTML = `<span class="error">${escapeHtml(message)}</span>`;
-  window.setTimeout(() => scanProgressEl?.classList.add("hidden"), 4000);
+  scheduleHideProgress(4000);
 }
 
 function formatDelta(bytes: number): string {
@@ -408,9 +434,16 @@ let baselineTriggered = false;
  */
 async function ensureBaseline(): Promise<void> {
   if (baselineTriggered) return;
-  const snaps = await invoke<SnapshotSummary[]>("snapshots_list");
-  baselineTriggered = true;
-  if (snaps.length === 0) void startScanAll();
+  baselineTriggered = true; // evita arranques simultáneos
+  try {
+    const snaps = await invoke<SnapshotSummary[]>("snapshots_list");
+    if (snaps.length === 0) void startScanAll();
+  } catch (_err) {
+    // Fallo transitorio (BD ocupada en el arranque): reintentar una vez en
+    // vez de dejar el primer uso sin línea base para siempre.
+    baselineTriggered = false;
+    window.setTimeout(() => void ensureBaseline(), 1500);
+  }
 }
 
 /** Etiqueta del período comparado del último diff. */
@@ -533,7 +566,9 @@ function handleScanDone(payload: ScanDonePayload): void {
     showScanError(payload.error);
     return;
   }
-  refreshData(currentScanRoot());
+  // La raíz del snapshot, no el input vivo: si el campo cambió mientras el
+  // escaneo corría, refrescar con él pintaría datos de otra raíz.
+  refreshData(payload.snapshot?.root ?? currentScanRoot());
 }
 
 /** Resultado del escaneo elevado: refresco idéntico al normal. */
@@ -543,7 +578,7 @@ function handleQuickScanDone(payload: ScanQuickDonePayload): void {
     showScanError(payload.error);
     return;
   }
-  refreshData(currentScanRoot());
+  refreshData(payload.snapshot?.root ?? currentScanRoot());
 }
 
 // ── Treemap ─────────────────────────────────────────────────────────────
@@ -563,11 +598,13 @@ function nodeLabel(node: TreemapNodeDto): string {
 
 async function loadTreemap(folder?: string): Promise<void> {
   if (!treemapEl) return;
+  const seq = ++treemapSeq;
   try {
     const nodes = await invoke<TreemapNodeDto[]>("treemap_nodes", {
       root: treemapRoot,
       folder: folder ?? null,
     });
+    if (seq !== treemapSeq) return; // un drill anterior pidió después: descartar
     treemapEl.innerHTML = nodes
       .map(
         (node) => `
@@ -581,6 +618,7 @@ async function loadTreemap(folder?: string): Promise<void> {
       .join("");
     lastTreemapNodes = nodes;
   } catch (err) {
+    if (seq !== treemapSeq) return;
     treemapEl.innerHTML = `<text x="16" y="40" class="error">${escapeHtml(String(err))}</text>`;
     lastTreemapNodes = [];
   }
@@ -632,6 +670,7 @@ function shortName(path: string): string {
  * (hasta 5), una línea por carpeta con escala temporal y de bytes comunes.
  */
 async function loadTimeline(folder?: string): Promise<void> {
+  const seq = ++timelineSeq;
   if (folder !== undefined) timelineFolder = folder ?? null;
   if (!timelineEl || !timelineLegendEl) return;
   const W = 1000;
@@ -666,6 +705,7 @@ async function loadTimeline(folder?: string): Promise<void> {
         }).catch(() => [] as TimelinePointDto[]),
       ),
     );
+    if (seq !== timelineSeq) return; // respuesta obsoleta de otro drill
 
     const valid = series
       .map((s, i) => ({ ...s, points: responses[i] }))
@@ -718,6 +758,7 @@ async function loadTimeline(folder?: string): Promise<void> {
       )
       .join("");
   } catch (err) {
+    if (seq !== timelineSeq) return;
     empty(String(err));
   }
 }
@@ -796,6 +837,12 @@ window.addEventListener("DOMContentLoaded", () => {
       try {
         await invoke("delete_snapshot", { snapshotId: id });
         await loadSnapshots();
+        // largest/growth/historial/treemap podían apuntar al snapshot borrado.
+        await loadLargest();
+        await loadLargestDirs();
+        await loadGrowth();
+        await loadHistory();
+        if (treemapRoot) await refreshTreemapForRoot(treemapRoot);
       } catch (err) {
         window.alert(`No se pudo borrar el escaneo: ${String(err)}`);
       }
@@ -836,7 +883,7 @@ window.addEventListener("DOMContentLoaded", () => {
   void listen<unknown>("scan-all-done", () => {
     scanAllActive = false;
     setScanBusy(false, "Escaneo completo de todas las unidades terminado.");
-    window.setTimeout(() => scanProgressEl?.classList.add("hidden"), 3500);
+    scheduleHideProgress(3500);
   });
 
   void loadVolumes();

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use disky_core::platform::path_norm::normalize_path_separators;
+use disky_core::platform::path_norm::{child_prefix, normalize_path_separators};
 use disky_core::{
     growth_ranking, list_volumes as core_list_volumes, match_by_path, squarify, walk_tree, DirStat,
     DirWriter, GrowthReport, LargestDir, LargestFile, MftError, PlatformError, SnapshotStore as _,
@@ -100,7 +100,10 @@ pub fn treemap_nodes(
     // El snapshot más reciente siempre trae separadores nativos (el store
     // normaliza al escribir); `folder_view` ya viene normalizado.
     let folder_path = folder_view;
-    let prefix = format!("{folder_path}{}", std::path::MAIN_SEPARATOR);
+    // `child_prefix` añade el separador final salvo en la raíz de volumen:
+    // `C:\Users\` delimita los hijos reales de `C:\Users` y `C:\` cubre la
+    // raíz (un sufijo `C:\\` doble barra filtraría TODO en la raíz).
+    let prefix = child_prefix(&folder_path);
     let folder_size = samples
         .iter()
         .find(|s| s.path == folder_path)
@@ -124,6 +127,18 @@ pub fn treemap_nodes(
     // lo que ya cubren los hijos).
     let children_total: u64 = children.iter().map(|c| c.size_bytes).sum();
     let files_node = folder_size.saturating_sub(children_total);
+    // Archivos sueltos viejos = total viejo de la carpeta menos lo que
+    // cubrían los MISMOS hijos en el snapshot anterior. Usar el total de
+    // hijos NUEVO contaría el crecimiento de los hijos dos veces.
+    let old_children: u64 = children
+        .iter()
+        .filter_map(|c| prev.get(&c.path).copied())
+        .sum();
+    let old_files = prev
+        .get(&folder_path)
+        .copied()
+        .unwrap_or(0)
+        .saturating_sub(old_children);
     if files_node > 0 {
         children.push(TreemapItem {
             path: String::new(),
@@ -136,10 +151,7 @@ pub fn treemap_nodes(
         .map(|node| {
             let is_files = node.path.is_empty();
             let delta = if is_files {
-                delta_bytes(
-                    files_node,
-                    files_size_of(&prev, &folder_path, children_total),
-                )
+                delta_bytes(files_node, old_files)
             } else {
                 delta_bytes(
                     node.size_bytes,
@@ -212,12 +224,6 @@ pub fn timeline_series(
         .collect())
 }
 
-/// Tamaño que tenían los archivos sueltos de `folder` en el snapshot anterior.
-fn files_size_of(prev: &HashMap<String, u64>, folder: &str, children_total_now: u64) -> u64 {
-    prev.get(folder)
-        .map_or(0, |total| total.saturating_sub(children_total_now))
-}
-
 /// Delta `new − old` con saturación (los tamaños nunca superan `i64::MAX`).
 fn delta_bytes(new: u64, old: u64) -> i64 {
     let delta = i128::from(new) - i128::from(old);
@@ -277,8 +283,16 @@ pub fn scan_all_start(window: tauri::Window, state: State<'_, AppState>) -> Resu
     }
     state.cancel.store(false, Ordering::SeqCst);
 
-    let fixed: Vec<String> = core_list_volumes()
-        .map_err(|e| e.to_string())?
+    let fixed = match core_list_volumes() {
+        Ok(v) => v,
+        Err(e) => {
+            // No dejar `scanning=true` fijado: todos los escaneos futuros
+            // responderían "ya hay un escaneo en curso" hasta reiniciar.
+            state.scanning.store(false, Ordering::SeqCst);
+            return Err(e.to_string());
+        }
+    };
+    let fixed: Vec<String> = fixed
         .into_iter()
         .filter(|v| matches!(v.kind, disky_core::DriveKind::Fixed) && v.total_bytes > 0)
         .map(|v| format!("{}\\", v.letter))
@@ -769,6 +783,7 @@ pub fn scan_quick_start(
     if state.scanning.swap(true, Ordering::SeqCst) {
         return Err("Ya hay un escaneo en curso".into());
     }
+    state.cancel.store(false, Ordering::SeqCst);
 
     let path = PathBuf::from(root.trim());
     if !path.is_dir() {
@@ -801,7 +816,6 @@ pub fn scan_quick_start(
         );
 
         let launch = disky_core::platform::elevate::run_elevated(&exe, &args);
-        state.scanning.store(false, Ordering::SeqCst);
 
         match launch {
             Ok(()) => finish_quick_scan(&handle, &state, &root, &out_path),
@@ -821,6 +835,10 @@ pub fn scan_quick_start(
                 emit_quick_error(&handle, msg);
             }
         }
+        // Liberar recién tras procesar el resultado: si se liberaba antes, el
+        // usuario podía lanzar un segundo escaneo mientras este se leía (doble
+        // escritura en la BD → SQLITE_BUSY espurio).
+        state.scanning.store(false, Ordering::SeqCst);
     });
     Ok(())
 }

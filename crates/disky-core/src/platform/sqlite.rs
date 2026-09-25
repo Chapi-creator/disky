@@ -22,7 +22,7 @@ use crate::domain::scan::{
     SnapshotSummary, StoreError,
 };
 use crate::domain::UsageSample;
-use crate::platform::path_norm::normalize_path_separators;
+use crate::platform::path_norm::{child_prefix, normalize_path_separators};
 
 /// Esquema actual de la base de datos.
 const SCHEMA_VERSION: i32 = 2;
@@ -74,6 +74,11 @@ impl SqliteStore {
             .map_err(db_err("activando WAL"))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(db_err("configurando synchronous"))?;
+        // `BEGIN IMMEDIATE` y `wal_checkpoint` deben ESPERAR a que el otro
+        // proceso (el hijo elevado durante un escaneo) termine su escritura,
+        // en vez de fallar al instante con SQLITE_BUSY.
+        conn.pragma_update(None, "busy_timeout", 5000)
+            .map_err(db_err("configurando busy_timeout"))?;
         Ok(())
     }
 
@@ -282,17 +287,20 @@ impl SnapshotStore for SqliteStore {
         snapshot_id: u64,
         prefix: &str,
     ) -> Result<Vec<UsageSample>, StoreError> {
-        let prefix = to_key(prefix);
-        // Rango cerrado [prefix, prefix + max] sobre el índice de `path`: lee
-        // solo las filas bajo el prefijo (p. ej. los hijos de una carpeta para
-        // el treemap) sin escanear el snapshot completo.
+        // La consulta devuelve la carpeta en sí (para el total) y sus hijos
+        // reales. `child_prefix` fuerza el separador final, de modo que el
+        // rango `[child_prefix, upper)` no arrastra hermanos como `C:\Users2`
+        // (y el último byte es siempre `\` ASCII, así el upper `]` es UTF-8
+        // válido incluso con prefijos no-ASCII).
+        let folder = normalize_path_separators(prefix);
+        let child = child_prefix(prefix);
         // El upper bound es el prefijo con su último BYTE incrementado. Se
         // calcula sobre bytes (no `char`): con prefijos no-ASCII el último
         // byte puede ser >0x7F y `(byte+1) as char` fabricaría un char
         // inválido o partiría un codepoint UTF-8 a la mitad (Upper suelto
         // malformado = resultados incorrectos). 0xFF... = rango abierto.
         let upper = {
-            let mut bytes = prefix.clone().into_bytes();
+            let mut bytes = child.clone().into_bytes();
             let Some(last) = bytes.pop() else {
                 return Ok(Vec::new()); // prefijo vacío: ningún path lo empieza
             };
@@ -309,7 +317,7 @@ impl SnapshotStore for SqliteStore {
         };
         let sql =
             "SELECT d.path, s.started_at, d.size_bytes FROM dirs d JOIN snapshots s ON s.id = d.snapshot_id
-             WHERE d.snapshot_id = ?1 AND d.path >= ?2 AND (?3 IS NULL OR d.path < ?3)
+             WHERE d.snapshot_id = ?1 AND (d.path = ?2 OR (d.path >= ?3 AND (?4 IS NULL OR d.path < ?4)))
              ORDER BY d.path";
         let mut stmt = self
             .conn
@@ -317,7 +325,7 @@ impl SnapshotStore for SqliteStore {
             .map_err(db_err("preparando consulta prefijada de dirs"))?;
         let rows = stmt
             .query_map(
-                rusqlite::params![to_db(snapshot_id), prefix, upper],
+                rusqlite::params![to_db(snapshot_id), folder, child, upper],
                 |row| {
                     Ok(UsageSample {
                         path: row.get(0)?,
@@ -473,12 +481,13 @@ impl DirWriter for SqliteDirWriter<'_> {
         self.conn
             .execute_batch("COMMIT")
             .map_err(db_err("confirmando snapshot"))?;
-        // Flush del WAL a la BD principal: la transacción gigante del escaneo
-        // no permite auto-checkpoint mientras está abierta, así que se fuerza
-        // aquí. Si el proceso muere después, el WAL residual es minúsculo.
-        self.conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
-            .map_err(db_err("compactando WAL tras el escaneo"))?;
+        // Compactar el WAL es una optimización de arranque, no de durabilidad:
+        // el snapshot ya está COMMITEADO. Si otra conexión tiene una lectura
+        // activa (la UI consultando justo al cerrar), SQLite devuelve `busy` y
+        // el checkpoint se reprueba en el próximo arranque (`truncate_wal`).
+        let _ = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         self.finished = true;
         Ok(non_neg(self.id))
     }
@@ -830,19 +839,20 @@ mod tests {
         };
 
         let prefixed = store
-            .load_dir_samples_prefixed(id, "C:\\Pfx\\")
+            .load_dir_samples_prefixed(id, "C:\\Pfx")
             .expect("prefijada");
         let expected: Vec<String> = store
             .load_dir_samples(id)
             .expect("completa")
             .into_iter()
-            .filter(|s| s.path.starts_with("C:\\Pfx\\"))
+            .filter(|s| s.path == "C:\\Pfx" || s.path.starts_with("C:\\Pfx\\"))
             .map(|s| s.path)
             .collect();
         let got: Vec<String> = prefixed.iter().map(|s| s.path.clone()).collect();
 
         assert_eq!(got, expected);
-        assert_eq!(got.len(), 3); // Hijo1, Nieto, Hijo2 — sin PfxZ ni Otra
+        // La carpeta en sí + Hijo1, Nieto, Hijo2 — sin `PfxZ` ni `Otra`.
+        assert_eq!(got.len(), 4);
         assert!(got.contains(&"C:\\Pfx\\Hijo1\\Nieto".to_string()));
     }
 
@@ -871,13 +881,13 @@ mod tests {
         };
 
         let prefixed = store
-            .load_dir_samples_prefixed(id, "C:\\Á\\")
+            .load_dir_samples_prefixed(id, "C:\\Á")
             .expect("prefijada utf8");
         let expected: Vec<String> = store
             .load_dir_samples(id)
             .expect("completa")
             .into_iter()
-            .filter(|s| s.path.starts_with("C:\\Á\\"))
+            .filter(|s| s.path == "C:\\Á" || s.path.starts_with("C:\\Á\\"))
             .map(|s| s.path)
             .collect();
         let got: Vec<String> = prefixed.iter().map(|s| s.path.clone()).collect();

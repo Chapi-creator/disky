@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use crate::domain::UsageSample;
+use crate::platform::path_norm::normalize_path_separators;
 
 /// Estadística roll-up de un directorio, emitida cuando su subárbol terminó.
 ///
@@ -192,11 +193,19 @@ pub trait SnapshotStore {
         prefix: &str,
     ) -> Result<Vec<UsageSample>, StoreError> {
         // Por defecto delega en la carga completa y filtra: los adaptadores
-        // pueden redefinirlo con una consulta de rango real.
+        // pueden redefinirlo con una consulta de rango real. Se devuelve la
+        // carpeta en sí (para el total) y sus hijos, sin hermanos (`C:\Users2`
+        // no es hijo de `C:\Users`).
+        let folder = normalize_path_separators(prefix);
+        let child_prefix = if folder.ends_with(std::path::MAIN_SEPARATOR) {
+            folder.clone()
+        } else {
+            format!("{folder}{}", std::path::MAIN_SEPARATOR)
+        };
         Ok(self
             .load_dir_samples(snapshot_id)?
             .into_iter()
-            .filter(|s| s.path.starts_with(prefix))
+            .filter(|s| s.path == folder || s.path.starts_with(&child_prefix))
             .collect())
     }
 

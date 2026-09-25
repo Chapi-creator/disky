@@ -30,10 +30,6 @@ use windows::Win32::System::IO::DeviceIoControl;
 /// Tamaño del struct `USN_JOURNAL_DATA_V0` en bytes (6 campos de 8).
 const USN_JOURNAL_DATA_V0_LEN: usize = 48;
 
-/// Cuánto retrocedemos desde el final del journal al pedir el lote de
-/// registros recientes (1 MiB ≈ varios miles de registros).
-const READ_BACK_BYTES: i64 = 1024 * 1024;
-
 /// Buffer de salida para `FSCTL_READ_USN_JOURNAL` (256 KiB por lote).
 const READ_BUFFER_BYTES: usize = 256 * 1024;
 
@@ -209,8 +205,12 @@ pub fn recent_records(
     let handle = VolumeHandle::open(letter)?;
     let status = query_status(&handle, letter)?;
 
-    // Nunca pedir por debajo de first_usn: el kernel rechazaría la lectura.
-    let start_usn = status.first_usn.max(status.next_usn - READ_BACK_BYTES);
+    // Nunca pedir por debajo de first_usn: el kernel rechazaría la lectura. El
+    // retroceso es lo que cabe en el buffer: pedir una ventana más grande que el
+    // buffer de salida devolvería el tramo MÁS ANTIGUO de la ventana, no el más
+    // reciente (el lote avanza desde `start_usn` hasta llenar el buffer).
+    let back = i64::try_from(READ_BUFFER_BYTES).unwrap_or(i64::MAX);
+    let start_usn = status.first_usn.max(status.next_usn.saturating_sub(back));
     let input = pack_read_request(status.journal_id, start_usn);
     let mut out = vec![0u8; READ_BUFFER_BYTES];
     let mut returned = 0u32;

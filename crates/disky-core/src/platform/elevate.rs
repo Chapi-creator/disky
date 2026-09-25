@@ -15,7 +15,9 @@ use std::path::Path;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
+};
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 
 /// Timeout de espera del hijo: 30 minutos (un escaneo muy lento de un HDD).
@@ -80,6 +82,9 @@ pub fn run_elevated(exe: &Path, args: &str) -> Result<(), ElevateError> {
 
     let waited = unsafe { WaitForSingleObject(sei.hProcess, CHILD_TIMEOUT_MILLIS) };
     if waited != WAIT_OBJECT_0 {
+        // No dejar huérfano al hijo elevado: seguiría escaneando el disco
+        // (y escribiendo la BD) sin que nadie lo espere. Se le mata.
+        let _ = unsafe { TerminateProcess(sei.hProcess, 1) };
         let _ = unsafe { CloseHandle(sei.hProcess) };
         return Err(ElevateError::Abandoned);
     }

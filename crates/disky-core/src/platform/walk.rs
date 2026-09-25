@@ -206,8 +206,7 @@ fn list_dir_win32(path: &Path) -> Result<Vec<RawEntry>, ()> {
     };
 
     let mut out = Vec::new();
-    let mut done = false;
-    while !done {
+    loop {
         let name_len = find_data
             .cFileName
             .iter()
@@ -227,7 +226,14 @@ fn list_dir_win32(path: &Path) -> Result<Vec<RawEntry>, ()> {
         }
         match unsafe { FindNextFileW(handle, &raw mut find_data) } {
             Ok(()) => {}
-            Err(_) => done = true,
+            // ERROR_NO_MORE_FILES: fin de directorio legítimo.
+            Err(e) if e.code().0 & 0xFFFF == 18 => break,
+            // Acceso denegado o carrera con el FS: el listado quedó incompleto
+            // y el caller debe contarlo como error, no como directorio íntegro.
+            Err(_) => {
+                let _ = unsafe { FindClose(handle) };
+                return Err(());
+            }
         }
     }
     let _ = unsafe { FindClose(handle) };

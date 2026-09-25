@@ -10,10 +10,11 @@
 //! No se toca nada más: mayúsculas, `\\?\` ni unidades — la comparación exacta
 //! de `String` es deliberada (simple, testeada y suficiente para el diff).
 
-/// Sustituye los separadores `/` por el separador nativo del SO y colapsa los
-/// separadores finales repetidos (`C:\\` → `C:\`), para que una raíz tipeada
-/// como `C:\\` coincida con la forma canónica `C:\` del volumen. No toca
-/// `\\?\` ni los prefijos UNC (que empiezan con doble barra, no la terminan).
+/// Sustituye los separadores `/` por el separador nativo del SO y elimina los
+/// separadores finales (`C:\Users\\` → `C:\Users`), para que una raíz tipeada
+/// como `C:\Users\` coincida con la propia carpeta `C:\Users` vista como hijo
+/// de otro escaneo. La única ruta que conserva su barra final es la raíz de un
+/// volumen (`C:\`). No toca `\\?\` ni los prefijos UNC.
 ///
 /// En Unix no transforma nada: `/` es el único separador válido y cualquier
 /// `\` sería parte legítima de un nombre de archivo.
@@ -21,19 +22,38 @@
 pub fn normalize_path_separators(path: &str) -> String {
     if cfg!(windows) {
         let converted = path.replace('/', "\\");
-        let collapsed = converted.trim_end_matches('\\');
-        if collapsed.len() == converted.len() {
-            converted
+        let trimmed = converted.trim_end_matches('\\');
+        if trimmed.is_empty() {
+            return converted; // "\\" o "\\" sin ruta: sin barra que decidir
+        }
+        // `C:`, `D:`, … → raíz de volumen con su barra de raíz.
+        if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' {
+            format!("{trimmed}\\")
         } else {
-            format!("{collapsed}\\")
+            trimmed.to_owned()
         }
     } else {
         path.to_owned()
     }
 }
 
+/// Prefijo canónico para consultar los **hijos directos** de `path`: añade el
+/// separador final (salvo raíces de volumen, que ya lo tienen). Garantiza que
+/// un filtro/consulta prefijada no arrastre hermanos como `C:\Users2` al pedir
+/// los hijos de `C:\Users`.
+#[must_use]
+pub fn child_prefix(path: &str) -> String {
+    let path = normalize_path_separators(path);
+    if path.ends_with(std::path::MAIN_SEPARATOR) {
+        path
+    } else {
+        format!("{path}{}", std::path::MAIN_SEPARATOR)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::child_prefix;
     use super::normalize_path_separators;
 
     #[cfg(windows)]
@@ -50,9 +70,33 @@ mod tests {
     #[test]
     fn collapses_trailing_separators() {
         assert_eq!(normalize_path_separators("C:\\\\"), "C:\\");
-        assert_eq!(normalize_path_separators("C:\\Users\\\\"), "C:\\Users\\");
+        assert_eq!(normalize_path_separators("C:\\Users\\\\"), "C:\\Users");
         assert_eq!(normalize_path_separators("C:\\Users"), "C:\\Users");
         assert_eq!(normalize_path_separators("C:\\"), "C:\\");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strips_trailing_separators_except_volume_root() {
+        assert_eq!(
+            normalize_path_separators("C:\\Users\\Breiner\\"),
+            "C:\\Users\\Breiner"
+        );
+        assert_eq!(normalize_path_separators("C:\\"), "C:\\");
+        assert_eq!(normalize_path_separators("C:"), "C:\\");
+        assert_eq!(
+            normalize_path_separators("\\\\server\\share\\"),
+            "\\\\server\\share"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_prefix_separates_siblings() {
+        assert_eq!(child_prefix("C:\\Users"), "C:\\Users\\");
+        assert_eq!(child_prefix("C:\\Users\\"), "C:\\Users\\");
+        assert_eq!(child_prefix("C:/Users"), "C:\\Users\\");
+        assert_eq!(child_prefix("C:\\"), "C:\\");
     }
 
     #[cfg(windows)]
