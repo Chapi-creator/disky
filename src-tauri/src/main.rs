@@ -11,6 +11,9 @@
 //! Modo hijo multiunidad (un solo UAC para todas las unidades fijas):
 //! `disky.exe --elevated-scan-all --out <result.jsonl> --db <snapshots.db>`
 //! Recorre las unidades y **añade una línea JSONL** por unidad terminada.
+//!
+//! `--cancel-file <ruta>` es opcional: si se pasa, el hijo vigila ese archivo y
+//! se cancela en cuanto exista (el padre no puede matar a un proceso elevado).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -21,14 +24,16 @@ fn main() {
     if args.iter().any(|a| a == "--elevated-scan-all") {
         let out = arg_value(slice, "--out").unwrap_or_default();
         let db = arg_value(slice, "--db").unwrap_or_default();
-        std::process::exit(disky_lib::elevated_scan_all(out, db));
+        let cancel_file = arg_value(slice, "--cancel-file").unwrap_or_default();
+        std::process::exit(disky_lib::elevated_scan_all(out, db, cancel_file));
     }
 
     if args.iter().any(|a| a == "--elevated-scan") {
         let root = arg_value(slice, "--elevated-scan").unwrap_or_default();
         let out = arg_value(slice, "--out").unwrap_or_default();
         let db = arg_value(slice, "--db").unwrap_or_default();
-        std::process::exit(disky_lib::elevated_scan(root, out, db));
+        let cancel_file = arg_value(slice, "--cancel-file").unwrap_or_default();
+        std::process::exit(disky_lib::elevated_scan(root, out, db, cancel_file));
     }
 
     disky_lib::run();

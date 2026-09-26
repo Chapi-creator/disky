@@ -41,10 +41,11 @@ fn trace_elevated(_msg: &str) {}
 /// el error en la UI.
 #[must_use]
 #[allow(clippy::expect_used)]
-pub fn elevated_scan(root: &str, out: &str, db: &str) -> i32 {
+pub fn elevated_scan(root: &str, out: &str, db: &str, cancel_file: &str) -> i32 {
     trace_elevated("arranca hijo");
     let started_at = unix_now();
-    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    watch_cancel_file(cancel_file, &cancel);
 
     let mut store = match open_store(db) {
         Ok(store) => store,
@@ -98,7 +99,7 @@ fn write_single_fail(out: &str, error: &str) -> i32 {
 /// Devuelve 0 si todas las unidades se procesaron (con o sin errores
 /// recuperables) y 2 si la base de datos o la enumeración fallaron.
 #[must_use]
-pub fn elevated_scan_all(out: &str, db: &str) -> i32 {
+pub fn elevated_scan_all(out: &str, db: &str, cancel_file: &str) -> i32 {
     trace_elevated("arranca hijo multiunidad");
     let started_at = unix_now();
 
@@ -131,7 +132,8 @@ pub fn elevated_scan_all(out: &str, db: &str) -> i32 {
         }
     };
 
-    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    watch_cancel_file(cancel_file, &cancel);
     for root in roots {
         let unit = match scan_one_volume(&root, &mut store, started_at, &cancel) {
             Ok(volume) => {
@@ -153,6 +155,11 @@ pub fn elevated_scan_all(out: &str, db: &str) -> i32 {
             }
         };
         append_unit(out, &unit);
+        // Cancelado: no seguir con la siguiente unidad (cada una sería un
+        // snapshot que se descarta en el rollback).
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
     }
     0
 }
@@ -181,6 +188,15 @@ struct VolumeScan {
 /// Directorios por lote al escribir el snapshot (compromiso latencia/memoria):
 /// lo que hay en memoria son 512 filas, no el snapshot entero.
 const DIR_BATCH: usize = 512;
+
+/// ¿Es `path` la raíz de un volumen (`C:\`) y no una subcarpeta?
+///
+/// `Path::parent` devuelve `None` justo cuando la ruta termina en la raíz o el
+/// prefijo (`C:\`, `\`, `\\servidor\recurso\`); cualquier subcarpeta tiene
+/// padre.
+fn is_volume_root(path: &std::path::Path) -> bool {
+    path.parent().is_none()
+}
 
 /// Escanea una unidad y deja su snapshot guardado en `store`.
 ///
@@ -223,7 +239,7 @@ fn scan_one_volume(
         }
     };
 
-    let totals = {
+    let totals = if is_volume_root(&root_path) {
         trace_elevated("antes de mft_scan");
         match disky_core::mft_scan(&root_path, cancel, &mut push, &mut |_| {}) {
             Ok(totals) => {
@@ -239,9 +255,24 @@ fn scan_one_volume(
                 trace_elevated(&format!("mft_scan: {err_label}; fallback a walker"));
                 match disky_core::walk_tree(&root_path, cancel, &mut push, &mut |_| {}) {
                     Ok(totals) => totals,
+                    // Cancelado: no adornar el error con el fallo del MFT.
+                    Err(_) if cancel.load(std::sync::atomic::Ordering::Relaxed) => {
+                        return Err("Escaneo cancelado".into());
+                    }
                     Err(walk_err) => return Err(format!("{err_label} (walk: {walk_err})")),
                 }
             }
+        }
+    } else {
+        // El MFT solo indexa la unidad entera: escanear una subcarpeta con él
+        // daría el volumen completo y costaría lo mismo. Para subrutas, walker.
+        trace_elevated("subruta: solo walker");
+        match disky_core::walk_tree(&root_path, cancel, &mut push, &mut |_| {}) {
+            Ok(totals) => totals,
+            Err(_) if cancel.load(std::sync::atomic::Ordering::Relaxed) => {
+                return Err("Escaneo cancelado".into());
+            }
+            Err(walk_err) => return Err(walk_err.to_string()),
         }
     };
     // Lote final: lo que quedó sin llegar a DIR_BATCH (un escaneo con menos de
@@ -273,6 +304,32 @@ fn scan_one_volume(
 fn open_store(db: &str) -> Result<disky_core::SqliteStore, String> {
     disky_core::SqliteStore::open(std::path::Path::new(db))
         .map_err(|_| "No se pudo abrir la base de datos de snapshots".to_owned())
+}
+
+/// Levanta un hilo que vigila el archivo centinela del padre y enciende `cancel`
+/// en cuanto aparece.
+///
+/// El canal inverso no existe: un proceso sin privilegios no puede
+/// `TerminateProcess` sobre un hijo elevado, así que la cancelación viaja como
+/// un archivo que el padre crea y este hijo sondea.
+fn watch_cancel_file(path: &str, cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    if path.is_empty() {
+        return;
+    }
+    let path = std::path::PathBuf::from(path);
+    let cancel = std::sync::Arc::clone(cancel);
+    // El hilo muere con el proceso; solo para de girar cuando hay cancelación.
+    let _ = std::thread::Builder::new()
+        .name("cancel-watch".into())
+        .spawn(move || {
+            while !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                if path.exists() {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        });
 }
 
 /// Añade una línea JSONL al archivo de resultados (append + flush: el padre la
@@ -357,4 +414,18 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_volume_root;
+
+    #[test]
+    fn volume_root_detection_separates_unit_from_subfolder() {
+        // El MFT solo tiene sentido en la raíz: en una subcarpeta indexaría la
+        // unidad entera.
+        assert!(is_volume_root(std::path::Path::new(r"C:\")));
+        assert!(!is_volume_root(std::path::Path::new(r"C:\Users\Breiner")));
+        assert!(!is_volume_root(std::path::Path::new(r"D:\Datos\cosas")));
+    }
 }

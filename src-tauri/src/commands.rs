@@ -388,6 +388,9 @@ pub fn scan_cancel(state: State<'_, AppState>) -> Result<(), String> {
         return Err("No hay ningún escaneo en curso".into());
     }
     state.cancel.store(true, Ordering::SeqCst);
+    // Escaneo elevado: el hijo no ve el flag atómico (proceso aparte), así que
+    // la señal le llega por su archivo centinela.
+    state.cancel_elevated();
     Ok(())
 }
 
@@ -836,14 +839,21 @@ pub fn scan_quick_start(
 
         // Archivo temporal único para esta corrida.
         let out_path = elevated_out_path("quick", "json");
+        // El centinela solo existe si el usuario pulsa Cancelar: el hijo lo
+        // sondea y aborta por su cuenta.
+        let cancel_path = elevated_out_path("quick-cancel", "flag");
         let args = format!(
-            "--elevated-scan {} --out {} --db {}",
+            "--elevated-scan {} --out {} --db {} --cancel-file {}",
             quote_arg(&root),
             quote_arg(&out_path.display().to_string()),
             quote_arg(&state.db_path.display().to_string()),
+            quote_arg(&cancel_path.display().to_string()),
         );
+        state.set_elevated_sentinel(Some(cancel_path.clone()));
 
         let launch = disky_core::platform::elevate::run_elevated(&exe, &args, &mut || {});
+        state.set_elevated_sentinel(None);
+        let _ = std::fs::remove_file(&cancel_path);
 
         match launch {
             Ok(()) => finish_quick_scan(&handle, &state, &root, &out_path),
@@ -1006,15 +1016,20 @@ pub fn scan_all_elevated_start(
         };
 
         let out_path = elevated_out_path("all", "jsonl");
+        let cancel_path = elevated_out_path("all-cancel", "flag");
         let args = format!(
-            "--elevated-scan-all --out {} --db {}",
+            "--elevated-scan-all --out {} --db {} --cancel-file {}",
             quote_arg(&out_path.display().to_string()),
             quote_arg(&state.db_path.display().to_string()),
+            quote_arg(&cancel_path.display().to_string()),
         );
+        state.set_elevated_sentinel(Some(cancel_path.clone()));
 
         let total = fixed.len();
         let mut pending = String::new();
         let mut done_units = 0usize;
+        // Cuántos bytes del JSONL del hijo ya se copiaron a `pending`.
+        let mut read_offset = 0usize;
         // Antes del UAC: la primera unidad ya está "en curso" para la UI.
         let _ = handle.emit(
             "scan-all-unit",
@@ -1026,22 +1041,22 @@ pub fn scan_all_elevated_start(
         );
 
         let mut tick = || {
-            if let Ok(text) = std::fs::read_to_string(&out_path) {
-                drain_unit_lines(
-                    &text,
-                    &mut pending,
-                    &handle,
-                    &state,
-                    &fixed,
-                    &mut done_units,
-                );
+            // El hijo solo añade al JSONL (append), así que basta con copiar los
+            // bytes nuevos: releer el archivo entero reemitiría unidades ya
+            // procesadas.
+            if let Ok(bytes) = std::fs::read(&out_path) {
+                append_new_bytes(&bytes, &mut read_offset, &mut pending);
+                drain_unit_lines(&mut pending, &handle, &state, &fixed, &mut done_units);
             }
         };
         let launch = disky_core::platform::elevate::run_elevated(&exe, &args, &mut tick);
+        state.set_elevated_sentinel(None);
+        let _ = std::fs::remove_file(&cancel_path);
 
         // Última pasada con un salto de línea forzado: si el hijo murió entre
         // el `write` y el `flush` de la última unidad, su línea no contaría.
-        drain_unit_lines("\n", &mut pending, &handle, &state, &fixed, &mut done_units);
+        pending.push('\n');
+        drain_unit_lines(&mut pending, &handle, &state, &fixed, &mut done_units);
         let _ = std::fs::remove_file(&out_path);
 
         if let Err(err) = launch {
@@ -1067,19 +1082,29 @@ pub fn scan_all_elevated_start(
     Ok(())
 }
 
+/// Copia al `pending` solo los bytes que aún no se habían leído del JSONL del
+/// hijo y avanza el offset. El hijo escribe en modo append, así que el archivo
+/// solo crece: releerlo entero reprocesaría unidades ya emitidas.
+fn append_new_bytes(bytes: &[u8], offset: &mut usize, pending: &mut String) -> bool {
+    if bytes.len() <= *offset {
+        return false;
+    }
+    pending.push_str(&String::from_utf8_lossy(&bytes[*offset..]));
+    *offset = bytes.len();
+    true
+}
+
 /// Consume las líneas nuevas del JSONL del hijo y refresca la UI por cada
 /// unidad terminada. Deja en `pending` lo que todavía no forma una línea
 /// completa (el hijo escribe y hace flush en caliente: una línea puede estar a
 /// medias cuando el padre la lee).
 fn drain_unit_lines(
-    text: &str,
     pending: &mut String,
     handle: &AppHandle,
     state: &State<'_, AppState>,
     fixed: &[String],
     done: &mut usize,
 ) {
-    pending.push_str(text);
     for unit in parse_unit_lines(pending) {
         if unit.letter.is_empty() {
             // Fallo previo a elegir unidad (base de datos o enumeración): no
@@ -1176,8 +1201,33 @@ fn unix_now() -> i64 {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{parse_unit_lines, quote_arg};
+    use super::{append_new_bytes, parse_unit_lines, quote_arg};
     use crate::{append_unit, UnitResult};
+
+    #[test]
+    fn append_new_bytes_ignores_already_read_data() {
+        // El tick del padre relee el JSONL entero cada 400 ms: si copiara todo,
+        // las unidades ya emitidas saldrían duplicadas.
+        let mut offset = 0usize;
+        let mut pending = String::new();
+
+        let first = b"{\"letter\":\"C:\\\\\",\"error\":null}\n{\"letter\":\"D:\\\\\",\"err";
+        assert!(append_new_bytes(first, &mut offset, &mut pending));
+        assert_eq!(parse_unit_lines(&mut pending).len(), 1);
+        let after_first = pending.clone();
+
+        // Segunda lectura sin novedades: no debe añadir ni un byte.
+        assert!(!append_new_bytes(first, &mut offset, &mut pending));
+        assert_eq!(pending, after_first);
+
+        // Cuando el hijo termina la línea, solo se copia la cola.
+        let grown =
+            b"{\"letter\":\"C:\\\\\",\"error\":null}\n{\"letter\":\"D:\\\\\",\"error\":null}\n";
+        assert!(append_new_bytes(grown, &mut offset, &mut pending));
+        let units = parse_unit_lines(&mut pending);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].letter, r"D:\");
+    }
 
     #[test]
     fn quote_arg_escapes_trailing_backslashes() {

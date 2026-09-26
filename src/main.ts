@@ -681,6 +681,9 @@ async function startQuickScan(): Promise<void> {
 async function cancelScan(): Promise<void> {
   try {
     await invoke("scan_cancel");
+    // El hijo elevado recibe la señal por archivo centinela y tarda unos
+    // segundos en abortar: el texto evita que parezca que no pasa nada.
+    if (scanProgressTextEl) scanProgressTextEl.textContent = "Cancelando…";
   } catch (err) {
     if (scanProgressTextEl) scanProgressTextEl.textContent = String(err);
   }

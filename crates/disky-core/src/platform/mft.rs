@@ -446,7 +446,11 @@ fn mft_extents(rec0: &[u8]) -> Result<Vec<(u64, u64)>, MftError> {
 type MftIndex = (HashMap<u64, FileRecord>, HashMap<u64, Vec<u64>>, u64);
 
 /// Escanea todo el `$MFT` del volumen y devuelve `(entradas, hijos, errores)`.
-fn read_mft_index(letter: char) -> Result<MftIndex, MftError> {
+///
+/// Consulta `cancel` en cada bloque leído: indexar la MFT entera son cientos de
+/// MB y es la fase larga del escaneo, así que sin esto "cancelar" no respondería
+/// hasta terminar de indexar.
+fn read_mft_index(letter: char, cancel: &AtomicBool) -> Result<MftIndex, MftError> {
     let handle = VolumeHandle::open(letter)?;
     let boot = read_boot_sector(&handle)?;
     let info = parse_boot(&boot).ok_or(MftError::NotNtfs)?;
@@ -475,6 +479,9 @@ fn read_mft_index(letter: char) -> Result<MftIndex, MftError> {
         let bytes = clusters.saturating_mul(info.cluster_bytes);
         let mut covered = 0u64;
         while covered < bytes {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(MftError::Cancelled);
+            }
             let want = usize::try_from((bytes - covered).min(per_chunk as u64)).unwrap_or(0);
             if want == 0 {
                 break;
@@ -576,7 +583,7 @@ pub fn mft_scan(
         .map(|c| c.to_ascii_uppercase())
         .ok_or_else(|| MftError::InvalidRoot(root.display().to_string()))?;
 
-    let (entries, children, read_errors) = read_mft_index(letter)?;
+    let (entries, children, read_errors) = read_mft_index(letter, cancel)?;
 
     // Componentes bajo la raíz del volumen.
     let components: Vec<String> = s
