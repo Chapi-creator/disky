@@ -44,20 +44,24 @@ jobs:
       - name: Instalar dependencias
         run: npm ci
 
-      # Tauri descarga NSIS automáticamente en el runner; produce ambos bundles.
-      - name: Build de Tauri (release + bundles)
-        run: npm run tauri build
+      # tauri-action: compila, firma (claves en secrets) y sube NSIS + MSI +
+      # los .sig y el latest.json que consume el auto-updater de la app.
+      - name: Build de Tauri y publicación (tauri-action)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: disky ${{ github.ref_name }}
+          releaseBody: |
+            Instaladores firmados (NSIS + MSI) y artefactos de auto-actualización.
+          prerelease: false
+          tauriScript: npm run tauri
 
       - name: Listar artefactos generados
         shell: bash
         run: |
           ls -lh target/release/bundle/nsis/
           ls -lh target/release/bundle/msi/
-
-      - name: Adjuntar instaladores a la GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            target/release/bundle/nsis/*.exe
-            target/release/bundle/msi/*.msi
-          generate_release_notes: true
