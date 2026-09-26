@@ -3,7 +3,7 @@
 //! La firma pública es portable; detrás hay una implementación Windows
 //! (`windows` crate, user-mode, sin admin) y una banda neutral para tests/CI.
 
-use crate::domain::Volume;
+use crate::domain::{DriveKind, Volume};
 
 pub mod elevate;
 pub mod mft;
@@ -55,6 +55,22 @@ pub fn drive_letter(letter: &str) -> Result<char, PlatformError> {
 /// Devuelve [`PlatformError`] si la consulta al sistema falla.
 pub fn list_volumes() -> Result<Vec<Volume>, PlatformError> {
     imp::list_volumes()
+}
+
+/// Raíces (`C:\`) de las unidades fijas que tienen medio, en orden de letra.
+///
+/// Filtro **compartido** por el padre y el hijo elevado del escaneo de todas las
+/// unidades: si cada uno enumerara por su cuenta, un USB enchufado entre el UAC
+/// y el arranque del hijo haría que ambos vieran unidades distintas.
+///
+/// # Errors
+/// Devuelve [`PlatformError`] si la enumeración falla.
+pub fn fixed_volume_roots() -> Result<Vec<String>, PlatformError> {
+    Ok(list_volumes()?
+        .into_iter()
+        .filter(|v| matches!(v.kind, DriveKind::Fixed) && v.total_bytes > 0)
+        .map(|v| format!("{}\\", v.letter))
+        .collect())
 }
 
 #[cfg(windows)]
@@ -132,7 +148,7 @@ mod imp {
     //! Banda neutral para CI en Linux/macOS: sin datos reales, sin panics.
 
     use super::PlatformError;
-    use crate::domain::Volume;
+    use crate::domain::{DriveKind, Volume};
 
     pub fn list_volumes() -> Result<Vec<Volume>, PlatformError> {
         Err(PlatformError::UnsupportedPlatform)

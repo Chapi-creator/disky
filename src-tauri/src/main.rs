@@ -7,14 +7,24 @@
 //! `disky.exe --elevated-scan <root> --out <result.json> --db <snapshots.db>`
 //! Escanea la raíz, escribe el snapshot en la base de datos y el resultado en
 //! el JSON, y sale con 0 (ok) o 2 (fallo). Sin ventana, sin Tauri.
+//!
+//! Modo hijo multiunidad (un solo UAC para todas las unidades fijas):
+//! `disky.exe --elevated-scan-all --out <result.jsonl> --db <snapshots.db>`
+//! Recorre las unidades y **añade una línea JSONL** por unidad terminada.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let slice = args.as_slice();
+
+    if args.iter().any(|a| a == "--elevated-scan-all") {
+        let out = arg_value(slice, "--out").unwrap_or_default();
+        let db = arg_value(slice, "--db").unwrap_or_default();
+        std::process::exit(disky_lib::elevated_scan_all(out, db));
+    }
 
     if args.iter().any(|a| a == "--elevated-scan") {
-        let slice = args.as_slice();
         let root = arg_value(slice, "--elevated-scan").unwrap_or_default();
         let out = arg_value(slice, "--out").unwrap_or_default();
         let db = arg_value(slice, "--db").unwrap_or_default();

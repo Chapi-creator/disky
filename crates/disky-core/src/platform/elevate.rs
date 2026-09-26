@@ -12,9 +12,10 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, GetLastError, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
 };
@@ -23,6 +24,10 @@ use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLE
 /// Timeout de espera del hijo: 30 minutos (un escaneo muy lento de un HDD).
 /// Formato en milisegundos porque así lo pide `WaitForSingleObject`.
 const CHILD_TIMEOUT_MILLIS: u32 = 30 * 60 * 1000;
+
+/// Cada cuánto se despierta la espera para llamar a `on_tick` (y volver a
+/// comprobar el deadline). 400 ms es la granularidad del progreso por unidad.
+const CHILD_TICK_MILLIS: u32 = 400;
 
 /// Código Win32 de `ERROR_CANCELLED`.
 const ERROR_CANCELLED_CODE: u32 = 1223;
@@ -46,9 +51,12 @@ pub enum ElevateError {
 
 /// Lanza `exe` elevado con los argumentos dados y espera su salida.
 ///
+/// `on_tick` se invoca cada ~400 ms mientras el hijo corre: es lo que permite
+/// al padre leer resultados parciales (JSONL por unidad) sin perder el timeout.
+///
 /// # Errors
 /// [`ElevateError`] si el UAC se cancela, el hijo falla o se pasa de tiempo.
-pub fn run_elevated(exe: &Path, args: &str) -> Result<(), ElevateError> {
+pub fn run_elevated(exe: &Path, args: &str, on_tick: &mut dyn FnMut()) -> Result<(), ElevateError> {
     // Los buffers deben vivir mientras ShellExecuteExW lee los punteros.
     let exe_wide = to_wide(exe.as_os_str());
     let verb_wide = to_wide(OsStr::new("runas"));
@@ -80,13 +88,25 @@ pub fn run_elevated(exe: &Path, args: &str) -> Result<(), ElevateError> {
         return Err(ElevateError::Abandoned);
     }
 
-    let waited = unsafe { WaitForSingleObject(sei.hProcess, CHILD_TIMEOUT_MILLIS) };
-    if waited != WAIT_OBJECT_0 {
+    // Espera en ticks: el callback lee el progreso del hijo, y el deadline
+    // conserva el timeout de 30 minutos del contrato original.
+    let deadline = Instant::now() + Duration::from_millis(u64::from(CHILD_TIMEOUT_MILLIS));
+    let abandoned = |h| {
         // No dejar huérfano al hijo elevado: seguiría escaneando el disco
         // (y escribiendo la BD) sin que nadie lo espere. Se le mata.
-        let _ = unsafe { TerminateProcess(sei.hProcess, 1) };
-        let _ = unsafe { CloseHandle(sei.hProcess) };
-        return Err(ElevateError::Abandoned);
+        let _ = unsafe { TerminateProcess(h, 1) };
+        let _ = unsafe { CloseHandle(h) };
+        ElevateError::Abandoned
+    };
+    loop {
+        let waited = unsafe { WaitForSingleObject(sei.hProcess, CHILD_TICK_MILLIS) };
+        if waited == WAIT_OBJECT_0 {
+            break;
+        }
+        if waited != WAIT_TIMEOUT || Instant::now() >= deadline {
+            return Err(abandoned(sei.hProcess));
+        }
+        on_tick();
     }
 
     let mut exit_code: u32 = 0;

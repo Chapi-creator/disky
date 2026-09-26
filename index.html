@@ -42,12 +42,15 @@
         <button type="button" id="scan-btn">Escanear esta carpeta</button>
         <button type="button" id="scan-quick-btn">Completo incl. carpetas protegidas (admin)</button>
         <button type="button" id="scan-all-btn">Escanear todas las unidades</button>
+        <button type="button" id="scan-all-admin-btn">Todas las unidades, con admin (un solo UAC)</button>
         <button type="button" id="scan-cancel-btn" disabled>Cancelar</button>
       </div>
       <p class="hint">
         El escaneo completo pide permisos de administrador (UAC) para leer
         también las carpetas protegidas del sistema; no muestra progreso ni se
-        puede cancelar mientras corre.
+        puede cancelar mientras corre. El de todas las unidades con admin pide
+        <strong>un único UAC</strong> para todo el lote y va mostrando el
+        progreso unidad a unidad.
       </p>
       <div id="scan-progress" class="scan-progress hidden">
         <div class="bar"><div class="fill"></div></div>

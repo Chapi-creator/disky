@@ -24,4 +24,4 @@ pub use platform::mft::{mft_available, mft_scan, MftError};
 pub use platform::sqlite::{truncate_wal, SqliteStore};
 pub use platform::usn::{journal_status, recent_records, UsnStatus};
 pub use platform::walk::{walk_tree, WalkError};
-pub use platform::{list_volumes, PlatformError};
+pub use platform::{fixed_volume_roots, list_volumes, PlatformError};

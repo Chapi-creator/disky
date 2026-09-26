@@ -18,13 +18,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use disky_core::platform::path_norm::{child_prefix, normalize_path_separators};
 use disky_core::{
-    growth_ranking, list_volumes as core_list_volumes, match_by_path, squarify, walk_tree, DirStat,
-    DirWriter, GrowthReport, LargestDir, LargestFile, MftError, PlatformError, SnapshotStore as _,
+    fixed_volume_roots as core_fixed_volume_roots, growth_ranking,
+    list_volumes as core_list_volumes, match_by_path, squarify, walk_tree, DirStat, DirWriter,
+    GrowthReport, LargestDir, LargestFile, MftError, PlatformError, SnapshotStore as _,
     SnapshotSummary, SqliteStore, TreemapItem, WalkError,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::state::{lock_store, AppState};
+use crate::UnitResult;
 
 /// Máximo de filas del informe de crecimiento enviado a la UI.
 const MAX_GROWTH_ROWS: usize = 50;
@@ -281,7 +283,7 @@ pub fn scan_all_start(window: tauri::Window, state: State<'_, AppState>) -> Resu
     }
     state.cancel.store(false, Ordering::SeqCst);
 
-    let fixed = match core_list_volumes() {
+    let fixed = match core_fixed_volume_roots() {
         Ok(v) => v,
         Err(e) => {
             // No dejar `scanning=true` fijado: todos los escaneos futuros
@@ -290,11 +292,6 @@ pub fn scan_all_start(window: tauri::Window, state: State<'_, AppState>) -> Resu
             return Err(e.to_string());
         }
     };
-    let fixed: Vec<String> = fixed
-        .into_iter()
-        .filter(|v| matches!(v.kind, disky_core::DriveKind::Fixed) && v.total_bytes > 0)
-        .map(|v| format!("{}\\", v.letter))
-        .collect();
     if fixed.is_empty() {
         state.scanning.store(false, Ordering::SeqCst);
         return Err("No hay unidades fijas para escanear".into());
@@ -838,11 +835,7 @@ pub fn scan_quick_start(
         };
 
         // Archivo temporal único para esta corrida.
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos().to_string())
-            .unwrap_or_default();
-        let out_path = std::env::temp_dir().join(format!("disky-elevated-{stamp}.json"));
+        let out_path = elevated_out_path("quick", "json");
         let args = format!(
             "--elevated-scan {} --out {} --db {}",
             quote_arg(&root),
@@ -850,7 +843,7 @@ pub fn scan_quick_start(
             quote_arg(&state.db_path.display().to_string()),
         );
 
-        let launch = disky_core::platform::elevate::run_elevated(&exe, &args);
+        let launch = disky_core::platform::elevate::run_elevated(&exe, &args, &mut || {});
 
         match launch {
             Ok(()) => finish_quick_scan(&handle, &state, &root, &out_path),
@@ -899,13 +892,28 @@ fn finish_quick_scan(handle: &AppHandle, state: &State<'_, AppState>, root: &str
     }
 
     // El hijo guardó el snapshot en la misma BD: lo recargamos para la UI.
-    let Ok(store) = SqliteStore::open(&state.db_path) else {
-        emit_quick_error(
-            handle,
-            "No se pudo leer la base de datos tras el escaneo elevado".into(),
-        );
-        return;
-    };
+    match read_unit_from_db(state, root) {
+        Ok(done) => {
+            let _ = handle.emit(
+                "scan-quick-done",
+                ScanQuickDonePayload {
+                    snapshot: done.snapshot,
+                    growth: done.growth,
+                    largest: done.largest,
+                    error: None,
+                },
+            );
+        }
+        Err(e) => emit_quick_error(handle, e),
+    }
+}
+
+/// Lee de la BD el snapshot más reciente de `root` con su crecimiento y sus
+/// archivos más pesados. Abre conexión propia: el hilo llamador puede estar
+/// reteniendo el store global y WAL permite leer en paralelo.
+fn read_unit_from_db(state: &State<'_, AppState>, root: &str) -> Result<ScanDonePayload, String> {
+    let store = SqliteStore::open(&state.db_path)
+        .map_err(|_| "No se pudo leer la base de datos tras el escaneo elevado".to_owned())?;
     let snapshot = store
         .list_snapshots(Some(root), 1)
         .ok()
@@ -915,16 +923,12 @@ fn finish_quick_scan(handle: &AppHandle, state: &State<'_, AppState>, root: &str
         .as_ref()
         .and_then(|s| store.load_top_files(s.id).ok())
         .unwrap_or_default();
-    drop(store);
-    let _ = handle.emit(
-        "scan-quick-done",
-        ScanQuickDonePayload {
-            snapshot,
-            growth,
-            largest,
-            error: None,
-        },
-    );
+    Ok(ScanDonePayload {
+        snapshot,
+        growth,
+        largest,
+        error: None,
+    })
 }
 
 /// Emite `scan-quick-done` con solo un error.
@@ -938,6 +942,207 @@ fn emit_quick_error(handle: &AppHandle, error: String) {
             error: Some(error),
         },
     );
+}
+
+/// Ruta temporal única para el archivo de resultados de una corrida elevada
+/// (`disky-elevated-<tag>-<nanos>.<ext>`).
+fn elevated_out_path(tag: &str, ext: &str) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos().to_string())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!("disky-elevated-{tag}-{stamp}.{ext}"))
+}
+
+/// Escanea **todas las unidades fijas con un solo UAC**.
+///
+/// El hijo (`--elevated-scan-all`) recorre las unidades y deja una línea JSONL
+/// por unidad terminada. El padre sondea ese archivo durante la espera y, por
+/// cada línea, refresca la UI con `scan-all-unit` + `scan-done`: el frontend
+/// acumula los resultados igual que en el escaneo sin admin.
+///
+/// # Errors
+/// `String` si ya hay un escaneo en curso o no hay unidades fijas.
+#[tauri::command]
+pub fn scan_all_elevated_start(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if state.scanning.swap(true, Ordering::SeqCst) {
+        return Err("Ya hay un escaneo en curso".into());
+    }
+    state.cancel.store(false, Ordering::SeqCst);
+
+    // La misma lista que usa el hijo (`fixed_volume_roots`): así los índices
+    // que ve la UI y las unidades que escanea el proceso elevado coinciden.
+    let fixed = match core_fixed_volume_roots() {
+        Ok(v) => v,
+        Err(e) => {
+            state.scanning.store(false, Ordering::SeqCst);
+            return Err(e.to_string());
+        }
+    };
+    if fixed.is_empty() {
+        state.scanning.store(false, Ordering::SeqCst);
+        return Err("No hay unidades fijas para escanear".into());
+    }
+
+    let handle = window.app_handle().clone();
+    std::thread::spawn(move || {
+        let state = handle.state::<AppState>();
+        let Some(exe) = std::env::current_exe().ok() else {
+            state.scanning.store(false, Ordering::SeqCst);
+            let _ = handle.emit(
+                "scan-done",
+                ScanDonePayload {
+                    snapshot: None,
+                    growth: None,
+                    largest: Vec::new(),
+                    error: Some("No se pudo ubicar el ejecutable de disky".into()),
+                },
+            );
+            let _ = handle.emit("scan-all-done", ());
+            return;
+        };
+
+        let out_path = elevated_out_path("all", "jsonl");
+        let args = format!(
+            "--elevated-scan-all --out {} --db {}",
+            quote_arg(&out_path.display().to_string()),
+            quote_arg(&state.db_path.display().to_string()),
+        );
+
+        let total = fixed.len();
+        let mut pending = String::new();
+        let mut done_units = 0usize;
+        // Antes del UAC: la primera unidad ya está "en curso" para la UI.
+        let _ = handle.emit(
+            "scan-all-unit",
+            ScanAllUnit {
+                letter: fixed[0].clone(),
+                index: 1,
+                total,
+            },
+        );
+
+        let mut tick = || {
+            if let Ok(text) = std::fs::read_to_string(&out_path) {
+                drain_unit_lines(
+                    &text,
+                    &mut pending,
+                    &handle,
+                    &state,
+                    &fixed,
+                    &mut done_units,
+                );
+            }
+        };
+        let launch = disky_core::platform::elevate::run_elevated(&exe, &args, &mut tick);
+
+        // Última pasada con un salto de línea forzado: si el hijo murió entre
+        // el `write` y el `flush` de la última unidad, su línea no contaría.
+        drain_unit_lines("\n", &mut pending, &handle, &state, &fixed, &mut done_units);
+        let _ = std::fs::remove_file(&out_path);
+
+        if let Err(err) = launch {
+            let msg = match err {
+                disky_core::platform::elevate::ElevateError::Cancelled => {
+                    "Elevación cancelada por el usuario".to_owned()
+                }
+                other => other.to_string(),
+            };
+            let _ = handle.emit(
+                "scan-done",
+                ScanDonePayload {
+                    snapshot: None,
+                    growth: None,
+                    largest: Vec::new(),
+                    error: Some(msg),
+                },
+            );
+        }
+        let _ = handle.emit("scan-all-done", ());
+        state.scanning.store(false, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+/// Consume las líneas nuevas del JSONL del hijo y refresca la UI por cada
+/// unidad terminada. Deja en `pending` lo que todavía no forma una línea
+/// completa (el hijo escribe y hace flush en caliente: una línea puede estar a
+/// medias cuando el padre la lee).
+fn drain_unit_lines(
+    text: &str,
+    pending: &mut String,
+    handle: &AppHandle,
+    state: &State<'_, AppState>,
+    fixed: &[String],
+    done: &mut usize,
+) {
+    pending.push_str(text);
+    for unit in parse_unit_lines(pending) {
+        if unit.letter.is_empty() {
+            // Fallo previo a elegir unidad (base de datos o enumeración): no
+            // hay snapshot que leer, solo el motivo.
+            let _ = handle.emit(
+                "scan-done",
+                ScanDonePayload {
+                    snapshot: None,
+                    growth: None,
+                    largest: Vec::new(),
+                    error: unit.error,
+                },
+            );
+            continue;
+        }
+        *done += 1;
+        // La UI ya tiene el `scan-done` de cada unidad: ahora el crecimiento y
+        // los archivos más pesados, leídos de la BD que el hijo acaba de escribir.
+        let payload = match read_unit_from_db(state, &unit.letter) {
+            Ok(mut payload) => {
+                payload.error = unit.error;
+                payload
+            }
+            Err(e) => ScanDonePayload {
+                snapshot: None,
+                growth: None,
+                largest: Vec::new(),
+                error: Some(e),
+            },
+        };
+        let _ = handle.emit("scan-done", payload);
+        // La siguiente unidad ya está corriendo en el hijo.
+        if *done < fixed.len() {
+            let _ = handle.emit(
+                "scan-all-unit",
+                ScanAllUnit {
+                    letter: fixed[*done].clone(),
+                    index: *done + 1,
+                    total: fixed.len(),
+                },
+            );
+        }
+    }
+}
+
+/// Extrae del buffer las líneas JSONL completas y deja la cola incompleta.
+///
+/// Una línea a medias es normal: el hijo escribe y hace flush en caliente, así
+/// que el padre puede leerla por la mitad. Se ignoran las líneas que no
+/// parsean (un JSON truncado no debe tumbar el escaneo).
+fn parse_unit_lines(pending: &mut String) -> Vec<UnitResult> {
+    let mut units = Vec::new();
+    while let Some(pos) = pending.find('\n') {
+        let line: String = pending.drain(..=pos).collect();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(unit) = serde_json::from_str::<UnitResult>(trimmed) {
+            units.push(unit);
+        }
+    }
+    units
 }
 
 /// Escapa un argumento con comillas dobles para la línea de comandos de Windows.
@@ -969,7 +1174,10 @@ fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::quote_arg;
+    #![allow(clippy::expect_used)]
+
+    use super::{parse_unit_lines, quote_arg};
+    use crate::{append_unit, UnitResult};
 
     #[test]
     fn quote_arg_escapes_trailing_backslashes() {
@@ -977,5 +1185,75 @@ mod tests {
         assert_eq!(quote_arg(r"C:\"), r#""C:\\""#);
         assert_eq!(quote_arg(r"C:\Users"), r#""C:\Users""#);
         assert_eq!(quote_arg(""), r#""""#);
+    }
+
+    #[test]
+    fn parse_unit_lines_keeps_partial_line_for_next_read() {
+        // El hijo escribe y hace flush en caliente: el padre puede leer una
+        // línea a medias. Solo se consume lo que terminó en '\n'.
+        let mut pending = String::new();
+        assert!(parse_unit_lines(&mut pending).is_empty());
+        pending.push_str("{\"letter\":\"C:\\\\\",\"error\":null}\n{\"letter\":\"D:\\\\\",\"err");
+        let units = parse_unit_lines(&mut pending);
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].letter, r"C:\");
+        assert!(units[0].error.is_none());
+        assert_eq!(pending, r#"{"letter":"D:\\","err"#);
+
+        // El resto llega en la siguiente lectura, ahora completo.
+        pending.push_str("or\":\"sin permiso\"}\n");
+        let units = parse_unit_lines(&mut pending);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].letter, r"D:\");
+        assert_eq!(units[0].error.as_deref(), Some("sin permiso"));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn parse_unit_lines_skips_blank_and_corrupt_lines() {
+        let mut pending =
+            String::from("\n{\"letter\":\"C:\\\\\"\n{\"letter\":\"E:\\\\\",\"error\":null}\n");
+        let units = parse_unit_lines(&mut pending);
+
+        // La línea truncada no tumba el escaneo; la buena sí se entrega.
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].letter, r"E:\");
+        assert!(pending.is_empty());
+    }
+
+    /// Contrato real padre↔hijo del escaneo multiunidad: lo que el hijo escribe
+    /// con `append_unit` tiene que salir de `parse_unit_lines` en el mismo orden.
+    #[test]
+    fn jsonl_written_by_child_is_parsed_by_parent() {
+        let path = std::env::temp_dir().join(format!("disky-jsonl-{}.jsonl", std::process::id()));
+        let out = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        append_unit(
+            &out,
+            &UnitResult {
+                letter: r"C:\".into(),
+                error: None,
+            },
+        );
+        append_unit(
+            &out,
+            &UnitResult {
+                letter: r"D:\".into(),
+                error: Some("sin permiso".into()),
+            },
+        );
+
+        let mut pending = std::fs::read_to_string(&path).expect("el hijo dejó el JSONL");
+        let units = parse_unit_lines(&mut pending);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].letter, r"C:\");
+        assert!(units[0].error.is_none());
+        assert_eq!(units[1].letter, r"D:\");
+        assert_eq!(units[1].error.as_deref(), Some("sin permiso"));
+        assert!(pending.is_empty());
     }
 }

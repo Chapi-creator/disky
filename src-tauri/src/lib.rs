@@ -43,103 +43,261 @@ fn trace_elevated(_msg: &str) {}
 #[allow(clippy::expect_used)]
 pub fn elevated_scan(root: &str, out: &str, db: &str) -> i32 {
     trace_elevated("arranca hijo");
-    let started = std::time::Instant::now();
-    let started_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or_default())
-        .unwrap_or_default();
-
-    let fail = |error: String| {
-        write_result(
-            out,
-            &ElevatedResult {
-                ok: false,
-                snapshot_id: None,
-                total_files: 0,
-                total_bytes: 0,
-                read_errors: 0,
-                duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
-                error: Some(error),
-            },
-        );
-        2
-    };
-
-    let root_path = std::path::PathBuf::from(root);
-    if !root_path.is_dir() {
-        return fail(format!("La ruta no existe o no es un directorio: `{root}`"));
-    }
-    // Clave canónica en la BD: separadores nativos (p. ej. llega `C:/x` desde bash).
-    let root = disky_core::platform::path_norm::normalize_path_separators(root);
-
-    let Ok(mut store) = disky_core::SqliteStore::open(std::path::Path::new(db)) else {
-        return fail("No se pudo abrir la base de datos de snapshots".into());
-    };
-    let Ok(mut writer) = store.open_writer(&root, started_at) else {
-        return fail("No se pudo iniciar el snapshot".into());
-    };
-
+    let started_at = unix_now();
     let cancel = std::sync::atomic::AtomicBool::new(false);
-    trace_elevated("abierto y writer OK");
 
-    // Fase 3: leer la MFT es más rápido que el walker y corre en el proceso
-    // elevado. Si el volumen no es NTFS o el formato sorprende, se cae al
-    // walker (sin admin) que siempre funciona. Los directorios del MFT se
-    // acumulan en memoria y solo se persisten si el escaneo completo triunfa:
-    // un fallo a mitad no debe dejar rastro mezclado en el snapshot.
-    let totals = {
-        let mut dirs: Vec<disky_core::DirStat> = Vec::new();
-        trace_elevated("antes de mft_scan");
-        match disky_core::mft_scan(&root_path, &cancel, &mut |dir| dirs.push(dir), &mut |_| {}) {
-            Ok(totals) => {
-                trace_elevated("mft_scan OK");
-                for dir in &dirs {
-                    if writer.write_dirs(std::slice::from_ref(dir)).is_err() {
-                        return fail("El snapshot (MFT) no pudo guardarse".into());
-                    }
-                }
-                totals
-            }
-            Err(e) => {
-                let err_label = e.to_string();
-                drop(dirs); // descartar el intento fallido de MFT
-                match disky_core::walk_tree(
-                    &root_path,
-                    &cancel,
-                    &mut |dir| {
-                        let _ = writer.write_dirs(std::slice::from_ref(&dir));
-                    },
-                    &mut |_| {},
-                ) {
-                    Ok(totals) => totals,
-                    Err(walk_err) => {
-                        return fail(format!("{err_label} (walk: {walk_err})"));
-                    }
-                }
-            }
-        }
+    let mut store = match open_store(db) {
+        Ok(store) => store,
+        Err(error) => return write_single_fail(out, &error),
     };
-
-    let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-    let (total_files, total_bytes, read_errors) = (totals.files, totals.bytes, totals.read_errors);
-    match writer.finish(totals, duration_ms) {
-        Ok(id) => {
+    match scan_one_volume(root, &mut store, started_at, &cancel) {
+        Ok(volume) => {
             write_result(
                 out,
                 &ElevatedResult {
                     ok: true,
-                    snapshot_id: Some(id),
-                    total_files,
-                    total_bytes,
-                    read_errors,
-                    duration_ms,
+                    snapshot_id: Some(volume.snapshot_id),
+                    total_files: volume.files,
+                    total_bytes: volume.bytes,
+                    read_errors: volume.read_errors,
+                    duration_ms: volume.duration_ms,
                     error: None,
                 },
             );
             0
         }
-        Err(err) => fail(err.to_string()),
+        Err(error) => write_single_fail(out, &error),
     }
+}
+
+/// Escribe el fallo del modo de una unidad y devuelve su código de salida.
+fn write_single_fail(out: &str, error: &str) -> i32 {
+    write_result(
+        out,
+        &ElevatedResult {
+            ok: false,
+            snapshot_id: None,
+            total_files: 0,
+            total_bytes: 0,
+            read_errors: 0,
+            duration_ms: 0,
+            error: Some(error.to_owned()),
+        },
+    );
+    2
+}
+
+/// Modo hijo elevado de **todas las unidades fijas** con un solo UAC.
+///
+/// Recorre las unidades en orden y, al terminar cada una, **añade una línea
+/// JSONL** a `out` para que el padre refresque la UI unidad a unidad sin esperar
+/// a que el lote termine. El padre ya conoce la lista (misma función
+/// `fixed_volume_roots`), así que la línea solo dice qué unidad terminó y si
+/// falló: el resto se lee de la base de datos.
+///
+/// Devuelve 0 si todas las unidades se procesaron (con o sin errores
+/// recuperables) y 2 si la base de datos o la enumeración fallaron.
+#[must_use]
+pub fn elevated_scan_all(out: &str, db: &str) -> i32 {
+    trace_elevated("arranca hijo multiunidad");
+    let started_at = unix_now();
+
+    let mut store = match open_store(db) {
+        Ok(store) => store,
+        Err(error) => {
+            // Sin store no hay dónde guardar snapshots: se escribe una sola
+            // línea para que el padre muestre el motivo y no se cuelgue.
+            append_unit(
+                out,
+                &UnitResult {
+                    letter: String::new(),
+                    error: Some(error),
+                },
+            );
+            return 2;
+        }
+    };
+    let roots = match disky_core::fixed_volume_roots() {
+        Ok(roots) => roots,
+        Err(error) => {
+            append_unit(
+                out,
+                &UnitResult {
+                    letter: String::new(),
+                    error: Some(error.to_string()),
+                },
+            );
+            return 2;
+        }
+    };
+
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    for root in roots {
+        let unit = match scan_one_volume(&root, &mut store, started_at, &cancel) {
+            Ok(volume) => {
+                trace_elevated(&format!(
+                    "{} ok en {} ms",
+                    volume.snapshot_id, volume.duration_ms
+                ));
+                UnitResult {
+                    letter: root,
+                    error: None,
+                }
+            }
+            Err(error) => {
+                trace_elevated(&format!("{root} error: {error}"));
+                UnitResult {
+                    letter: root,
+                    error: Some(error),
+                }
+            }
+        };
+        append_unit(out, &unit);
+    }
+    0
+}
+
+/// Resultado por unidad del escaneo multiunidad: una línea JSONL por unidad
+/// terminada, en el orden en que el hijo las termina.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UnitResult {
+    /// Raíz escaneada ya normalizada (p. ej. `C:\`); vacía si el fallo fue
+    /// previo a elegir unidad (base de datos o enumeración).
+    pub letter: String,
+    /// Motivo del fallo; `None` si la unidad se escaneó y guardó bien.
+    pub error: Option<String>,
+}
+
+/// Totales de una unidad terminada. El padre no los lee del JSON sino de la
+/// base de datos; el hijo solo los usa para el `ElevatedResult` de una unidad.
+struct VolumeScan {
+    snapshot_id: u64,
+    files: u64,
+    bytes: u64,
+    read_errors: u64,
+    duration_ms: i64,
+}
+
+/// Directorios por lote al escribir el snapshot (compromiso latencia/memoria):
+/// lo que hay en memoria son 512 filas, no el snapshot entero.
+const DIR_BATCH: usize = 512;
+
+/// Escanea una unidad y deja su snapshot guardado en `store`.
+///
+/// Los directorios se persisten en lotes de [`DIR_BATCH`] mientras llegan. La
+/// atomicidad la garantiza el `ROLLBACK` del writer si no se llega a `finish`,
+/// así que un fallo a mitad no deja rastro parcial.
+///
+/// El MFT es más rápido y corre en el proceso elevado; si el volumen no es
+/// NTFS (o el formato sorprende) se cae al walker, que siempre funciona.
+fn scan_one_volume(
+    root: &str,
+    store: &mut disky_core::SqliteStore,
+    started_at: i64,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<VolumeScan, String> {
+    let root_path = std::path::PathBuf::from(root);
+    if !root_path.is_dir() {
+        return Err(format!("La ruta no existe o no es un directorio: `{root}`"));
+    }
+    // Clave canónica en la BD: separadores nativos (p. ej. llega `C:/x` desde bash).
+    let root = disky_core::platform::path_norm::normalize_path_separators(root);
+    let started = std::time::Instant::now();
+    let mut writer = store
+        .open_writer(&root, started_at)
+        .map_err(|e| e.to_string())?;
+
+    let mut batch: Vec<disky_core::DirStat> = Vec::with_capacity(DIR_BATCH);
+    let mut write_error: Option<String> = None;
+    let mut push = |dir: disky_core::DirStat| {
+        if write_error.is_some() {
+            return;
+        }
+        batch.push(dir);
+        if batch.len() < DIR_BATCH {
+            return;
+        }
+        let full = std::mem::replace(&mut batch, Vec::with_capacity(DIR_BATCH));
+        if let Err(e) = writer.write_dirs(&full) {
+            write_error = Some(format!("El snapshot no pudo guardarse: {e}"));
+        }
+    };
+
+    let totals = {
+        trace_elevated("antes de mft_scan");
+        match disky_core::mft_scan(&root_path, cancel, &mut push, &mut |_| {}) {
+            Ok(totals) => {
+                trace_elevated("mft_scan OK");
+                totals
+            }
+            // Cancelación real: caer al walker solo repetiría el mismo error.
+            Err(disky_core::MftError::Cancelled) => return Err("Escaneo cancelado".into()),
+            Err(e) => {
+                // Los directorios que el MFT alcanzó a escribir los reemite el
+                // walker y `dirs` es PRIMARY KEY: el REPLACE los pisa.
+                let err_label = e.to_string();
+                trace_elevated(&format!("mft_scan: {err_label}; fallback a walker"));
+                match disky_core::walk_tree(&root_path, cancel, &mut push, &mut |_| {}) {
+                    Ok(totals) => totals,
+                    Err(walk_err) => return Err(format!("{err_label} (walk: {walk_err})")),
+                }
+            }
+        }
+    };
+    // Lote final: lo que quedó sin llegar a DIR_BATCH (un escaneo con menos de
+    // 512 carpetas no volcó nada todavía).
+    if !batch.is_empty() && write_error.is_none() {
+        if let Err(e) = writer.write_dirs(&batch) {
+            write_error = Some(format!("El snapshot no pudo guardarse: {e}"));
+        }
+    }
+    if let Some(error) = write_error {
+        return Err(error);
+    }
+
+    let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+    let (files, bytes, read_errors) = (totals.files, totals.bytes, totals.read_errors);
+    let snapshot_id = writer
+        .finish(totals, duration_ms)
+        .map_err(|e| e.to_string())?;
+    Ok(VolumeScan {
+        snapshot_id,
+        files,
+        bytes,
+        read_errors,
+        duration_ms,
+    })
+}
+
+/// Abre la BD del hijo o devuelve el motivo (texto) del fallo.
+fn open_store(db: &str) -> Result<disky_core::SqliteStore, String> {
+    disky_core::SqliteStore::open(std::path::Path::new(db))
+        .map_err(|_| "No se pudo abrir la base de datos de snapshots".to_owned())
+}
+
+/// Añade una línea JSONL al archivo de resultados (append + flush: el padre la
+/// lee mientras el hijo sigue corriendo).
+fn append_unit(out: &str, unit: &UnitResult) {
+    let Ok(json) = serde_json::to_string(unit) else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "{json}");
+        let _ = file.flush();
+    }
+}
+
+/// Segundos UNIX actuales (0 si el reloj del sistema está antes del epoch).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or_default())
+        .unwrap_or_default()
 }
 
 /// Serializa el resultado del hijo (mejor esfuerzo: si falla, el padre verá
@@ -186,6 +344,7 @@ pub fn run() {
             commands::list_volumes,
             commands::scan_start,
             commands::scan_all_start,
+            commands::scan_all_elevated_start,
             commands::scan_cancel,
             commands::scan_quick_start,
             commands::snapshots_list,

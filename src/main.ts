@@ -51,22 +51,35 @@ let scanAllActive = false;
 
 /** Botón del escaneo de todas las unidades. */
 let scanAllBtnEl: HTMLButtonElement | null;
+let scanAllAdminBtnEl: HTMLButtonElement | null;
 
 /**
- * Escaneo de todas las unidades fijas: una a la vez, refrescando lo
- * acumulado tras cada una sin cerrar el estado de progreso.
+ * Escaneo de todas las unidades fijas: una a una, refrescando lo acumulado
+ * tras cada una sin cerrar el estado de progreso.
+ *
+ * `command` distingue el modo normal (sin privilegios, un hilo por unidad) del
+ * elevado, que recorre todas las unidades en un solo proceso hijo con un único
+ * UAC. Los dos emiten los mismos eventos, así que la UI es idéntica.
  */
-async function startScanAll(): Promise<void> {
+async function startScanAll(
+  command: "scan_all_start" | "scan_all_elevated_start",
+): Promise<void> {
   if (scanAllActive) return;
   try {
-    await invoke("scan_all_start");
+    await invoke(command);
     scanAllActive = true;
     if (scanBtnEl) scanBtnEl.disabled = true;
     if (scanQuickBtnEl) scanQuickBtnEl.disabled = true;
     if (scanAllBtnEl) scanAllBtnEl.disabled = true;
+    if (scanAllAdminBtnEl) scanAllAdminBtnEl.disabled = true;
     if (scanCancelBtnEl) scanCancelBtnEl.disabled = false;
     if (scanProgressEl) scanProgressEl.classList.remove("hidden");
-    if (scanProgressTextEl) scanProgressTextEl.textContent = "Preparando el barrido de unidades…";
+    if (scanProgressTextEl) {
+      scanProgressTextEl.textContent =
+        command === "scan_all_elevated_start"
+          ? "Escaneo elevado de todas las unidades: confirma el diálogo de UAC."
+          : "Preparando el barrido de unidades…";
+    }
   } catch (err) {
     showScanError(String(err));
   }
@@ -174,6 +187,8 @@ function currentScanRoot(): string {
 function setScanBusy(busy: boolean, progressText = "Preparando…"): void {
   if (scanBtnEl) scanBtnEl.disabled = busy;
   if (scanQuickBtnEl) scanQuickBtnEl.disabled = busy;
+  if (scanAllBtnEl) scanAllBtnEl.disabled = busy;
+  if (scanAllAdminBtnEl) scanAllAdminBtnEl.disabled = busy;
   if (scanCancelBtnEl) scanCancelBtnEl.disabled = !busy;
   if (scanProgressEl) scanProgressEl.classList.toggle("hidden", !busy);
   if (scanProgressTextEl) scanProgressTextEl.textContent = progressText;
@@ -467,7 +482,7 @@ async function ensureBaseline(): Promise<void> {
   baselineTriggered = true; // evita arranques simultáneos
   try {
     const snaps = await invoke<SnapshotSummary[]>("snapshots_list");
-    if (snaps.length === 0) void startScanAll();
+    if (snaps.length === 0) void startScanAll("scan_all_start");
   } catch (_err) {
     // Fallo transitorio (BD ocupada en el arranque): reintentar una vez en
     // vez de dejar el primer uso sin línea base para siempre.
@@ -901,6 +916,7 @@ window.addEventListener("DOMContentLoaded", () => {
   scanBtnEl = document.querySelector("#scan-btn");
   scanQuickBtnEl = document.querySelector("#scan-quick-btn");
   scanAllBtnEl = document.querySelector("#scan-all-btn");
+  scanAllAdminBtnEl = document.querySelector("#scan-all-admin-btn");
   scanCancelBtnEl = document.querySelector("#scan-cancel-btn");
   scanProgressEl = document.querySelector("#scan-progress");
   scanProgressTextEl = document.querySelector("#scan-progress-text");
@@ -920,7 +936,10 @@ window.addEventListener("DOMContentLoaded", () => {
 
   scanBtnEl?.addEventListener("click", () => void startScan());
   scanQuickBtnEl?.addEventListener("click", () => void startQuickScan());
-  scanAllBtnEl?.addEventListener("click", () => void startScanAll());
+  scanAllBtnEl?.addEventListener("click", () => void startScanAll("scan_all_start"));
+  scanAllAdminBtnEl?.addEventListener("click", () =>
+    void startScanAll("scan_all_elevated_start"),
+  );
   scanCancelBtnEl?.addEventListener("click", () => void cancelScan());
 
   growthThresholdEl?.addEventListener("input", () => renderGrowth());
