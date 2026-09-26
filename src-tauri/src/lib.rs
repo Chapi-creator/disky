@@ -161,6 +161,8 @@ fn write_result(out: &str, result: &ElevatedResult) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // La base de datos vive en la carpeta de datos de la app:
             // %APPDATA%/com.breiner.disky/snapshots.db
@@ -181,7 +183,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::greet,
             commands::list_volumes,
             commands::scan_start,
             commands::scan_all_start,

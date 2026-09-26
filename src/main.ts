@@ -7,6 +7,13 @@
  */
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from "@tauri-apps/plugin-notification";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { check } from "@tauri-apps/plugin-updater";
 import type {
   GrowthDiff,
   GrowthReport,
@@ -22,8 +29,6 @@ import type {
   Volume,
 } from "./api";
 
-let greetInputEl: HTMLInputElement | null;
-let greetMsgEl: HTMLElement | null;
 let volumesEl: HTMLElement | null;
 let scanRootEl: HTMLInputElement | null;
 let scanBtnEl: HTMLButtonElement | null;
@@ -37,6 +42,7 @@ let historyGroupEl: HTMLSelectElement | null;
 let historyEl: HTMLElement | null;
 let growthEl: HTMLElement | null;
 let growthThresholdEl: HTMLInputElement | null;
+let growthBaseEl: HTMLSelectElement | null;
 let largestEl: HTMLElement | null;
 let largestDirsEl: HTMLElement | null;
 
@@ -81,6 +87,13 @@ function handleScanDoneKeepBusy(payload: ScanDonePayload): void {
 let lastGrowth: GrowthDiff | null = null;
 /** Carpeta en la que se hizo drill-down (null = vista completa). */
 let drillPath: string | null = null;
+
+/** Snapshots de la raíz actual: alimentan el selector de línea base. */
+let growthRootSnapshots: SnapshotSummary[] = [];
+/** Línea base elegida en «¿Qué creció?» (null = el anterior al más nuevo). */
+let growthBaseId: number | null = null;
+/** Permiso de notificaciones concedido (o desconocido aún). */
+let notificationsGranted: boolean | null = null;
 
 /** Raíz del treemap actual y pila de navegación (breadcrumb). */
 let treemapRoot = "";
@@ -230,7 +243,7 @@ function growthRow(report: GrowthReport): string {
       ? ' class="grow-alert"'
       : "";
   return `<tr${alert} class="clickable" data-path="${escapeHtml(report.path)}">
-    <td class="path">${escapeHtml(report.path)}</td>
+    <td class="path">${escapeHtml(report.path)}<button type="button" class="row-action" data-reveal="${escapeHtml(report.path)}" data-reveal-dir title="Abrir carpeta en el explorador">⌖</button></td>
     <td class="num">${formatBytes(report.old_bytes)}</td>
     <td class="num">${formatBytes(report.new_bytes)}</td>
     <td class="num ${cls}">${formatDelta(report.delta_bytes)}</td>
@@ -245,7 +258,7 @@ function largestRow(file: LargestFile, index: number): string {
       : "—";
   return `<tr>
     <td class="num">${index + 1}</td>
-    <td class="path">${escapeHtml(file.path)}</td>
+    <td class="path">${escapeHtml(file.path)}<button type="button" class="row-action" data-reveal="${escapeHtml(file.path)}" title="Revelar archivo en el explorador">⌖</button></td>
     <td class="num">${formatBytes(file.size_bytes)}</td>
     <td class="num">${escapeHtml(when)}</td>
   </tr>`;
@@ -254,7 +267,7 @@ function largestRow(file: LargestFile, index: number): string {
 function largestDirsRow(dir: LargestDir, index: number): string {
   return `<tr>
     <td class="num">${index + 1}</td>
-    <td class="path">${escapeHtml(dir.path)}</td>
+    <td class="path">${escapeHtml(dir.path)}<button type="button" class="row-action" data-reveal="${escapeHtml(dir.path)}" data-reveal-dir title="Abrir carpeta en el explorador">⌖</button></td>
     <td class="num">${formatBytes(dir.size_bytes)}</td>
     <td class="num">${dir.files.toLocaleString()}</td>
   </tr>`;
@@ -263,6 +276,23 @@ function largestDirsRow(dir: LargestDir, index: number): string {
 /** Vacía la tabla si no queda nada pintable. */
 function emptyTable(el: HTMLElement | null, cols: number, msg: string): void {
   if (el) el.innerHTML = `<tr><td colspan="${cols}">${msg}</td></tr>`;
+}
+
+/**
+ * Abre en el explorador el destino del botón `data-reveal` de una tabla.
+ * Archivo → seleccionado en su carpeta; carpeta → abierta directamente.
+ */
+function wireReveal(el: HTMLElement | null): void {
+  el?.addEventListener("click", (event) => {
+    const btn = (event.target as HTMLElement).closest("button[data-reveal]");
+    if (!btn) return;
+    const path = btn.getAttribute("data-reveal") ?? "";
+    if (!path) return;
+    const isDir = btn.hasAttribute("data-reveal-dir");
+    void (isDir ? openPath(path) : revealItemInDir(path)).catch((err) =>
+      window.alert(`No se pudo abrir: ${String(err)}`),
+    );
+  });
 }
 
 /** Carga los archivos más pesados del último snapshot de la raíz actual. */
@@ -512,14 +542,105 @@ function renderGrowth(): void {
 async function loadGrowth(): Promise<void> {
   if (!growthEl) return;
   try {
+    growthRootSnapshots = await invoke<SnapshotSummary[]>("snapshots_list", {
+      root: currentScanRoot(),
+    });
+    renderGrowthBaseline();
     const diff = await invoke<GrowthDiff | null>("growth_report", {
       root: currentScanRoot(),
+      baseId: growthBaseId,
     });
     lastGrowth = diff;
     drillPath = null;
     renderGrowth();
+    maybeNotifyGrowth();
   } catch (err) {
     growthEl.innerHTML = `<tr><td colspan="5" class="error">Error: ${escapeHtml(String(err))}</td></tr>`;
+  }
+}
+
+/**
+ * Comprueba el endpoint de la release al arrancar. Si hay versión nueva
+ * ofrece instalarla; cualquier fallo de red/firma se ignora en silencio.
+ */
+async function checkForUpdates(): Promise<void> {
+  try {
+    const update = await check();
+    if (!update) return;
+    const ok = window.confirm(
+      `Hay una versión nueva de disky (${update.version}). ¿Instalarla ahora?`,
+    );
+    if (!ok) return;
+    await update.downloadAndInstall((event) => {
+      if (event.event === "Started") return;
+      console.info("actualización:", event); // progreso: no hay barra
+    });
+    window.alert("Actualización instalada. Se recargará la app.");
+    window.location.reload();
+  } catch {
+    // Sin red, sin firma válida o sin endpoint: no molestar.
+  }
+}
+
+/**
+ * Permiso de notificaciones del sistema pedido una sola vez al arranque.
+ * En Windows no suele abrir diálogo: las toasts se conceden solas.
+ */
+async function ensureNotifyPermission(): Promise<void> {
+  try {
+    notificationsGranted =
+      (await isPermissionGranted()) ||
+      (await requestPermission()) === "granted";
+  } catch {
+    notificationsGranted = false; // sin permiso en el perfil: callar.
+  }
+}
+
+/** Notifica en segundo plano si algo creció por encima del umbral. */
+function maybeNotifyGrowth(): void {
+  if (!lastGrowth || !notificationsGranted) return;
+  if (document.hasFocus()) return; // lo está viendo en la tabla
+  const threshold = growthAlertThresholdBytes();
+  if (threshold === null) return;
+  const top = [...lastGrowth.rows]
+    .filter((r) => r.delta_bytes > 0 && r.delta_bytes >= threshold)
+    .sort((a, b) => b.delta_bytes - a.delta_bytes)[0];
+  if (!top) return;
+  const since = new Date(lastGrowth.old.started_at * 1000).toLocaleDateString();
+  sendNotification({
+    title: `disky · ${lastGrowth.new.root}`,
+    body: `${top.path} creció ${formatBytes(top.delta_bytes)} desde ${since}.`,
+  });
+}
+
+/**
+ * Pinta el selector de línea base con los snapshots más viejos que el último
+ * (el último se compara implícitamente, "Anterior" por defecto).
+ */
+function renderGrowthBaseline(): void {
+  if (!growthBaseEl) return;
+  const latest = growthRootSnapshots[0];
+  const older = latest
+    ? growthRootSnapshots.filter((s) => s.id < latest.id).reverse()
+    : [];
+  const picked = growthBaseEl.value;
+  growthBaseEl.innerHTML =
+    `<option value="">Anterior</option>` +
+    older
+      .map(
+        (s) =>
+          `<option value="${s.id}">${new Date(s.started_at * 1000).toLocaleDateString()} ${new Date(s.started_at * 1000).toLocaleTimeString()}</option>`,
+      )
+      .join("");
+  growthBaseEl.disabled = older.length === 0;
+  //  El snapshot elegido desapareció (podado o se volvió el más reciente):
+  //  re-caiga a "Anterior".
+  if (!picked || !older.some((s) => String(s.id) === picked)) {
+    growthBaseEl.value = "";
+    growthBaseId = null;
+  } else {
+    growthBaseEl.value = picked;
+    growthBaseId = Number(picked);
   }
 }
 
@@ -603,6 +724,7 @@ async function loadTreemap(folder?: string): Promise<void> {
     const nodes = await invoke<TreemapNodeDto[]>("treemap_nodes", {
       root: treemapRoot,
       folder: folder ?? null,
+      baseId: growthBaseId,
     });
     if (seq !== treemapSeq) return; // un drill anterior pidió después: descartar
     treemapEl.innerHTML = nodes
@@ -773,17 +895,7 @@ async function refreshTreemapForRoot(root: string): Promise<void> {
 
 // ── Arranque ─────────────────────────────────────────────────────────────────
 
-async function greet(): Promise<void> {
-  if (greetMsgEl && greetInputEl) {
-    greetMsgEl.textContent = await invoke<string>("greet", {
-      name: greetInputEl.value,
-    });
-  }
-}
-
 window.addEventListener("DOMContentLoaded", () => {
-  greetInputEl = document.querySelector("#greet-input");
-  greetMsgEl = document.querySelector("#greet-msg");
   volumesEl = document.querySelector("#volumes");
   scanRootEl = document.querySelector("#scan-root");
   scanBtnEl = document.querySelector("#scan-btn");
@@ -798,6 +910,7 @@ window.addEventListener("DOMContentLoaded", () => {
   historyEl = document.querySelector("#history-table tbody");
   growthEl = document.querySelector("#growth-table tbody");
   growthThresholdEl = document.querySelector("#growth-alert-threshold");
+  growthBaseEl = document.querySelector("#growth-base");
   largestEl = document.querySelector("#largest-table tbody");
   largestDirsEl = document.querySelector("#largest-dirs");
   treemapEl = document.querySelector("#treemap");
@@ -805,24 +918,31 @@ window.addEventListener("DOMContentLoaded", () => {
   timelineEl = document.querySelector("#timeline");
   timelineLegendEl = document.querySelector("#timeline-legend");
 
-  document.querySelector("#greet-form")?.addEventListener("submit", (e) => {
-    e.preventDefault();
-    void greet();
-  });
   scanBtnEl?.addEventListener("click", () => void startScan());
   scanQuickBtnEl?.addEventListener("click", () => void startQuickScan());
   scanAllBtnEl?.addEventListener("click", () => void startScanAll());
   scanCancelBtnEl?.addEventListener("click", () => void cancelScan());
 
   growthThresholdEl?.addEventListener("input", () => renderGrowth());
+  const baseSelect = growthBaseEl;
+  baseSelect?.addEventListener("change", () => {
+    growthBaseId = baseSelect.value ? Number(baseSelect.value) : null;
+    void loadGrowth();
+    void loadTreemap();
+  });
   historyRootEl?.addEventListener("change", () => void loadHistory());
   historyGroupEl?.addEventListener("change", () => renderHistory());
   growthEl?.addEventListener("click", (event) => {
+    if ((event.target as HTMLElement).closest("button")) return; // botón de acción
     const row = (event.target as HTMLElement).closest("tr[data-path]");
     if (!row) return;
     drillPath = row.getAttribute("data-path");
     renderGrowth();
   });
+
+  wireReveal(growthEl);
+  wireReveal(largestEl);
+  wireReveal(largestDirsEl);
 
   snapshotsEl?.addEventListener("click", (event) => {
     const btn = (event.target as HTMLElement).closest("[data-delete-snapshot]");
@@ -889,6 +1009,9 @@ window.addEventListener("DOMContentLoaded", () => {
   void loadVolumes();
   void loadSnapshots();
   void loadHistory();
+  void ensureNotifyPermission();
+  // La comprobación de updates va al final: primero pinta la app.
+  window.setTimeout(() => void checkForUpdates(), 3000);
   // Los listados "más pesados" son los queries costosos del arranque: se
   // difieren un tick para que volúmenes y snapshots pinten primero.
   window.setTimeout(() => void loadLargest(), 0);

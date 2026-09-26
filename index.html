@@ -119,7 +119,11 @@
 
       <h3>¿Qué creció?
         <span class="hint-inline">
-          Alertar si crecieron más de
+          línea base
+          <select id="growth-base" aria-label="Snapshot de línea base">
+            <option value="">Anterior</option>
+          </select>
+          · alertar si crecieron más de
           <input id="growth-alert-threshold" type="number" min="0" step="100" value="100" aria-label="Umbral de alerta en MB" />
           MB por scan
         </span>
@@ -186,12 +190,6 @@
           </tbody>
         </table>
       </details>
-
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Tu nombre…" />
-        <button type="submit">Saludar al núcleo</button>
-      </form>
-      <p id="greet-msg"></p>
     </main>
   </body>
 </html>

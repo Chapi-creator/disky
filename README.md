@@ -21,8 +21,9 @@ Solo lectura, 100% local, sin servidores.
 
 - ✅ Pipeline end-to-end funcional: volúmenes reales (Win32) → core → Tauri → UI.
 - ✅ Parser de registros `USN_RECORD_V2` probado con buffers sintéticos.
-- ⚠️ Hallazgo del spike: leer la MFT/journal exige **proceso elevado** — las
-  pruebas de integración reales quedan `#[ignore]` localmente y corren en CI.
+- ⚠️ Leer la MFT/journal exige **proceso elevado**; las pruebas de integración
+  reales quedan `#[ignore]` y se corren en una máquina local elevada
+  (`cargo test -p disky-core -- --include-ignored`). El runner de CI no puede.
 - ✅ **Escaneo sin admin**: walker portable en post-orden (`std::fs`) que emite
   cada directorio con el roll-up de su subárbol, cancelable y con progreso en
   vivo por eventos.
@@ -31,9 +32,14 @@ Solo lectura, 100% local, sin servidores.
   esquema versionado (`user_version = 1`).
 - ✅ **Diff "¿qué creció?"**: comparación de los dos snapshots de una raíz vía
   `match_by_path` + `growth_ranking` (las mismas funciones puras del dominio).
-- ✅ **Escaneo rápido con UAC**: disky se relanza a sí mismo elevado
-  (`--elevated-scan`), guarda el snapshot desde el hijo y reporta el resultado
-  por JSON; cubre las carpetas protegidas que el walk normal no puede leer.
+### Escaneo rápido con UAC (lectura vía MFT)
+
+El escaneo completo se relanza a sí mismo elevado (`--elevated-scan`) y lee el
+**`$MFT` del volumen** (rápido, cubre carpetas protegidas); si el volumen no es
+NTFS o el formato sorprende, cae al walker sin admin. El snapshot se guarda
+desde el hijo y el resultado se reporta por JSON. Los **cambios recientes del
+journal** (`$UsnJrnl`) siguen en el roadmap: exigirían un lector elevado a
+demanda para alimentar un panel "qué cambió" (no solo "qué creció").
 - ✅ **Drill-down**: clic en cualquier carpeta del ranking para ver el crecimiento
   de sus hijos directos (navegable en profundidad, con "volver").
 - ✅ **Treemap squarify** (Bruls et al. 2000): implementación pura en el core
@@ -143,12 +149,6 @@ raíz › Torrents › 2026-09            ← breadcrumb
 Historial de la raíz escaneada (raíz, fecha, uso medido, archivos, errores de
 lectura). Útil para confirmar cuándo se tomó cada snapshot.
 
-### USN Journal (experimental)
-
-Panel del spike original de NTFS: estado del Change Journal y últimos cambios
-detectados por el kernel, por letra de unidad. Requiere permisos de
-administrador; es exploratorio y no alimenta (todavía) las demás secciones.
-
 ### Preguntas frecuentes
 
 **La UI dice «Aún no hay escaneos de esta raíz» pero yo escaneé esa carpeta.**
@@ -234,7 +234,10 @@ cargo test -p disky-core                                 # tests (los de integra
 npx tsc --noEmit                                         # typecheck del frontend
 ```
 
-CI (`.github/workflows/ci.yml`): runner Windows elevado que corre los tests de
-integración con `--include-ignored`; frontend en runner separado.
+CI (`.github/workflows/ci.yml`): formato, clippy estricto y los tests del core
+en un runner Windows estándar, y el frontend (tsc + build) en uno de Linux.
+Los tests de integración que exigen acesso al dispositivo (`#[ignore]`) se
+corren aparte, en una máquina local elevada: `cargo test -p disky-core --
+--include-ignored`.
 Releases (`.github/workflows/release.yml`): tag `v*` → instaladores NSIS/MSI
 adjuntos a la GitHub Release.
