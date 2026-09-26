@@ -105,6 +105,13 @@ Carpeta                          Antes    Ahora      Δ      Por día
 - **Por día** normaliza el delta a la distancia entre escaneos.
 - **Clic en cualquier fila** → drill-down: los hijos directos de esa carpeta,
   con su propio delta (y así en profundidad, con enlace «↑ volver»).
+- El desplegable junto al título fija la **línea base**: por defecto el
+  escaneo inmediatamente anterior al más reciente, o cualquier snapshot más
+  viejo de esa misma raíz («¿cuánto creció esto desde hace un mes?»).
+- El botón **⌖** de cada fila abre la carpeta en el explorador de Windows.
+- Si la ventana está en segundo plano y algún delta supera el umbral
+  configurado (MB), salta una **notificación del sistema** con la carpeta
+  culpable.
 
 ### Treemap
 
@@ -224,6 +231,25 @@ git tag v0.1.0 && git push origin v0.1.0
 El workflow (`.github/workflows/release.yml`) valida que el tag coincida con
 la versión de `tauri.conf.json` antes de compilar (fail fast) y genera las
 notas de release automáticamente.
+
+### Actualizaciones automáticas
+
+Al arrancar, disky consulta el `latest.json` de la última release y, si hay
+versión nueva, ofrece instalarla en caliente (NSIS, sin reinstalar a mano).
+La app verifica la firma minisign de cada artefacto con la clave pública
+embebida en `tauri.conf.json`.
+
+Para que CI pueda firmar hacen falta dos secrets del repositorio
+(**Settings → Secrets and variables → Actions**):
+
+| Secret | Valor |
+|---|---|
+| `TAURI_SIGNING_PRIVATE_KEY` | Contenido de `src-tauri/.tauri/disky.key` (nunca al repo) |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Contraseña con la que se generó esa clave |
+
+La clave se genera una vez con `npm run tauri signer generate -w
+src-tauri/.tauri/disky.key`; si se pierde, las actualizaciones firmadas dejan
+de poder publicarse (los instaladores de la release siguen valiendo).
 
 ## Calidad
 
