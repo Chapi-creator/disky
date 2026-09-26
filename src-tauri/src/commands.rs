@@ -71,6 +71,7 @@ pub fn treemap_nodes(
     state: State<'_, AppState>,
     root: String,
     folder: Option<String>,
+    base_id: Option<u64>,
 ) -> Result<Vec<TreemapNodeDto>, String> {
     let store = lock_store(&state.store);
     let snaps = store
@@ -85,16 +86,19 @@ pub fn treemap_nodes(
     let samples = store
         .load_dir_samples_prefixed(latest.id, &folder_view)
         .map_err(|e| e.to_string())?;
-    let prev: HashMap<String, u64> = if snaps.len() > 1 {
-        store
-            .load_dir_samples_prefixed(snaps[1].id, &folder_view)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|s| (s.path, s.size_bytes))
-            .collect()
-    } else {
-        HashMap::new()
-    };
+    // Deltas contra la línea base elegida (default: el scan anterior). Una
+    // base inválida no tumba el treemap: se cae al snapshot anterior.
+    let prev: HashMap<String, u64> = old_snapshot(&store, &root, latest, base_id)
+        .ok()
+        .flatten()
+        .map(|old| {
+            store
+                .load_dir_samples_prefixed(old.id, &folder_view)
+                .map(|rows| rows.into_iter().map(|s| (s.path, s.size_bytes)).collect())
+        })
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
     drop(store);
 
     // El snapshot más reciente siempre trae separadores nativos (el store
@@ -228,12 +232,6 @@ pub fn timeline_series(
 fn delta_bytes(new: u64, old: u64) -> i64 {
     let delta = i128::from(new) - i128::from(old);
     i64::try_from(delta).unwrap_or(if delta > 0 { i64::MAX } else { i64::MIN })
-}
-
-/// Mensaje de bienvenida; queda como ejemplo del patrón command → core.
-#[tauri::command]
-pub fn greet(name: &str) -> String {
-    format!("Hola, {name}! Te saluda el núcleo de Rust de disky.")
 }
 
 /// Enumera los volúmenes montados del sistema (solo lectura).
@@ -431,20 +429,57 @@ pub fn delete_snapshot(state: State<'_, AppState>, snapshot_id: u64) -> Result<(
 ///
 /// # Errors
 /// `String` si la consulta a la base de datos falla.
+/// Resuelve el snapshot de línea base contra el que comparar `latest`.
+///
+/// `base_id` explícito (elegido en la UI) si existe, es más viejo que `latest`
+/// y pertenece a `root`; si no, el inmediatamente anterior. `None` = la raíz
+/// aún no tiene un segundo escaneo.
+fn old_snapshot(
+    store: &SqliteStore,
+    root: &str,
+    latest: &SnapshotSummary,
+    base_id: Option<u64>,
+) -> Result<Option<SnapshotSummary>, String> {
+    match base_id {
+        None => Ok(store
+            .list_snapshots(Some(root), 2)
+            .map_err(|e| e.to_string())?
+            .get(1)
+            .cloned()),
+        Some(id) if id == latest.id => {
+            Err("La línea base debe ser un escaneo anterior al más reciente".into())
+        }
+        Some(id) => Ok(store
+            .list_snapshots(Some(root), 64)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|s| s.id == id && s.id < latest.id)),
+    }
+}
+
+/// ¿Qué creció? `growth_report` con una línea base elegible vs. solo el scan
+/// anterior: misma lógica pura del core, distinto snapshot de comparación.
+///
+/// # Errors
+/// `String` si la línea base pedida no existe o es más reciente que la actual.
 #[tauri::command]
 pub fn growth_report(
     state: State<'_, AppState>,
     root: String,
+    base_id: Option<u64>,
 ) -> Result<Option<GrowthDiff>, String> {
     let store = lock_store(&state.store);
-    let snaps = store
+    let Some(new_snapshot) = store
         .list_snapshots(Some(&root), 2)
-        .map_err(|e| e.to_string())?;
-    if snaps.len() < 2 {
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .next()
+    else {
         return Ok(None);
-    }
-    let new_snapshot = snaps[0].clone();
-    let old_snapshot = snaps[1].clone();
+    };
+    let Some(old_snapshot) = old_snapshot(&store, &root, &new_snapshot, base_id)? else {
+        return Ok(None);
+    };
     let old_samples = store
         .load_dir_samples(old_snapshot.id)
         .map_err(|e| e.to_string())?;
