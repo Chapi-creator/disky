@@ -409,6 +409,7 @@ pub fn run() {
             commands::growth_report,
             commands::largest_files,
             commands::largest_dirs,
+            commands::search_big_files,
             commands::treemap_nodes,
             commands::timeline_series,
         ])

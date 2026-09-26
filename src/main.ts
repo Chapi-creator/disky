@@ -45,6 +45,9 @@ let growthThresholdEl: HTMLInputElement | null;
 let growthBaseEl: HTMLSelectElement | null;
 let largestEl: HTMLElement | null;
 let largestDirsEl: HTMLElement | null;
+let bigResultsEl: HTMLElement | null;
+let bigSearchInputEl: HTMLInputElement | null;
+let bigSearchBtnEl: HTMLButtonElement | null;
 
 /** `true` mientras un "Escanear todo" está en curso. */
 let scanAllActive = false;
@@ -336,6 +339,34 @@ async function loadLargest(): Promise<void> {
 }
 
 /** Carga las carpetas más pesadas del último snapshot de la raíz actual. */
+/** Busca por nombre entre los archivos ≥ 32 MiB del último snapshot. */
+async function loadBigFiles(query: string): Promise<void> {
+  const el = bigResultsEl;
+  if (!el) return;
+  try {
+    const snaps = await invoke<SnapshotSummary[]>("snapshots_list", {
+      root: currentScanRoot(),
+    });
+    const latest = snaps[0];
+    if (!latest) {
+      el.innerHTML = `<tr><td colspan="4">Aún no hay escaneos guardados</td></tr>`;
+      return;
+    }
+    const files = await invoke<LargestFile[]>("search_big_files", {
+      snapshotId: latest.id,
+      query,
+    });
+    el.innerHTML =
+      files.length > 0
+        ? files.map(largestRow).join("")
+        : `<tr><td colspan="4">Sin archivos de 32 MiB o más${
+            query ? ` que contengan "${escapeHtml(query)}"` : ""
+          }</td></tr>`;
+  } catch (err) {
+    el.innerHTML = `<tr><td colspan="4" class="error">Error: ${escapeHtml(String(err))}</td></tr>`;
+  }
+}
+
 async function loadLargestDirs(): Promise<void> {
   const el = largestDirsEl;
   if (!el) return;
@@ -696,6 +727,7 @@ function refreshData(root: string): void {
   void loadGrowth();
   void loadLargest();
   void loadLargestDirs();
+  void loadBigFiles(bigSearchInputEl?.value.trim() ?? "");
   void refreshTreemapForRoot(root);
 }
 
@@ -932,6 +964,9 @@ window.addEventListener("DOMContentLoaded", () => {
   growthBaseEl = document.querySelector("#growth-base");
   largestEl = document.querySelector("#largest-table tbody");
   largestDirsEl = document.querySelector("#largest-dirs");
+  bigResultsEl = document.querySelector("#big-results");
+  bigSearchInputEl = document.querySelector("#big-search-input");
+  bigSearchBtnEl = document.querySelector("#big-search-btn");
   treemapEl = document.querySelector("#treemap");
   treemapCrumbEl = document.querySelector("#treemap-crumb");
   timelineEl = document.querySelector("#timeline");
@@ -965,6 +1000,13 @@ window.addEventListener("DOMContentLoaded", () => {
   wireReveal(growthEl);
   wireReveal(largestEl);
   wireReveal(largestDirsEl);
+  wireReveal(bigResultsEl);
+  const runBigSearch = (): void =>
+    void loadBigFiles(bigSearchInputEl?.value.trim() ?? "");
+  bigSearchBtnEl?.addEventListener("click", runBigSearch);
+  bigSearchInputEl?.addEventListener("keydown", (ev) => {
+    if ((ev as KeyboardEvent).key === "Enter") runBigSearch();
+  });
 
   snapshotsEl?.addEventListener("click", (event) => {
     const btn = (event.target as HTMLElement).closest("[data-delete-snapshot]");

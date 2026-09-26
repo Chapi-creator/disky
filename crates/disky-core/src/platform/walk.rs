@@ -21,7 +21,9 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
-use crate::domain::scan::{DirStat, LargestFile, ScanProgress, ScanTotals};
+use crate::domain::scan::{
+    DirStat, LargestFile, ScanProgress, ScanTotals, BIG_FILE_BYTES, BIG_FILE_MAX,
+};
 
 /// Frecuencia de emisión de progreso (entradas procesadas).
 const PROGRESS_EVERY: u64 = 8_192;
@@ -97,10 +99,13 @@ pub fn walk_tree(
 
     let worker_count = thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 16));
     let mut heaps: Vec<TopHeap> = (0..worker_count).map(|_| TopHeap::new()).collect();
+    // Un vector por worker (como los heaps) evita un canal extra: los archivos
+    // grandes se fusionan y recortan al final, una vez.
+    let mut bigs: Vec<Vec<LargestFile>> = (0..worker_count).map(|_| Vec::new()).collect();
 
     thread::scope(|scope| {
-        for heap in &mut heaps {
-            scope.spawn(|| worker(&shared, heap));
+        for (heap, big) in heaps.iter_mut().zip(&mut bigs) {
+            scope.spawn(|| worker(&shared, heap, big));
         }
         drain(&shared, &done_rx, on_dir, on_progress);
     });
@@ -129,12 +134,19 @@ pub fn walk_tree(
         .collect();
     top.sort_by_key(|f| std::cmp::Reverse(f.size_bytes));
 
+    // Índice de archivos grandes: todos los que superan el umbral, no solo el
+    // top-N de arriba.
+    let mut big: Vec<LargestFile> = bigs.into_iter().flatten().collect();
+    big.sort_by_key(|f| std::cmp::Reverse(f.size_bytes));
+    big.truncate(BIG_FILE_MAX);
+
     Ok(ScanTotals {
         files: shared.files.load(Ordering::Relaxed),
         dirs: shared.dirs.load(Ordering::Relaxed),
         bytes: shared.bytes.load(Ordering::Relaxed),
         read_errors: shared.errors.load(Ordering::Relaxed),
         top,
+        big,
     })
 }
 
@@ -347,7 +359,7 @@ fn push_top(heap: &mut TopHeap, size: u64, mtime: i64, path: &Path) {
 }
 
 /// Ciclo del worker: toma directorios de la cola hasta agotarlos.
-fn worker(shared: &WalkShared<'_>, top: &mut TopHeap) {
+fn worker(shared: &WalkShared<'_>, top: &mut TopHeap, big: &mut Vec<LargestFile>) {
     loop {
         let node = {
             let mut queue = shared.queue.lock().unwrap_or_else(PoisonError::into_inner);
@@ -364,14 +376,19 @@ fn worker(shared: &WalkShared<'_>, top: &mut TopHeap) {
                     .unwrap_or_else(PoisonError::into_inner);
             }
         };
-        process_node(shared, node, top);
+        process_node(shared, node, top, big);
     }
 }
 
 /// Lista un directorio: suma los archivos directos, encola subdirectorios y,
 /// cuando el nodo queda completo, lo colapsa (emite el roll-up al hilo que
 /// drena). Si `cancel` se activó, el nodo se descarta sin emitir.
-fn process_node(shared: &WalkShared<'_>, node: Arc<Node>, top: &mut TopHeap) {
+fn process_node(
+    shared: &WalkShared<'_>,
+    node: Arc<Node>,
+    top: &mut TopHeap,
+    big: &mut Vec<LargestFile>,
+) {
     if shared.cancelled.load(Ordering::SeqCst) {
         node.done.store(true, Ordering::SeqCst);
         collapse(shared, node);
@@ -419,6 +436,13 @@ fn process_node(shared: &WalkShared<'_>, node: Arc<Node>, top: &mut TopHeap) {
         }
 
         push_top(top, entry.size, entry.mtime, &entry_path);
+        if entry.size >= BIG_FILE_BYTES {
+            big.push(LargestFile {
+                path: entry_path.display().to_string(),
+                size_bytes: entry.size,
+                mtime_unix: entry.mtime,
+            });
+        }
         node.sub_bytes.fetch_add(entry.size, Ordering::SeqCst);
         node.sub_files.fetch_add(1, Ordering::SeqCst);
         shared.bytes.fetch_add(entry.size, Ordering::Relaxed);
@@ -542,6 +566,31 @@ mod tests {
 
     fn write_file(path: &Path, size: usize) {
         fs::write(path, vec![0_u8; size]).expect("escribir archivo de prueba");
+    }
+
+    /// Solo entra en `big` lo que llega al umbral: es el índice de búsqueda.
+    #[test]
+    fn collects_only_files_over_the_big_threshold() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        // `set_len` deja un archivo disperso: 32 MiB de tamaño sin escribir un
+        // solo byte, así que el test no cuesta disco.
+        fs::File::create(root.join("movie.iso"))
+            .expect("crear iso")
+            .set_len(BIG_FILE_BYTES)
+            .expect("dimensionar iso");
+        write_file(&root.join("notas.txt"), 1_024);
+        fs::File::create(root.join("al_borde.bin"))
+            .expect("crear al_borde")
+            .set_len(BIG_FILE_BYTES - 1)
+            .expect("dimensionar al_borde");
+
+        let totals =
+            walk_tree(root, &AtomicBool::new(false), &mut |_| {}, &mut |_| {}).expect("walk ok");
+
+        assert_eq!(totals.big.len(), 1, "solo movie.iso llega a 32 MiB");
+        assert!(totals.big[0].path.ends_with("movie.iso"));
+        assert_eq!(totals.big[0].size_bytes, BIG_FILE_BYTES);
     }
 
     #[test]

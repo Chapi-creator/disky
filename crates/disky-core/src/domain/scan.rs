@@ -30,6 +30,14 @@ pub struct DirStat {
     pub files: u64,
 }
 
+/// Umbral del índice de archivos grandes: 32 MiB.
+pub const BIG_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Tope de filas del índice de archivos grandes por snapshot. Un volumen con
+/// más de 50.000 archivos de 32 MiB supera los 1,5 TB, así que el recorte es
+/// una red de seguridad, no una política.
+pub const BIG_FILE_MAX: usize = 50_000;
+
 /// Totales de un escaneo completado.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[must_use]
@@ -44,6 +52,8 @@ pub struct ScanTotals {
     pub read_errors: u64,
     /// Los archivos más pesados del escaneo, ordenados desc por peso.
     pub top: Vec<LargestFile>,
+    /// Archivos de [`BIG_FILE_BYTES`] o más, para la búsqueda por nombre.
+    pub big: Vec<LargestFile>,
 }
 
 /// Un archivo individual por peso: lo recoge el walker mientras recorre el
@@ -236,6 +246,20 @@ pub trait SnapshotStore {
     /// # Errors
     /// [`StoreError`] si la consulta falla.
     fn load_top_dirs(&self, snapshot_id: u64, limit: u32) -> Result<Vec<LargestDir>, StoreError>;
+
+    /// Busca por nombre en el índice de archivos grandes de un snapshot
+    /// (los de [`BIG_FILE_BYTES`] o más). `query` es un fragmento de ruta, sin
+    /// distinguir mayúsculas; vacío devuelve los más pesados. `limit` acota el
+    /// número de resultados.
+    ///
+    /// # Errors
+    /// [`StoreError`] si la consulta falla.
+    fn search_big_files(
+        &self,
+        snapshot_id: u64,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<LargestFile>, StoreError>;
 }
 
 /// Escritura incremental de un snapshot en curso (post-orden de directorios).

@@ -97,6 +97,12 @@ h2 {
   gap: 8px;
 }
 
+/* La fila de búsqueda va dentro de un <details>: sin tanto margen arriba. */
+.search-row {
+  margin-top: 12px;
+  margin-bottom: 12px;
+}
+
 .row input {
   flex: 1;
   padding: 8px 12px;

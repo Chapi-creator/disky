@@ -25,7 +25,7 @@ use crate::domain::UsageSample;
 use crate::platform::path_norm::{child_prefix, normalize_path_separators};
 
 /// Esquema actual de la base de datos.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// Ruta por defecto de la base de datos: `%LOCALAPPDATA%\disky\snapshots.db`
 /// en Windows, `~/.local/state/disky/snapshots.db` en el resto.
@@ -112,6 +112,13 @@ impl SqliteStore {
                 PRIMARY KEY (snapshot_id, path)
             );
             CREATE INDEX IF NOT EXISTS idx_top_files_size ON top_files(snapshot_id, size_bytes);
+            CREATE TABLE IF NOT EXISTS big_files (
+                snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+                path        TEXT NOT NULL,
+                size_bytes  INTEGER NOT NULL,
+                mtime_unix  INTEGER NOT NULL,
+                PRIMARY KEY (snapshot_id, path)
+            );
             PRAGMA foreign_keys = ON;",
         )
         .map_err(db_err("creando esquema"))?;
@@ -402,6 +409,45 @@ impl SnapshotStore for SqliteStore {
         rows.map(|row| row.map_err(db_err("leyendo fila de top_dirs")))
             .collect()
     }
+
+    fn search_big_files(
+        &self,
+        snapshot_id: u64,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<LargestFile>, StoreError> {
+        // Búsqueda por fragmento de ruta: LIKE con comodín solo en los
+        // extremos; los comodines del usuario se escapan.
+        let pattern = format!(
+            "%{}%",
+            query
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let sql = "SELECT path, size_bytes, mtime_unix FROM big_files
+                   WHERE snapshot_id = ?1 AND path LIKE ?2 ESCAPE '\\'
+                   ORDER BY size_bytes DESC, path ASC
+                   LIMIT ?3";
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(db_err("preparando consulta de big_files"))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![to_db(snapshot_id), pattern, limit],
+                |row| {
+                    Ok(LargestFile {
+                        path: row.get(0)?,
+                        size_bytes: non_neg(row.get::<_, i64>(1)?),
+                        mtime_unix: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(db_err("leyendo big_files"))?;
+        rows.map(|row| row.map_err(db_err("leyendo fila de big_files")))
+            .collect()
+    }
 }
 
 /// Escritor de un snapshot: transacción abierta (`BEGIN IMMEDIATE`), invisible
@@ -463,6 +509,25 @@ impl DirWriter for SqliteDirWriter<'_> {
                     rusqlite::params![self.id, to_key(&file.path), size, file.mtime_unix],
                 )
                 .map_err(db_err("insertando archivo del top-N"))?;
+        }
+        if !totals.big.is_empty() {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO big_files(snapshot_id, path, size_bytes, mtime_unix)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(db_err("preparando INSERT de big_files"))?;
+            for file in &totals.big {
+                let size = i64::try_from(file.size_bytes).unwrap_or(i64::MAX);
+                stmt.execute(rusqlite::params![
+                    self.id,
+                    to_key(&file.path),
+                    size,
+                    file.mtime_unix
+                ])
+                .map_err(db_err("insertando archivo grande"))?;
+            }
         }
         self.conn
             .execute(
@@ -581,6 +646,7 @@ mod tests {
                         bytes: 300,
                         read_errors: 1,
                         top: Vec::new(),
+                        big: Vec::new(),
                     },
                     1_500,
                 )
@@ -649,6 +715,63 @@ mod tests {
             store.load_dir_samples(999),
             Err(StoreError::UnknownSnapshot(999))
         );
+    }
+
+    /// El índice de archivos grandes es lo que responde "¿dónde está mi .iso?".
+    #[test]
+    fn search_big_files_finds_by_fragment_and_prunes_with_snapshot() {
+        let (_tmp, mut store) = open_tmp();
+        let id = {
+            let writer = store.open_writer("C:\\P", 1).expect("writer");
+            writer
+                .finish(
+                    ScanTotals {
+                        big: vec![
+                            big_file(r"C:\P\Pelicula.iso", 8_000_000_000),
+                            big_file(r"C:\P\Backups\video.ISO", 4_000_000_000),
+                        ],
+                        ..ScanTotals::default()
+                    },
+                    10,
+                )
+                .expect("finish")
+        };
+
+        // Vacío = los más pesados primero.
+        let all = store.search_big_files(id, "", 10).expect("buscar");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].path, r"C:\P\Pelicula.iso");
+        assert_eq!(all[1].path, r"C:\P\Backups\video.ISO");
+
+        // Sin distinguir mayúsculas y por fragmento de ruta.
+        let iso = store.search_big_files(id, "video.iso", 10).expect("buscar");
+        assert_eq!(iso.len(), 1);
+        assert_eq!(iso[0].path, r"C:\P\Backups\video.ISO");
+
+        // Un comodín del usuario es texto literal, no comodín.
+        assert!(store
+            .search_big_files(id, "%", 10)
+            .expect("buscar")
+            .is_empty());
+        assert!(store
+            .search_big_files(id, "no-existe", 10)
+            .expect("buscar")
+            .is_empty());
+
+        // El índice es del snapshot: al podarlo, sus filas se van en cascada.
+        store.prune("C:\\P", 0).expect("podar");
+        assert!(store
+            .search_big_files(id, "", 10)
+            .expect("buscar")
+            .is_empty());
+    }
+
+    fn big_file(path: &str, size_bytes: u64) -> LargestFile {
+        LargestFile {
+            path: path.into(),
+            size_bytes,
+            mtime_unix: 1_700_000_000,
+        }
     }
 
     #[test]

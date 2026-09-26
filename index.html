@@ -173,6 +173,39 @@
 
       <details class="collapsible">
         <summary>
+          <h3>Buscar archivos grandes</h3>
+          <span class="hint-inline">≥ 32 MiB · por nombre</span>
+        </summary>
+        <p class="hint">
+          Busca por nombre entre los archivos de 32 MiB o más del último
+          escaneo ("¿dónde está mi .iso?"). Vacío lista los más pesados.
+        </p>
+        <div class="row search-row">
+          <input
+            type="search"
+            id="big-search-input"
+            placeholder="nombre o fragmento de ruta"
+            autocomplete="off"
+          />
+          <button id="big-search-btn" type="button">Buscar</button>
+        </div>
+        <table class="volumes-table" id="big-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Archivo</th>
+              <th>Tamaño</th>
+              <th>Modificado</th>
+            </tr>
+          </thead>
+          <tbody id="big-results">
+            <tr><td colspan="4">Aún no hay escaneos guardados</td></tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details class="collapsible">
+        <summary>
           <h3>Carpetas más pesadas</h3>
           <span class="hint-inline">Top 50 por tamaño · expandir/contraer</span>
         </summary>

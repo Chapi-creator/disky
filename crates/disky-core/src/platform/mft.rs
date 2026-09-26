@@ -40,7 +40,9 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::IO::OVERLAPPED;
 
 use super::PlatformError;
-use crate::domain::scan::{DirStat, LargestFile, ScanProgress, ScanTotals};
+use crate::domain::scan::{
+    DirStat, LargestFile, ScanProgress, ScanTotals, BIG_FILE_BYTES, BIG_FILE_MAX,
+};
 use crate::domain::usn::filetime_to_unix;
 
 /// Archivos más pesados recogidos (el resto se descarta; igual que el walker).
@@ -667,6 +669,7 @@ fn accumulate(
     let mut acc_size: HashMap<u64, u64> = HashMap::new();
     let mut acc_files: HashMap<u64, u64> = HashMap::new();
     let mut top: Vec<LargestFile> = Vec::new();
+    let mut big: Vec<LargestFile> = Vec::new();
     let mut dirs_emitted = 0u64;
 
     for frn in postorder {
@@ -686,7 +689,7 @@ fn accumulate(
             } else {
                 size = size.saturating_add(k.size);
                 files += 1;
-                push_top(&mut top, &path, k);
+                push_top(&mut top, &mut big, &path, k);
             }
         }
         acc_size.insert(*frn, size);
@@ -705,6 +708,8 @@ fn accumulate(
     let bytes = acc_size.get(&target).copied().unwrap_or(0);
     top.sort_by_key(|b| std::cmp::Reverse(b.size_bytes));
     top.truncate(TOP_N);
+    big.sort_by_key(|b| std::cmp::Reverse(b.size_bytes));
+    big.truncate(BIG_FILE_MAX);
 
     ScanTotals {
         files,
@@ -712,11 +717,25 @@ fn accumulate(
         bytes,
         read_errors,
         top,
+        big,
     }
 }
 
-fn push_top(top: &mut Vec<LargestFile>, dir_path: &str, entry: &FileRecord) {
+/// Añade un archivo al top-N y, si llega al umbral, al índice de grandes.
+fn push_top(
+    top: &mut Vec<LargestFile>,
+    big: &mut Vec<LargestFile>,
+    dir_path: &str,
+    entry: &FileRecord,
+) {
     let sep = if dir_path.ends_with('\\') { "" } else { "\\" };
+    if entry.size >= BIG_FILE_BYTES {
+        big.push(LargestFile {
+            path: format!("{dir_path}{sep}{}", entry.name),
+            size_bytes: entry.size,
+            mtime_unix: entry.mtime_unix,
+        });
+    }
     if top.len() < TOP_N || entry.size > top[top.len() - 1].size_bytes {
         top.push(LargestFile {
             path: format!("{dir_path}{sep}{}", entry.name),

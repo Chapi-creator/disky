@@ -34,6 +34,9 @@ const MAX_GROWTH_ROWS: usize = 50;
 /// Máximo de carpetas del listado "más pesadas" enviado a la UI.
 const MAX_LARGEST_DIRS: u32 = 50;
 
+/// Máximo de resultados de la búsqueda de archivos grandes.
+const MAX_BIG_RESULTS: u32 = 200;
+
 /// Lienzo del treemap en coordenadas de layout (el SVG escala con viewBox).
 const TREEMAP_W: f64 = 1_000.0;
 const TREEMAP_H: f64 = 700.0;
@@ -510,6 +513,25 @@ pub fn largest_files(
 ) -> Result<Vec<LargestFile>, String> {
     let store = lock_store(&state.store);
     store.load_top_files(snapshot_id).map_err(|e| e.to_string())
+}
+
+/// Busca por nombre entre los archivos grandes (≥ 32 MiB) del snapshot.
+///
+/// `query` es un fragmento de ruta; vacío devuelve los más pesados. Responde a
+/// "¿dónde está mi .iso de 40 GB?", que el top-N no cubre.
+///
+/// # Errors
+/// `String` si la consulta a la base de datos falla.
+#[tauri::command]
+pub fn search_big_files(
+    state: State<'_, AppState>,
+    snapshot_id: u64,
+    query: String,
+) -> Result<Vec<LargestFile>, String> {
+    let store = lock_store(&state.store);
+    store
+        .search_big_files(snapshot_id, &query, MAX_BIG_RESULTS)
+        .map_err(|e| e.to_string())
 }
 
 /// Carpetas más pesadas de un snapshot (roll-up de su subárbol), ordenadas
