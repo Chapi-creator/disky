@@ -9,8 +9,9 @@ Solo lectura, 100% local, sin servidores.
 
 ## Capturas
 
-> Las capturas son de la piel anterior (acento azul). La app ya usa la identidad
-> de abajo; para regenerarlas, abre la app y corre `scripts/captura.ps1`.
+> Capturas de la identidad actual. Para regenerarlas, abre la app y corre
+> `scripts/captura.ps1 -Nombre treemap` (la ventana debe estar en la sección que
+> quieras retratar).
 
 ![Vista completa de disky](docs/screenshots/app-completa.png)
 
