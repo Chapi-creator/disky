@@ -324,6 +324,14 @@ fn scan_one_volume(
     if let Some(error) = write_error {
         return Err(error);
     }
+    // Un escaneo que no emitió ni una carpeta es un fallo, no un snapshot: un
+    // `$MFT` ilegible devuelve el índice vacío y confirmarlo dejaría la app en
+    // blanco (el treemap y el timeline usan el escaneo más reciente). El writer
+    // se descarta aquí, así que la transacción hace rollback.
+    if totals.collected_nothing() {
+        log.write("escaneo sin carpetas: se descarta el snapshot");
+        return Err(totals.discard_reason());
+    }
 
     let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     let (files, bytes, read_errors) = (totals.files, totals.bytes, totals.read_errors);
@@ -399,8 +407,65 @@ fn unix_now() -> i64 {
 /// Serializa el resultado del hijo (mejor esfuerzo: si falla, el padre verá
 /// un archivo vacío y lo reportará).
 fn write_result(out: &str, result: &ElevatedResult) {
-    if let Ok(json) = serde_json::to_string(result) {
+    write_json(out, result);
+}
+
+/// Serializa `value` a JSON y lo deja en `out`.
+///
+/// Nunca falla en voz alta: si el archivo no aparece, el padre lo interpreta
+/// como «el hijo no devolvió resultado» y muestra ese motivo, que es más útil
+/// que un error de escritura que nadie puede leer.
+fn write_json<T: serde::Serialize>(out: &str, value: &T) {
+    if let Ok(json) = serde_json::to_string(value) {
         let _ = std::fs::write(out, json);
+    }
+}
+
+/// Máximo de cambios del journal que pide el panel «¿qué cambió?» por defecto.
+pub const USN_DEFAULT_LIMIT: usize = 200;
+
+/// Resultado JSON que deja el hijo elevado del panel USN.
+///
+/// Mismo canal que el escaneo elevado (un archivo por corrida, sin canal
+/// inverso): el panel es una consulta a demanda, no un watcher en vivo.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UsnResult {
+    ok: bool,
+    changes: Vec<disky_core::JournalChange>,
+    error: Option<String>,
+}
+
+/// Modo hijo elevado del panel USN: lee los cambios recientes del journal de una
+/// unidad, resuelve la ruta de cada uno desde la MFT y escribe el resultado en
+/// `out`. Devuelve el código de salida del proceso (0 ok, 2 fallo).
+///
+/// El journal exige `GENERIC_READ` al volumen, que a su vez exige elevación: por
+/// eso este trabajo vive en un hijo con UAC y no en el proceso de la app.
+#[must_use]
+pub fn elevated_usn(letter: &str, out: &str, limit: usize) -> i32 {
+    match disky_core::recent_changes(letter, limit) {
+        Ok(changes) => {
+            write_json(
+                out,
+                &UsnResult {
+                    ok: true,
+                    changes,
+                    error: None,
+                },
+            );
+            0
+        }
+        Err(error) => {
+            write_json(
+                out,
+                &UsnResult {
+                    ok: false,
+                    changes: Vec::new(),
+                    error: Some(error.to_string()),
+                },
+            );
+            2
+        }
     }
 }
 
@@ -423,7 +488,12 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let db_path = data_dir.join("snapshots.db");
-            let store = disky_core::SqliteStore::open(&db_path)?;
+            let mut store = disky_core::SqliteStore::open(&db_path)?;
+            // Autocuración al arrancar: los escaneos que no guardaron ni una
+            // carpeta (rastro de un fallo de lectura confirmado por una versión
+            // anterior) dejan el treemap y el timeline en blanco. Mejor esfuerzo:
+            // si el `DELETE` falla, la app arranca igual y lo reintenta luego.
+            let _ = store.delete_empty_snapshots();
             app.manage(state::AppState::new(store, db_path.clone()));
 
             // Compacta el WAL residual de un cierre forzado sin bloquear la
@@ -451,6 +521,7 @@ pub fn run() {
             commands::largest_dirs,
             commands::search_big_files,
             commands::find_duplicates,
+            commands::usn_changes_start,
             commands::treemap_nodes,
             commands::timeline_series,
         ])

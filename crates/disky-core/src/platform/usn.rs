@@ -15,8 +15,13 @@
 //! Todos los buffers se empaquetan/parsean con `to_le_bytes`/`from_le_bytes`
 //! (sin transmutes) para que la única parte `unsafe` sea la llamada Win32.
 
+use std::collections::HashMap;
+
+use super::mft::MftError;
 use super::PlatformError;
-use crate::domain::usn::{parse_usn_batch, parse_usn_records, JournalRecord};
+use crate::domain::usn::{
+    attach_paths, parse_usn_batch, parse_usn_records, paths_needed, JournalChange, JournalRecord,
+};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{
@@ -243,6 +248,49 @@ pub fn recent_records(
     Ok(records)
 }
 
+/// Motivos por los que la lista de cambios recientes no se pudo construir.
+///
+/// Separa las dos mitades del trabajo porque fallan por cosas distintas: leer el
+/// journal depende de tener elevación y de que el volumen sea NTFS; reconstruir
+/// las rutas depende de que el índice de la MFT se pueda leer.
+#[derive(Debug, thiserror::Error)]
+pub enum ChangesError {
+    /// El journal no se pudo leer (falta elevación, volumen sin journal).
+    #[error(transparent)]
+    Journal(#[from] PlatformError),
+    /// El journal se leyó, pero las rutas no se pudieron reconstruir.
+    #[error(transparent)]
+    Paths(#[from] MftError),
+}
+
+/// Cambios recientes del volumen **con la ruta absoluta de cada uno**.
+///
+/// Es la composición que responde «¿qué cambió?»: el journal solo guarda el FRN
+/// y el nombre, así que los FRN del lote se cruzan con el índice de la MFT en
+/// **una sola pasada** (no una por registro). Los cambios más nuevos quedan al
+/// final, para que la UI los muestre en orden de lectura.
+///
+/// # Errors
+/// [`ChangesError::Journal`] si no se pudo leer el journal —lo normal sin
+/// permisos de administrador—; [`ChangesError::Paths`] si se leyó pero la MFT no
+/// pudo resolver las rutas.
+pub fn recent_changes(
+    letter: &str,
+    max_records: usize,
+) -> Result<Vec<JournalChange>, ChangesError> {
+    let letter = super::drive_letter(letter)?;
+    let records = recent_records(&letter.to_string(), max_records)?;
+    let needed = paths_needed(&records);
+    // Un journal sin registros no justifica indexar la MFT entera (segundos de
+    // lectura en un disco grande) para resolver cero rutas.
+    let paths = if needed.is_empty() {
+        HashMap::new()
+    } else {
+        super::mft::resolve_paths(letter, &needed)?
+    };
+    Ok(attach_paths(records, &paths))
+}
+
 /// Empaqueta `MFT_ENUM_DATA_V1` (layout de `winioctl.h`) para el escaneo
 /// inicial: desde el FRN 0, sin filtros de USN, versiones de registro 2 y
 /// flags de acceso cero + visibles.
@@ -307,6 +355,17 @@ mod tests {
     #![allow(clippy::expect_used, clippy::format_push_string, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn recent_changes_rejects_an_invalid_drive_letter() {
+        // Valida antes de abrir el volumen: el error sale al instante y sin
+        // tocar el disco (por eso este test no necesita elevación).
+        let err = recent_changes("CC", 10).expect_err("`CC` no es una unidad");
+        assert!(matches!(
+            err,
+            ChangesError::Journal(PlatformError::InvalidDriveLetter(_))
+        ));
+    }
 
     /// Prueba de integración real (solo Windows, solo lectura). Requiere un
     /// proceso **elevado**: sin admin, el kernel rechaza el FSCTL (error 1).

@@ -54,7 +54,21 @@ icono y el banner se generan de la misma geometría con
 
 ## Estado
 
-✅ **MVP completo: escaneo sin admin + UAC + treemap + timeline.**
+✅ **MVP completo: escaneo sin admin + UAC + treemap + timeline + «¿qué cambió?».**
+
+> **Panel USN (primer corte).** `¿Qué cambió?` lee los cambios recientes del
+> `$UsnJrnl`, reconstruye la ruta de cada uno desde la MFT (el journal solo da
+> FRN + nombre) y los lista. Corre en un hijo elevado con UAC —el kernel exige
+> `GENERIC_READ` al volumen— por el mismo canal de archivo JSON que el escaneo
+> elevado: es una **foto del momento, no un watcher en vivo**. Ese watcher sigue
+> pendiente porque necesita un canal inverso desde el proceso elevado.
+>
+> **Un escaneo sin carpetas no se guarda.** Si la lectura no emite ni un
+> directorio (típico de un `$MFT` ilegible que devuelve el índice vacío) el
+> snapshot se descarta con rollback: no es «un escaneo vacío», es una línea base
+> envenenada que dejaría el treemap y el timeline en blanco, porque ambos leen
+> el escaneo **más reciente** de la raíz. Al arrancar se borran los que hubieran
+> quedado de versiones anteriores.
 
 - ✅ Pipeline end-to-end funcional: volúmenes reales (Win32) → core → Tauri → UI.
 - ✅ Parser de registros `USN_RECORD_V2` probado con buffers sintéticos.
@@ -164,6 +178,29 @@ Carpeta                          Antes    Ahora      Δ      Por día
   snapshots completos más un `HashMap` con todas las rutas para quedarse con 50
   filas).
 
+### ¿Qué cambió? (journal de NTFS)
+
+```
+Cuándo        Cambio                        Ruta
+14:23:51      extend · close                C:\Users\tu-usuario\Downloads\backup.iso
+14:23:47      create · close                C:\Users\tu-usuario\AppData\Local\Temp\0.tmp
+14:19:02      rename_old · rename_new       C:\Program Files\App\viejo.exe
+```
+
+- Los cambios más recientes que registró el journal del volumen: **qué** archivo,
+  qué le pasó (creado, extendido, truncado, borrado, renombrado, cerrado) y
+  **dónde**. Es la respuesta al «¿qué cambió?» que «¿qué creció?» solo aproxima
+  entre dos escaneos.
+- El journal guarda **FRN + nombre**, no rutas: por eso las rutas se reconstruyen
+  barriendo el índice de la MFT **una sola vez** para todos los FRN del lote.
+- Cuando ni el archivo ni su carpeta siguen en la MFT (se borraron antes del
+  escaneo) la fila lo dice en vez de inventarse una ruta.
+- **Requiere permisos de administrador** (los FSCTL del journal exigen
+  `GENERIC_READ` al volumen), así que Windows pedirá el UAC. Si cancelas, no pasa
+  nada: el resto de la app funciona igual sin admin.
+- Es una **consulta a demanda**, no un vigilante: no se refresca sola ni avisa
+  cuando algo cambia. Eso queda para el watcher con canal inverso del roadmap.
+
 ### Duplicados probables
 
 ```
@@ -263,7 +300,9 @@ python scripts/gen_marca.py    # → src-tauri/icons/* y docs/logo/*
 3. ~~Escaneo rápido con UAC~~ ✅ — hijo elevado con `--elevated-scan`
 4. ~~Treemap squarify~~ ✅ — core puro + SVG interactivo con breadcrumb
 5. ~~Timeline de crecimiento~~ ✅ — serie por carpeta + comparación multi-línea
-6. Agente elevado compartido con Frostbyte (opción B), a futuro
+6. ~~Primer corte del panel «¿qué cambió?»~~ ✅ — journal + rutas desde la MFT, a demanda con UAC
+7. Watcher del journal en vivo (canal inverso desde el proceso elevado)
+8. Agente elevado compartido con Frostbyte (opción B), a futuro
 
 ## Arquitectura (hexagonal)
 
@@ -281,6 +320,15 @@ python scripts/gen_marca.py    # → src-tauri/icons/* y docs/logo/*
 npm install
 npm run tauri dev
 ```
+
+### Binario suelto: usa `npm run tauri build`, no `cargo build --release`
+
+`target/release/disky.exe` solo funciona por sí solo si se compiló con
+`npm run tauri build`: así la CLI incrusta `dist/` dentro del ejecutable. Un
+`cargo build --release` a secas deja el binario en **modo dev**, apuntando a
+`http://localhost:1420`; sin un Vite corriendo, la ventana muestra «no se pudo
+acceder a la página» — que es justo lo que rompe el acceso directo del
+escritorio.
 
 ## Distribución
 

@@ -57,6 +57,34 @@ pub struct ScanTotals {
     pub big: Vec<LargestFile>,
 }
 
+impl ScanTotals {
+    /// `true` si el escaneo no emitió ni un solo directorio.
+    ///
+    /// Los dos escaneos (walker y MFT) emiten siempre al menos la raíz, así que
+    /// esto solo pasa cuando la lectura no produjo nada: un `$MFT` ilegible que
+    /// devolvió el índice vacío, o un volumen que desapareció a mitad. Guardarlo
+    /// como snapshot no es «un escaneo vacío»: es envenenar la línea base de la
+    /// que dependen el treemap, el timeline y «¿qué creció?», que se quedan en
+    /// blanco porque el escaneo más reciente de esa raíz es el roto.
+    #[must_use]
+    pub fn collected_nothing(&self) -> bool {
+        self.dirs == 0
+    }
+
+    /// Motivo con el que se descarta un escaneo que no emitió ni una carpeta.
+    ///
+    /// Acompaña a [`ScanTotals::collected_nothing`] para que los dos caminos de
+    /// escaneo (walker sin admin y MFT elevado) cuenten lo mismo al usuario en
+    /// vez de inventarse cada uno su mensaje.
+    #[must_use]
+    pub fn discard_reason(&self) -> String {
+        format!(
+            "El escaneo no devolvió ninguna carpeta ({} archivos, {} errores de lectura)",
+            self.files, self.read_errors
+        )
+    }
+}
+
 /// Un archivo individual por peso: lo recoge el walker mientras recorre el
 /// árbol (top-N, no todos), para "¿qué archivo ocupa más?". Ordenado
 /// descendentemente por `size_bytes`.
@@ -457,6 +485,19 @@ mod tests {
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0.path, "C:\\A");
         assert_eq!(pairs[1].0.path, "C:\\B");
+    }
+
+    #[test]
+    fn only_a_scan_without_directories_collected_nothing() {
+        assert!(ScanTotals::default().collected_nothing());
+
+        // Un escaneo real siempre emite al menos la raíz, aunque esté vacía o no
+        // se pueda leer (se emite con tamaño cero).
+        let one_dir = ScanTotals {
+            dirs: 1,
+            ..ScanTotals::default()
+        };
+        assert!(!one_dir.collected_nothing());
     }
 
     #[test]

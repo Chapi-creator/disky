@@ -488,6 +488,14 @@ td.period-label {
   text-align: right;
 }
 
+/* Letra de unidad del panel USN: un carácter, no la barra de escaneo. */
+#usn-letter {
+  flex: none;
+  width: 3.2em;
+  text-align: center;
+  text-transform: uppercase;
+}
+
 /* Acciones compactas dentro de un encabezado (p. ej. Exportar CSV). */
 .hint-inline button {
   margin-left: 6px;

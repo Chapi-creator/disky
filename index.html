@@ -181,6 +181,36 @@
         </tbody>
       </table>
 
+      <h3>¿Qué cambió?
+        <span class="hint-inline">
+          journal de NTFS · pide admin (un UAC)
+        </span>
+      </h3>
+      <p class="hint">
+        Los cambios más recientes que registró el journal del volumen:
+        <strong>qué</strong> archivo, qué le pasó (creado, extendido, borrado,
+        renombrado) y <strong>dónde</strong>, con la ruta reconstruida desde la
+        MFT. Es una foto del momento, no un vigilante en vivo. Leer el journal
+        exige permisos de administrador, así que Windows pedirá el UAC.
+      </p>
+      <div class="row">
+        <input id="usn-letter" value="C" maxlength="1" spellcheck="false" aria-label="Letra de la unidad" />
+        <button type="button" id="usn-btn">Ver cambios recientes</button>
+      </div>
+      <p class="hint" id="usn-status"></p>
+      <table class="volumes-table" id="usn-table" aria-label="Cambios recientes del journal">
+        <thead>
+          <tr>
+            <th>Cuándo</th>
+            <th>Cambio</th>
+            <th>Ruta</th>
+          </tr>
+        </thead>
+        <tbody id="usn-rows">
+          <tr><td colspan="3">Pulsa «Ver cambios recientes» para leer el journal de la unidad</td></tr>
+        </tbody>
+      </table>
+
       <details class="collapsible">
         <summary>
           <h3>Archivos más pesados</h3>

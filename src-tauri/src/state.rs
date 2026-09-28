@@ -29,6 +29,11 @@ pub struct AppState {
     /// el hijo lo sondea. `None` = el escaneo actual corre en este proceso y
     /// ya lee el flag atómico de arriba.
     pub elevated_sentinel: Mutex<Option<PathBuf>>,
+    /// `true` mientras se lee el journal para el panel «¿qué cambió?».
+    ///
+    /// Una consulta a la vez: si el usuario pulsa dos veces el botón, el
+    /// segundo lanzaría otro UAC y otro barrido de la MFT sin necesidad.
+    pub usn_reading: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -41,6 +46,7 @@ impl AppState {
             scanning: Arc::new(AtomicBool::new(false)),
             cancel: Arc::new(AtomicBool::new(false)),
             elevated_sentinel: Mutex::new(None),
+            usn_reading: Arc::new(AtomicBool::new(false)),
         }
     }
 

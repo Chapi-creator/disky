@@ -82,6 +82,30 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Borra los snapshots que no llegaron a guardar ni una carpeta y devuelve
+    /// cuántos quitó.
+    ///
+    /// Son el rastro de un escaneo que falló y aun así se confirmó (un `$MFT`
+    /// ilegible que devolvió el índice vacío). No aportan nada —cero carpetas,
+    /// cero archivos, cero top-N— y, como quedan como los «más recientes» de su
+    /// raíz, dejan el treemap, el timeline y «¿qué creció?» en blanco. Se llaman
+    /// al arrancar para que una base ya envenenada se cure sola.
+    ///
+    /// El borrado en cascada del esquema (`ON DELETE CASCADE` sobre `dirs`,
+    /// `top_files` y `big_files`) se lleva las filas hijas.
+    ///
+    /// # Errors
+    /// [`StoreError::Db`] si el `DELETE` falla.
+    pub fn delete_empty_snapshots(&mut self) -> Result<usize, StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM snapshots
+                 WHERE NOT EXISTS (SELECT 1 FROM dirs WHERE dirs.snapshot_id = snapshots.id)",
+                [],
+            )
+            .map_err(db_err("borrando escaneos sin carpetas"))
+    }
+
     /// Verifica que el snapshot exista.
     ///
     /// Un id borrado (podado entre medidas) debe dar un error explícito en vez
@@ -868,6 +892,47 @@ mod tests {
             store.load_dir_samples(deleted_id),
             Err(StoreError::UnknownSnapshot(deleted_id))
         );
+    }
+
+    #[test]
+    fn delete_empty_snapshots_clears_the_ruin_of_a_failed_scan() {
+        let (_tmp, mut store) = open_tmp();
+        // Un escaneo confirmado sin guardar ni una carpeta (índice ilegible) y
+        // otro que sí guardó datos, ambos de la misma raíz.
+        let empty_id = {
+            let writer = store.open_writer("C:\\P", 1).expect("writer");
+            writer.finish(ScanTotals::default(), 0).expect("finish")
+        };
+        let good_id = {
+            let mut writer = store.open_writer("C:\\P", 2).expect("writer");
+            write_all(&mut writer, &[("C:\\P\\x".into(), 10, 0, 1)]);
+            writer.finish(ScanTotals::default(), 10).expect("finish")
+        };
+
+        assert_eq!(store.delete_empty_snapshots().expect("limpiar"), 1);
+
+        // El roto desaparece y el bueno queda como único escaneo de la raíz.
+        let snaps = store.list_snapshots(None, 10).expect("listar");
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].id, good_id);
+        assert_eq!(
+            store.load_dir_samples(empty_id),
+            Err(StoreError::UnknownSnapshot(empty_id))
+        );
+    }
+
+    #[test]
+    fn delete_empty_snapshots_keeps_a_legitimately_empty_root() {
+        let (_tmp, mut store) = open_tmp();
+        // Una carpeta vacía de verdad sí emite su propia raíz: no es basura.
+        let id = {
+            let mut writer = store.open_writer("C:\\Vacia", 1).expect("writer");
+            write_all(&mut writer, &[("C:\\Vacia".into(), 0, 0, 0)]);
+            writer.finish(ScanTotals::default(), 5).expect("finish")
+        };
+
+        assert_eq!(store.delete_empty_snapshots().expect("limpiar"), 0);
+        assert_eq!(store.dir_count(id), 1);
     }
 
     #[test]

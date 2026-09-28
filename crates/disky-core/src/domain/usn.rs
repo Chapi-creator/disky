@@ -7,6 +7,8 @@
 //! Referencia: `USN_RECORD_V2` y `USN_JOURNAL_DATA_V0` en la documentación de
 //! Windows (Change Journal).
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Tamaño mínimo de un registro USN V2: los 64 bytes de campos fijos.
@@ -82,6 +84,73 @@ pub struct JournalRecord {
     pub reason_labels: Vec<String>,
     /// Nombre del archivo en el momento del registro.
     pub file_name: String,
+}
+
+/// Un registro del journal con su ruta absoluta ya resuelta.
+///
+/// El journal solo guarda el FRN del archivo y el de su carpeta padre, así que
+/// el `file_name` de [`JournalRecord`] no dice *dónde* está nada: en un `C:`
+/// hay decenas de `Cache` y de `0.tmp`. La ruta se reconstruye desde la MFT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[must_use]
+pub struct JournalChange {
+    /// El registro crudo del journal (FRN, motivo, nombre y momento).
+    pub record: JournalRecord,
+    /// Ruta absoluta reconstruida desde el índice de la MFT.
+    ///
+    /// `None` si ni el archivo ni su carpeta padre siguen en el índice: el
+    /// journal conserva registros de cosas borradas antes del escaneo y ahí no
+    /// hay ruta que dar.
+    pub path: Option<String>,
+}
+
+impl JournalChange {
+    /// Texto para mostrar en la fila: la ruta si se resolvió y, si no, el
+    /// nombre del registro (sigue siendo mejor que una fila vacía).
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.path.as_deref().unwrap_or(&self.record.file_name)
+    }
+}
+
+/// FRN únicos (el del archivo y el de su carpeta padre) que hay que resolver
+/// para un lote del journal, en orden ascendente.
+///
+/// Se pide el del padre además del propio porque un archivo borrado ya no está
+/// en la MFT: sin el padre no habría forma de situarlo.
+#[must_use]
+pub fn paths_needed(records: &[JournalRecord]) -> Vec<u64> {
+    let mut frns: Vec<u64> = records.iter().flat_map(|r| [r.frn, r.parent_frn]).collect();
+    frns.sort_unstable();
+    frns.dedup();
+    frns
+}
+
+/// Cruza cada registro del journal con la ruta que le tocó.
+///
+/// Función pura: la lectura del volumen y el barrido de la MFT quedan fuera, así
+/// que el emparejamiento se prueba con datos sintéticos, sin tocar el kernel.
+#[must_use]
+pub fn attach_paths<S: std::hash::BuildHasher>(
+    records: Vec<JournalRecord>,
+    paths: &HashMap<u64, String, S>,
+) -> Vec<JournalChange> {
+    records
+        .into_iter()
+        .map(|record| {
+            // Un archivo borrado ya no está en la MFT, pero su carpeta padre sí:
+            // se compone la ruta con el nombre que el journal conservó.
+            let path = paths.get(&record.frn).cloned().or_else(|| {
+                let mut joined = paths.get(&record.parent_frn)?.clone();
+                if !joined.ends_with(std::path::MAIN_SEPARATOR) {
+                    joined.push(std::path::MAIN_SEPARATOR);
+                }
+                joined.push_str(&record.file_name);
+                Some(joined)
+            });
+            JournalChange { record, path }
+        })
+        .collect()
 }
 
 /// Parsea un registro USN V2 que inicia en el byte 0 de `buf`.
@@ -300,5 +369,71 @@ mod tests {
         let base = 132_539_328_000_000_000i64; // 2021-01-01 00:00:00 UTC
         assert_eq!(filetime_to_unix(base), 1_609_459_200);
         assert_eq!(filetime_to_unix(base + 10_000_000), 1_609_459_201);
+    }
+
+    /// Registro con solo lo que importa para el emparejamiento de rutas.
+    fn change_record(frn: u64, parent_frn: u64, name: &str) -> JournalRecord {
+        JournalRecord {
+            frn,
+            parent_frn,
+            usn: 1,
+            timestamp_unix: 1_700_000_000,
+            reasons: reason::FILE_CREATE,
+            reason_labels: vec!["create".to_owned()],
+            file_name: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn attach_paths_uses_the_resolved_route_of_the_file() {
+        let records = vec![change_record(10, 5, "facturas.pdf")];
+        let mut paths = std::collections::HashMap::new();
+        paths.insert(10u64, r"C:\Docs\facturas.pdf".to_owned());
+        paths.insert(5u64, r"C:\Docs".to_owned());
+
+        let changes = attach_paths(records, &paths);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path.as_deref(), Some(r"C:\Docs\facturas.pdf"));
+        assert_eq!(changes[0].display_name(), r"C:\Docs\facturas.pdf");
+    }
+
+    #[test]
+    fn attach_paths_composes_the_parent_when_the_file_is_gone() {
+        // Borrado antes del escaneo: el FRN del archivo ya no está en la MFT,
+        // pero el de su carpeta sí, así que la ruta se arma con el nombre que el
+        // journal conservó.
+        let records = vec![change_record(999, 5, "viejo.tmp")];
+        let mut paths = std::collections::HashMap::new();
+        paths.insert(5u64, "C:\\Docs".to_owned());
+
+        let changes = attach_paths(records, &paths);
+
+        let sep = std::path::MAIN_SEPARATOR;
+        let expected = format!("C:\\Docs{sep}viejo.tmp");
+        assert_eq!(changes[0].path.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn attach_paths_leaves_no_route_when_the_parent_is_gone_too() {
+        let records = vec![change_record(999, 998, "huerfano.tmp")];
+        let paths = std::collections::HashMap::new();
+
+        let changes = attach_paths(records, &paths);
+
+        assert_eq!(changes[0].path, None);
+        // Sin ruta, el nombre del journal es mejor que una fila vacía.
+        assert_eq!(changes[0].display_name(), "huerfano.tmp");
+    }
+
+    #[test]
+    fn paths_needed_collects_file_and_parent_frns_once() {
+        let records = vec![
+            change_record(10, 5, "a.txt"),
+            change_record(11, 5, "b.txt"),
+            change_record(10, 5, "a.txt"),
+        ];
+
+        assert_eq!(paths_needed(&records), vec![5, 10, 11]);
     }
 }

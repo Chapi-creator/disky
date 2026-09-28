@@ -19,8 +19,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use disky_core::platform::path_norm::{child_prefix, normalize_path_separators};
 use disky_core::{
     fixed_volume_roots as core_fixed_volume_roots, list_volumes as core_list_volumes, squarify,
-    walk_tree, DirStat, DirWriter, GrowthReport, GrowthTop, LargestDir, LargestFile, MftError,
-    PlatformError, SnapshotStore as _, SnapshotSummary, SqliteStore, TreemapItem, WalkError,
+    walk_tree, ChangesError, DirStat, DirWriter, GrowthReport, GrowthTop, JournalChange,
+    LargestDir, LargestFile, MftError, PlatformError, SnapshotStore as _, SnapshotSummary,
+    SqliteStore, TreemapItem, WalkError,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -658,6 +659,144 @@ pub fn find_duplicates(
     Ok(disky_core::duplicate_groups(&files))
 }
 
+/// Máximo de cambios del journal que muestra el panel «¿qué cambió?».
+const MAX_USN_CHANGES: usize = 200;
+
+/// JSON que deja el hijo elevado del panel USN.
+#[derive(Debug, serde::Deserialize)]
+struct UsnJson {
+    ok: bool,
+    changes: Vec<JournalChange>,
+    error: Option<String>,
+}
+
+/// Payload del evento `usn-changes`.
+#[derive(Clone, serde::Serialize)]
+struct UsnChangesPayload {
+    letter: String,
+    changes: Vec<JournalChange>,
+    error: Option<String>,
+}
+
+/// Cambios recientes del journal de una unidad, con la ruta de cada archivo.
+///
+/// El journal no se puede leer sin permisos de administrador (el kernel rechaza
+/// los FSCTL sin `GENERIC_READ` al volumen), así que el comando intenta primero
+/// la lectura en este proceso —gratis si la app ya corre elevada— y solo si
+/// Windows responde `ACCESS_DENIED` relanza el hijo con UAC.
+///
+/// El resultado viaja por el evento `usn-changes` en vez de por el valor de
+/// retorno: reconstruir las rutas barre el índice de la MFT, que tarda segundos
+/// en un disco grande, y bloquear el hilo de la UI durante eso congelaría la
+/// ventana.
+///
+/// # Errors
+/// `String` si ya hay una consulta en curso o la letra no es válida.
+#[tauri::command]
+pub fn usn_changes_start(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    letter: String,
+) -> Result<(), String> {
+    if state.usn_reading.swap(true, Ordering::SeqCst) {
+        return Err("Ya hay una consulta de cambios en curso".into());
+    }
+    // Validar la letra ya: el error se ve al instante, sin hilo ni UAC de por medio.
+    let letter = match disky_core::platform::drive_letter(&letter) {
+        Ok(valid) => valid.to_string(),
+        Err(error) => {
+            state.usn_reading.store(false, Ordering::SeqCst);
+            return Err(render_error(error));
+        }
+    };
+
+    let handle = window.app_handle().clone();
+    std::thread::spawn(move || {
+        let state = handle.state::<AppState>();
+        match read_changes(&letter) {
+            Ok(changes) => emit_usn(&handle, &letter, changes, None),
+            Err(message) => emit_usn(&handle, &letter, Vec::new(), Some(message)),
+        }
+        state.usn_reading.store(false, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+/// Lee los cambios recientes, elevándose solo si hace falta.
+///
+/// Corre elevado el proceso de la app, la lectura es un éxito sin más; si no,
+/// el `ACCESS_DENIED` del kernel no es un fallo sino la señal de que toca pedir
+/// el UAC. Cualquier otro error sí es un error.
+fn read_changes(letter: &str) -> Result<Vec<JournalChange>, String> {
+    match disky_core::recent_changes(letter, MAX_USN_CHANGES) {
+        Ok(changes) => Ok(changes),
+        Err(ChangesError::Journal(PlatformError::WindowsApi { code: 5, .. })) => {
+            run_elevated_usn(letter)
+        }
+        Err(ChangesError::Journal(other)) => Err(render_error(other)),
+        Err(ChangesError::Paths(error)) => Err(format!(
+            "Se leyó el journal, pero no se pudieron reconstruir las rutas: {error}"
+        )),
+    }
+}
+
+/// Relanza disky elevado (`--elevated-usn`) y devuelve lo que dejó en su JSON.
+///
+/// Se reutiliza el canal del escaneo elevado: un archivo por corrida. Aquí no se
+/// pasa `--cancel-file` porque la lectura tarda segundos, no minutos: cancelarla
+/// no aporta y añadiría estado que nadie consulta.
+fn run_elevated_usn(letter: &str) -> Result<Vec<JournalChange>, String> {
+    let exe = std::env::current_exe()
+        .map_err(|_| "No se pudo ubicar el ejecutable de disky".to_owned())?;
+    let out_path = elevated_out_path("usn", "json");
+    let args = format!(
+        "--elevated-usn {} --out {} --limit {MAX_USN_CHANGES}",
+        quote_arg(letter),
+        quote_arg(&out_path.display().to_string()),
+    );
+
+    let launched = disky_core::platform::elevate::run_elevated(&exe, &args, &mut || {});
+    let parsed: Option<UsnJson> = std::fs::read_to_string(&out_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let _ = std::fs::remove_file(&out_path);
+
+    if let Some(json) = &parsed {
+        if !json.ok {
+            return Err(json
+                .error
+                .clone()
+                .unwrap_or_else(|| "El lector elevado del journal falló".to_owned()));
+        }
+    }
+    match launched {
+        Ok(()) => Ok(parsed.map(|json| json.changes).unwrap_or_default()),
+        Err(disky_core::platform::elevate::ElevateError::Cancelled) => {
+            Err("Elevación cancelada por el usuario".to_owned())
+        }
+        Err(error) => {
+            // El hijo deja el motivo real en el JSON aunque salga con código 2:
+            // ese detalle es más útil que «código de salida N».
+            let detail = parsed
+                .and_then(|json| json.error)
+                .filter(|s| !s.trim().is_empty());
+            Err(detail.unwrap_or_else(|| error.to_string()))
+        }
+    }
+}
+
+/// Emite el resultado del panel USN (`usn-changes`).
+fn emit_usn(handle: &AppHandle, letter: &str, changes: Vec<JournalChange>, error: Option<String>) {
+    let _ = handle.emit(
+        "usn-changes",
+        UsnChangesPayload {
+            letter: letter.to_owned(),
+            changes,
+            error,
+        },
+    );
+}
+
 /// Carpetas más pesadas de un snapshot (roll-up de su subárbol), ordenadas
 /// descendentemente por tamaño y sin incluir la raíz.
 ///
@@ -698,6 +837,11 @@ pub fn render_error(err: PlatformError) -> String {
     }
 }
 
+/// Resultado de un escaneo descartado: sin snapshot, sin top-N y con el motivo.
+fn discarded(reason: String) -> (Option<SnapshotSummary>, Vec<LargestFile>, Option<String>) {
+    (None, Vec::new(), Some(reason))
+}
+
 /// Empuja un dir al búfer y lo vuelca a la BD cada [`DIR_BATCH`] entradas.
 fn flush_dir(writer: &mut dyn DirWriter, batch: &mut Vec<DirStat>, dir: DirStat) {
     batch.push(dir);
@@ -728,18 +872,10 @@ fn perform_scan(
     let started = Instant::now();
 
     let Ok(mut store) = SqliteStore::open(&state.db_path) else {
-        return (
-            None,
-            Vec::new(),
-            Some("No se pudo abrir la base de datos para guardar el escaneo".into()),
-        );
+        return discarded("No se pudo abrir la base de datos para guardar el escaneo".into());
     };
     let Ok(mut writer) = store.open_writer(root, started_at) else {
-        return (
-            None,
-            Vec::new(),
-            Some("No se pudo iniciar el snapshot del escaneo".into()),
-        );
+        return discarded("No se pudo iniciar el snapshot del escaneo".into());
     };
 
     // Búfer de directorios: escribe en la BD en lotes en vez de fila a fila.
@@ -785,13 +921,9 @@ fn perform_scan(
     if let Some(mft_error) = mft_error {
         drop(writer);
         let Ok(new_writer) = store.open_writer(root, started_at) else {
-            return (
-                None,
-                Vec::new(),
-                Some(format!(
-                    "Falló el MFT ({mft_error}) y tampoco se pudo abrir el snapshot para reintentar"
-                )),
-            );
+            return discarded(format!(
+                "Falló el MFT ({mft_error}) y tampoco se pudo abrir el snapshot para reintentar"
+            ));
         };
         writer = new_writer;
         batch.clear();
@@ -812,6 +944,10 @@ fn perform_scan(
     }
 
     let outcome = match scan_result {
+        // Un escaneo sin carpetas es un fallo, no un snapshot vacío: guardarlo
+        // envenenaría la línea base. El `writer` se descarta sin `finish`, así
+        // que la transacción hace rollback y no queda rastro.
+        Ok(totals) if totals.collected_nothing() => discarded(totals.discard_reason()),
         Ok(totals) => {
             let (top, total_files, total_bytes, read_errors) = (
                 totals.top.clone(),
@@ -838,7 +974,7 @@ fn perform_scan(
         }
         // Cancelación: el escritor se descarta y la transacción hace rollback,
         // así que no queda un snapshot a medias.
-        Err(scan_error) => (None, Vec::new(), Some(scan_error.to_string())),
+        Err(scan_error) => discarded(scan_error.to_string()),
     };
 
     // La conexión dedicada se cierra al soltar `store`: el guard global del

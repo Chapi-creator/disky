@@ -124,3 +124,32 @@ export interface DuplicateGroup {
   size_bytes: number;
   paths: string[];
 }
+
+/** Un registro crudo del journal de NTFS (un cambio del volumen). */
+export interface JournalRecord {
+  frn: number;
+  parent_frn: number;
+  usn: number;
+  timestamp_unix: number;
+  reasons: number;
+  reason_labels: string[];
+  file_name: string;
+}
+
+/**
+ * Un cambio del journal con su ruta ya reconstruida desde la MFT. El journal
+ * solo guarda el FRN y el nombre, así que sin la ruta no se sabe *dónde* pasó.
+ * `path` es null cuando ni el archivo ni su carpeta siguen en el índice
+ * (borrados antes del escaneo).
+ */
+export interface JournalChange {
+  record: JournalRecord;
+  path: string | null;
+}
+
+/** Payload del evento `usn-changes` (panel «¿qué cambió?»). */
+export interface UsnChangesPayload {
+  letter: string;
+  changes: JournalChange[];
+  error: string | null;
+}

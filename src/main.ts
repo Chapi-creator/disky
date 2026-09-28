@@ -16,6 +16,7 @@ import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { check } from "@tauri-apps/plugin-updater";
 import type {
   DuplicateGroup,
+  JournalChange,
   GrowthDiff,
   GrowthReport,
   LargestDir,
@@ -27,6 +28,7 @@ import type {
   SnapshotSummary,
   TimelinePointDto,
   TreemapNodeDto,
+  UsnChangesPayload,
   Volume,
 } from "./api";
 
@@ -85,6 +87,12 @@ let bigResultsEl: HTMLElement | null;
 let bigSearchInputEl: HTMLInputElement | null;
 let bigSearchBtnEl: HTMLButtonElement | null;
 let duplicatesEl: HTMLElement | null;
+
+/** Tabla, aviso, botón y letra del panel USN («¿qué cambió?»). */
+let usnRunsEl: HTMLElement | null;
+let usnStatusEl: HTMLElement | null;
+let usnBtnEl: HTMLButtonElement | null;
+let usnLetterEl: HTMLInputElement | null;
 
 /** `true` mientras un "Escanear todo" está en curso. */
 let scanAllActive = false;
@@ -420,6 +428,69 @@ async function loadDuplicates(): Promise<void> {
         : `<tr><td colspan="5">Ningún par de archivos grandes comparte nombre y tamaño</td></tr>`;
   } catch (err) {
     el.innerHTML = `<tr><td colspan="5" class="error">Error: ${escapeHtml(String(err))}</td></tr>`;
+  }
+}
+
+/**
+ * Qué le pasó al archivo, en las etiquetas que ya trae el registro del journal
+ * (las traduce el core, aquí solo se unen).
+ */
+function changeReason(change: JournalChange): string {
+  const labels = change.record.reason_labels;
+  return labels.length > 0 ? labels.join(" · ") : "—";
+}
+
+/**
+ * Una fila del panel «¿qué cambió?». El nombre lo puso Windows, así que va
+ * escapado; se muestra el nombre a secas cuando la ruta no se pudo reconstruir,
+ * porque entonces significa que el archivo ya no existe.
+ */
+function journalChangeRow(change: JournalChange): string {
+  const when = new Date(change.record.timestamp_unix * 1000).toLocaleTimeString();
+  const where = change.path ?? `${change.record.file_name} (ya no está en la MFT)`;
+  return `<tr>
+    <td class="num">${escapeHtml(when)}</td>
+    <td>${escapeHtml(changeReason(change))}</td>
+    <td class="path">${escapeHtml(where)}</td>
+  </tr>`;
+}
+
+/** Pinta el resultado del panel USN, que llega por el evento `usn-changes`. */
+function renderUsnChanges(payload: UsnChangesPayload): void {
+  usnBtnEl?.removeAttribute("disabled");
+  if (payload.error) {
+    if (usnStatusEl) {
+      usnStatusEl.innerHTML = `<span class="error">${escapeHtml(payload.error)}</span>`;
+    }
+    emptyTable(usnRunsEl, 3, "Sin cambios que mostrar");
+    return;
+  }
+  if (usnStatusEl) {
+    usnStatusEl.textContent = `${payload.changes.length.toLocaleString()} cambios recientes en ${payload.letter}:`;
+  }
+  if (!usnRunsEl) return;
+  usnRunsEl.innerHTML =
+    payload.changes.length > 0
+      ? payload.changes.map(journalChangeRow).join("")
+      : `<tr><td colspan="3">El journal no registró cambios en la ventana leída</td></tr>`;
+}
+
+/** Pide los cambios recientes de la unidad elegida (UAC aparte). */
+async function requestUsnChanges(): Promise<void> {
+  const letter = (usnLetterEl?.value ?? "C").trim().toUpperCase();
+  window.localStorage.setItem("disky.usnLetter", letter);
+  if (usnStatusEl) {
+    usnStatusEl.textContent =
+      "Leyendo el journal… Windows puede pedir permiso de administrador.";
+  }
+  usnBtnEl?.setAttribute("disabled", "disabled");
+  try {
+    await invoke("usn_changes_start", { letter });
+  } catch (err) {
+    usnBtnEl?.removeAttribute("disabled");
+    if (usnStatusEl) {
+      usnStatusEl.innerHTML = `<span class="error">${escapeHtml(String(err))}</span>`;
+    }
   }
 }
 
@@ -1201,6 +1272,10 @@ window.addEventListener("DOMContentLoaded", () => {
   bigSearchInputEl = document.querySelector("#big-search-input");
   bigSearchBtnEl = document.querySelector("#big-search-btn");
   duplicatesEl = document.querySelector("#duplicates");
+  usnRunsEl = document.querySelector("#usn-rows");
+  usnStatusEl = document.querySelector("#usn-status");
+  usnBtnEl = document.querySelector("#usn-btn");
+  usnLetterEl = document.querySelector("#usn-letter");
   treemapEl = document.querySelector("#treemap");
   treemapCrumbEl = document.querySelector("#treemap-crumb");
   timelineEl = document.querySelector("#timeline");
@@ -1258,6 +1333,19 @@ window.addEventListener("DOMContentLoaded", () => {
   wireReveal(largestDirsEl);
   wireReveal(bigResultsEl);
   wireReveal(duplicatesEl);
+
+  // Panel USN: la tabla se pinta al recibir el evento, no tras el `invoke`,
+  // porque leer el journal y barrer la MFT puede tardar segundos.
+  const savedUsnLetter = window.localStorage.getItem("disky.usnLetter");
+  if (savedUsnLetter && usnLetterEl) usnLetterEl.value = savedUsnLetter;
+  usnBtnEl?.addEventListener("click", () => void requestUsnChanges());
+  usnLetterEl?.addEventListener("keydown", (ev) => {
+    if ((ev as KeyboardEvent).key === "Enter") void requestUsnChanges();
+  });
+  void listen<UsnChangesPayload>("usn-changes", (event) => {
+    renderUsnChanges(event.payload);
+  });
+
   const runBigSearch = (): void =>
     void loadBigFiles(bigSearchInputEl?.value.trim() ?? "");
   bigSearchBtnEl?.addEventListener("click", runBigSearch);
