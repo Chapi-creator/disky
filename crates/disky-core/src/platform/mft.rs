@@ -624,7 +624,7 @@ pub fn mft_scan(
     let totals = accumulate(
         &postorder,
         target,
-        s,
+        &s,
         read_errors,
         &entries,
         &children,
@@ -633,20 +633,59 @@ pub fn mft_scan(
     Ok(totals)
 }
 
-/// Rutas absolutas, acumulación hijo→padre (post-orden) y emisión de
-/// [`DirStat`]. Separado de [`mft_scan`] para mantenerlo legible.
-#[allow(clippy::too_many_arguments)]
-fn accumulate(
-    postorder: &[u64],
-    target: u64,
-    root_path: String,
-    read_errors: u64,
+/// Resuelve la ruta absoluta de cada FRN pedido leyendo el índice de la MFT.
+///
+/// El USN Journal solo da FRN + nombre; para saber *dónde* está algo hay que
+/// reconstruir la ruta desde la MFT. Los FRN que ya no existen (el registro es
+/// más viejo que el archivo) simplemente no aparecen en el mapa.
+///
+/// # Errors
+/// [`MftError`] si la unidad no se puede indexar.
+pub fn resolve_paths(letter: char, frns: &[u64]) -> Result<HashMap<u64, String>, MftError> {
+    let cancel = AtomicBool::new(false);
+    let (entries, children, _read_errors) = read_mft_index(letter, &cancel)?;
+    let dirs = dir_paths(ROOT_FRN, &format!("{letter}:\\"), &entries, &children);
+
+    let mut out = HashMap::new();
+    for &frn in frns {
+        if let Some((path, _)) = dirs.get(&frn) {
+            out.insert(frn, path.clone());
+            continue;
+        }
+        let Some(record) = entries.get(&frn) else {
+            continue; // borrado antes del escaneo: sin ruta que dar
+        };
+        let Some((parent, _)) = dirs.get(&record.parent_frn) else {
+            continue;
+        };
+        let sep = if parent.ends_with('\\') { "" } else { "\\" };
+        out.insert(frn, format!("{parent}{sep}{}", record.name));
+    }
+    Ok(out)
+}
+
+/// Rutas absolutas de todos los directorios alcanzables desde `start_frn`,
+/// junto a su `mtime`. DFS iterativo (sin recursión: la MFT tiene profundidad
+/// variable y una cadena de junctions largos reventaría la pila).
+///
+/// Se guarda solo `(ruta, mtime)` y **no** el [`FileRecord`] entero: el nombre
+/// ya está dentro de la ruta y clonar el struct por cada carpeta duplicaría el
+/// `String` del nombre en un mapa con una entrada por directorio del volumen.
+///
+/// El punto de partida se recibe explícito porque hay dos casos de uso: el
+/// volumen entero (`start_frn` = [`ROOT_FRN`] y `start_path` = `"C:\\"`, para
+/// `resolve_paths`) y el subárbol de un escaneo (`start_frn` = el FRN objetivo y
+/// `start_path` = la carpeta escaneada, para `accumulate`). Arrancar siempre en
+/// [`ROOT_FRN`] mezclaría la ruta del volumen con la de la subruta y produciría
+/// rutas duplicadas (`C:\\Users\\Breiner\\Users\\…`).
+fn dir_paths(
+    start_frn: u64,
+    start_path: &str,
     entries: &HashMap<u64, FileRecord>,
     children: &HashMap<u64, Vec<u64>>,
-    on_dir: &mut dyn FnMut(DirStat),
-) -> ScanTotals {
-    let mut dir_info: HashMap<u64, (String, FileRecord)> = HashMap::new();
-    let mut dfs = vec![(target, root_path)];
+) -> HashMap<u64, (String, i64)> {
+    let mut dir_info: HashMap<u64, (String, i64)> = HashMap::new();
+    let mut dfs = vec![(start_frn, start_path.to_owned())];
     while let Some((frn, path)) = dfs.pop() {
         let Some(entry) = entries.get(&frn) else {
             continue;
@@ -654,7 +693,7 @@ fn accumulate(
         if !entry.is_dir {
             continue;
         }
-        dir_info.insert(frn, (path.clone(), entry.clone()));
+        dir_info.insert(frn, (path.clone(), entry.mtime_unix));
         if let Some(kids) = children.get(&frn) {
             for &kid in kids {
                 if let Some(e) = entries.get(&kid) {
@@ -664,6 +703,27 @@ fn accumulate(
             }
         }
     }
+    dir_info
+}
+
+/// FRN de la raíz del volumen: 5 es el well-known "root directory" de NTFS.
+const ROOT_FRN: u64 = 5;
+
+/// Rutas absolutas, acumulación hijo→padre (post-orden) y emisión de
+/// [`DirStat`]. Separado de [`mft_scan`] para mantenerlo legible.
+#[allow(clippy::too_many_arguments)]
+fn accumulate(
+    postorder: &[u64],
+    target: u64,
+    root_path: &str,
+    read_errors: u64,
+    entries: &HashMap<u64, FileRecord>,
+    children: &HashMap<u64, Vec<u64>>,
+    on_dir: &mut dyn FnMut(DirStat),
+) -> ScanTotals {
+    // El subárbol empieza en el objetivo (no en la raíz del volumen): así una
+    // subruta conserva su propia ruta y una raíz `C:\\` da `C:\\Users`.
+    let dir_info = dir_paths(target, root_path, entries, children);
 
     // Acumular hijo→padre en post-orden: cada directorio aparece tras sus hijos.
     let mut acc_size: HashMap<u64, u64> = HashMap::new();
@@ -673,7 +733,7 @@ fn accumulate(
     let mut dirs_emitted = 0u64;
 
     for frn in postorder {
-        let Some((path, entry)) = dir_info.get(frn).cloned() else {
+        let Some((path, mtime_unix)) = dir_info.get(frn).cloned() else {
             continue;
         };
         let mut size = 0u64;
@@ -698,7 +758,7 @@ fn accumulate(
         on_dir(DirStat {
             path,
             size_bytes: size,
-            mtime_unix: entry.mtime_unix,
+            mtime_unix,
             files,
         });
         dirs_emitted += 1;
@@ -997,7 +1057,7 @@ mod tests {
         let totals = accumulate(
             &[21, 22, 12],
             12,
-            "C:\\Usuarios".to_owned(),
+            "C:\\Usuarios",
             0,
             &entries,
             &children,
@@ -1049,7 +1109,7 @@ mod tests {
         let totals = accumulate(
             &[21, 22, 31, 30, 12],
             12,
-            "C:\\Usuarios".to_owned(),
+            "C:\\Usuarios",
             0,
             &entries,
             &children,
@@ -1061,5 +1121,28 @@ mod tests {
         assert_eq!(dirs.len(), 2);
         assert_eq!(dirs[1].path, "C:\\Usuarios");
         assert_eq!(dirs[1].size_bytes, 450);
+    }
+
+    /// Contrato del escaneo de volumen completo (el uso real de [`mft_scan`]):
+    /// con `start_frn = ROOT_FRN` y `start_path = "C:\\"` la raíz se etiqueta
+    /// `C:\\` y los hijos cuelgan con una sola barra (`crate::platform::path_norm`
+    /// nunca debe ver `C:\\Usuarios` duplicado).
+    #[test]
+    fn dir_paths_from_volume_root_does_not_duplicate_root() {
+        let (entries, children) = sample_index();
+        let dirs = dir_paths(ROOT_FRN, "C:\\", &entries, &children);
+
+        assert_eq!(dirs.get(&ROOT_FRN).map(|(p, _)| p.as_str()), Some("C:\\"));
+        assert_eq!(dirs.get(&12).map(|(p, _)| p.as_str()), Some("C:\\Usuarios"));
+    }
+
+    /// Y el caso de subruta (usado por `accumulate` cuando el MFT se invoca sobre
+    /// una carpeta): la carpeta escaneada conserva su ruta exacta como raíz.
+    #[test]
+    fn dir_paths_from_subfolder_keeps_the_subfolder_as_root() {
+        let (entries, children) = sample_index();
+        let dirs = dir_paths(12, "C:\\Usuarios", &entries, &children);
+
+        assert_eq!(dirs.get(&12).map(|(p, _)| p.as_str()), Some("C:\\Usuarios"));
     }
 }

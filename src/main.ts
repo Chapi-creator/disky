@@ -15,6 +15,7 @@ import {
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { check } from "@tauri-apps/plugin-updater";
 import type {
+  DuplicateGroup,
   GrowthDiff,
   GrowthReport,
   LargestDir,
@@ -28,6 +29,39 @@ import type {
   TreemapNodeDto,
   Volume,
 } from "./api";
+
+/**
+ * Lee un token de `styles.css`, la fuente de verdad de la paleta.
+ *
+ * Los gráficos se pintan con atributos SVG (`fill="#…"`), donde `var(--token)`
+ * no se resuelve; leer el valor computado permite que el CSS siga siendo el
+ * único sitio donde se define un color (antes había una copia a mano aquí que
+ * se desincronizaba al tocar la paleta).
+ */
+function cssVar(name: string, fallback: string): string {
+  const value = getComputedStyle(document.documentElement)
+    .getPropertyValue(name)
+    .trim();
+  return value || fallback;
+}
+
+/**
+ * Paleta derivada de `styles.css` al arrancar. Los fallbacks son los mismos
+ * valores, por si el stylesheet aún no estuviera aplicado (el script es
+ * `type="module"`, ya diferido, así que en la práctica siempre lo está).
+ *
+ * Reglas del color (identidad «ticker»): verde y rojo significan SOLO subida y
+ * bajada del tamaño; el ámbar es la marca y lo estructural, nunca «creció».
+ */
+const COLOR = {
+  alza: cssVar("--alza", "#2fdc75"),
+  baja: cssVar("--baja", "#ff4d6d"),
+  plano: cssVar("--plano", "#3d4959"),
+  acento: cssVar("--acento", "#f2b23c"),
+  text: cssVar("--text", "#e9eef6"),
+  textDim: cssVar("--text-dim", "#8996a8"),
+  borde: cssVar("--border", "#1f2833"),
+} as const;
 
 let volumesEl: HTMLElement | null;
 let scanRootEl: HTMLInputElement | null;
@@ -43,11 +77,14 @@ let historyEl: HTMLElement | null;
 let growthEl: HTMLElement | null;
 let growthThresholdEl: HTMLInputElement | null;
 let growthBaseEl: HTMLSelectElement | null;
+let growthFilterEl: HTMLSelectElement | null;
+let growthExportBtnEl: HTMLButtonElement | null;
 let largestEl: HTMLElement | null;
 let largestDirsEl: HTMLElement | null;
 let bigResultsEl: HTMLElement | null;
 let bigSearchInputEl: HTMLInputElement | null;
 let bigSearchBtnEl: HTMLButtonElement | null;
+let duplicatesEl: HTMLElement | null;
 
 /** `true` mientras un "Escanear todo" está en curso. */
 let scanAllActive = false;
@@ -108,6 +145,8 @@ let drillPath: string | null = null;
 let growthRootSnapshots: SnapshotSummary[] = [];
 /** Línea base elegida en «¿Qué creció?» (null = el anterior al más nuevo). */
 let growthBaseId: number | null = null;
+/** Filtro de filas de «¿Qué creció?» (persistido en localStorage). */
+let growthFilter: "all" | "up" | "down" = "all";
 /** Permiso de notificaciones concedido (o desconocido aún). */
 let notificationsGranted: boolean | null = null;
 
@@ -148,6 +187,35 @@ function formatBytes(bytes: number): string {
     unit += 1;
   }
   return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+/**
+ * Cache de un solo vuelo de `snapshots_list`.
+ *
+ * Un refresco tras un escaneo pide la misma lista desde varios loaders
+ * (`largest`, `largestDirs`, `bigFiles`, `duplicates`, `growth`, historial…):
+ * con este cache se hace **una** consulta IPC por raíz en vez de siete.
+ * Se limpia al empezar cada refresco (y tras borrar un snapshot) para no
+ * servir datos viejos.
+ */
+let snapshotsCache = new Map<string, Promise<SnapshotSummary[]>>();
+
+/** Snapshots de `root` (`null` = todos), compartidos dentro del refresco. */
+function snapshotsFor(root: string | null): Promise<SnapshotSummary[]> {
+  const key = root ?? "";
+  const cached = snapshotsCache.get(key);
+  if (cached) return cached;
+  const request = invoke<SnapshotSummary[]>(
+    "snapshots_list",
+    root === null ? {} : { root },
+  );
+  snapshotsCache.set(key, request);
+  return request;
+}
+
+/** Invalida el cache de snapshots (tras escanear, borrar o cambiar de raíz). */
+function clearSnapshotsCache(): void {
+  snapshotsCache = new Map();
 }
 
 // ── Volúmenes ────────────────────────────────────────────────────────────────
@@ -231,6 +299,28 @@ function formatDelta(bytes: number): string {
   return `${sign}${formatBytes(Math.abs(bytes))}`;
 }
 
+/**
+ * Celda de variación: flecha + signo + barra de magnitud (la «cinta»).
+ *
+ * `maxAbs` es el mayor valor absoluto de la columna que se está pintando, así
+ * que la barra se lee como proporción dentro de su propia tabla y no como una
+ * unidad absoluta. La flecha y el signo van siempre: la dirección no depende
+ * del color (clave para daltonismo, porque verde/rojo es justo el par que peor
+ * se distingue).
+ */
+function deltaCell(bytes: number, maxAbs: number): string {
+  const dir = bytes > 0 ? "sube" : bytes < 0 ? "baja" : "plano";
+  const flecha = bytes > 0 ? "▲" : bytes < 0 ? "▼" : "·";
+  const pct =
+    maxAbs > 0 ? Math.max(4, Math.round((Math.abs(bytes) / maxAbs) * 100)) : 0;
+  return `<td class="num delta ${dir}"><span class="flecha">${flecha}</span>${formatDelta(bytes)}<span class="cinta"><span class="cinta-barra" style="width:${pct}%"></span></span></td>`;
+}
+
+/** Mayor magnitud de una columna: escala común de las cintas de esa tabla. */
+function columnMax(values: number[]): number {
+  return values.reduce((max, v) => Math.max(max, Math.abs(v)), 0);
+}
+
 function snapshotRow(snapshot: SnapshotSummary): string {
   const when = new Date(snapshot.started_at * 1000).toLocaleString();
   const seconds = Math.round(snapshot.duration_ms / 1000);
@@ -250,23 +340,29 @@ function growthAlertThresholdBytes(): number | null {
   return Math.max(0, Number(growthThresholdEl.value) || 0) * 1024 * 1024;
 }
 
-function growthRow(report: GrowthReport): string {
-  const cls = report.delta_bytes > 0 ? "delta-pos" : report.delta_bytes < 0 ? "delta-neg" : "";
-  const perDay = report.delta_bytes / Math.max(report.elapsed_seconds, 1) * 86_400;
+function growthRow(
+  report: GrowthReport,
+  maxDelta: number,
+  maxPerDay: number,
+): string {
   const threshold = growthAlertThresholdBytes();
   const alert =
     threshold !== null &&
     report.delta_bytes >= threshold &&
-    (report.delta_bytes > 0 || report.new_bytes > 0)
-      ? ' class="grow-alert"'
-      : "";
-  return `<tr${alert} class="clickable" data-path="${escapeHtml(report.path)}">
-    <td class="path">${escapeHtml(report.path)}<button type="button" class="row-action" data-reveal="${escapeHtml(report.path)}" data-reveal-dir title="Abrir carpeta en el explorador">⌖</button></td>
+    (report.delta_bytes > 0 || report.new_bytes > 0);
+  const path = escapeHtml(report.path);
+  return `<tr class="${alert ? "clickable grow-alert" : "clickable"}" data-path="${path}">
+    <td class="path">${path}<button type="button" class="row-action" data-reveal="${path}" data-reveal-dir title="Abrir carpeta en el explorador">⌖</button></td>
     <td class="num">${formatBytes(report.old_bytes)}</td>
     <td class="num">${formatBytes(report.new_bytes)}</td>
-    <td class="num ${cls}">${formatDelta(report.delta_bytes)}</td>
-    <td class="num ${cls}">${formatDelta(Math.round(perDay))}</td>
+    ${deltaCell(report.delta_bytes, maxDelta)}
+    ${deltaCell(perDayBytes(report), maxPerDay)}
   </tr>`;
+}
+
+/** Delta normalizado a 24 h: la velocidad del cambio, no el salto total. */
+function perDayBytes(report: GrowthReport): number {
+  return Math.round((report.delta_bytes / Math.max(report.elapsed_seconds, 1)) * 86_400);
 }
 
 function largestRow(file: LargestFile, index: number): string {
@@ -280,6 +376,51 @@ function largestRow(file: LargestFile, index: number): string {
     <td class="num">${formatBytes(file.size_bytes)}</td>
     <td class="num">${escapeHtml(when)}</td>
   </tr>`;
+}
+
+/**
+ * Fila de un grupo de duplicados probables: nombre, tamaño, cuántas copias y
+ * el desperdicio (`(copias − 1) × tamaño`), con cada ruta revelable.
+ */
+function duplicateRow(group: DuplicateGroup): string {
+  const copies = group.paths.length;
+  const wasted = group.size_bytes * (copies - 1);
+  const list = group.paths
+    .map(
+      (p) =>
+        `<div class="dup-path">${escapeHtml(p)}<button type="button" class="row-action" data-reveal="${escapeHtml(p)}" title="Revelar archivo en el explorador">⌖</button></div>`,
+    )
+    .join("");
+  return `<tr>
+    <td class="path">${escapeHtml(group.name)}</td>
+    <td class="num">${formatBytes(group.size_bytes)}</td>
+    <td class="num">${copies}</td>
+    <td class="num">${formatBytes(wasted)}</td>
+    <td class="dup-list">${list}</td>
+  </tr>`;
+}
+
+/** Duplicados probables entre los archivos grandes del último snapshot. */
+async function loadDuplicates(): Promise<void> {
+  const el = duplicatesEl;
+  if (!el) return;
+  try {
+    const snaps = await snapshotsFor(currentScanRoot());
+    const latest = snaps[0];
+    if (!latest) {
+      el.innerHTML = `<tr><td colspan="5">Aún no hay escaneos guardados</td></tr>`;
+      return;
+    }
+    const groups = await invoke<DuplicateGroup[]>("find_duplicates", {
+      snapshotId: latest.id,
+    });
+    el.innerHTML =
+      groups.length > 0
+        ? groups.map(duplicateRow).join("")
+        : `<tr><td colspan="5">Ningún par de archivos grandes comparte nombre y tamaño</td></tr>`;
+  } catch (err) {
+    el.innerHTML = `<tr><td colspan="5" class="error">Error: ${escapeHtml(String(err))}</td></tr>`;
+  }
 }
 
 function largestDirsRow(dir: LargestDir, index: number): string {
@@ -318,9 +459,7 @@ async function loadLargest(): Promise<void> {
   const el = largestEl;
   if (!el) return;
   try {
-    const snaps = await invoke<SnapshotSummary[]>("snapshots_list", {
-      root: currentScanRoot(),
-    });
+    const snaps = await snapshotsFor(currentScanRoot());
     const latest = snaps[0];
     if (!latest) {
       el.innerHTML = `<tr><td colspan="4">Aún no hay escaneos guardados</td></tr>`;
@@ -344,9 +483,7 @@ async function loadBigFiles(query: string): Promise<void> {
   const el = bigResultsEl;
   if (!el) return;
   try {
-    const snaps = await invoke<SnapshotSummary[]>("snapshots_list", {
-      root: currentScanRoot(),
-    });
+    const snaps = await snapshotsFor(currentScanRoot());
     const latest = snaps[0];
     if (!latest) {
       el.innerHTML = `<tr><td colspan="4">Aún no hay escaneos guardados</td></tr>`;
@@ -371,9 +508,7 @@ async function loadLargestDirs(): Promise<void> {
   const el = largestDirsEl;
   if (!el) return;
   try {
-    const snaps = await invoke<SnapshotSummary[]>("snapshots_list", {
-      root: currentScanRoot(),
-    });
+    const snaps = await snapshotsFor(currentScanRoot());
     const latest = snaps[0];
     if (!latest) {
       el.innerHTML = `<tr><td colspan="4">Aún no hay escaneos guardados</td></tr>`;
@@ -394,7 +529,7 @@ async function loadLargestDirs(): Promise<void> {
 async function loadSnapshots(): Promise<void> {
   if (!snapshotsEl) return;
   try {
-    const snapshots = await invoke<SnapshotSummary[]>("snapshots_list");
+    const snapshots = await snapshotsFor(null);
     snapshotsEl.innerHTML =
       snapshots.length > 0
         ? snapshots.map(snapshotRow).join("")
@@ -434,24 +569,38 @@ function bucketSnapshots(group: string, snaps: SnapshotSummary[]): SnapshotSumma
   return [...last.values()].sort((a, b) => a.started_at - b.started_at);
 }
 
+/**
+ * Un punto del historial ya derivado: sus tres variaciones (contra el anterior,
+ * por día y contra la línea base) alimentan tanto la fila como la escala de su
+ * cinta.
+ */
+interface HistoryRow {
+  point: SnapshotSummary;
+  isBase: boolean;
+  delta: number;
+  perDay: number;
+  vsBase: number;
+}
+
+/** Escala común de las tres columnas de variación de una tabla de historial. */
+interface DeltaMaxima {
+  delta: number;
+  perDay: number;
+  vsBase: number;
+}
+
 /** Fila del historial: un punto de la serie (cada escaneo o período). */
-function historyRow(point: SnapshotSummary, prev: SnapshotSummary | null, isBase: boolean): string {
+function historyRow(row: HistoryRow, maxima: DeltaMaxima): string {
+  const { point, isBase } = row;
   const when = new Date(point.started_at * 1000).toLocaleString();
   const seconds = Math.round(point.duration_ms / 1000);
-  const delta = prev
-    ? point.total_bytes - prev.total_bytes
-    : 0;
-  const elapsed = prev ? Math.max(point.started_at - prev.started_at, 1) : 1;
-  const perDay = Math.round((delta / elapsed) * 86_400);
-  const vsBase = point.total_bytes - (baseBytes);
-  const cls = delta > 0 ? "delta-pos" : delta < 0 ? "delta-neg" : "";
   const baseBadge = isBase ? ' <span class="badge-base">base</span>' : "";
   return `<tr>
     <td>${when} (${seconds}s)${baseBadge}</td>
     <td class="num">${formatBytes(point.total_bytes)}</td>
-    <td class="num ${cls}">${formatDelta(delta)}</td>
-    <td class="num ${cls}">${formatDelta(perDay)}</td>
-    <td class="num ${vsBase > 0 ? "delta-pos" : vsBase < 0 ? "delta-neg" : ""}">${formatDelta(vsBase)}</td>
+    ${deltaCell(row.delta, maxima.delta)}
+    ${deltaCell(row.perDay, maxima.perDay)}
+    ${deltaCell(row.vsBase, maxima.vsBase)}
     <td class="num">${point.total_files.toLocaleString()}</td>
   </tr>`;
 }
@@ -463,7 +612,7 @@ let baseBytes = 0;
 async function loadHistory(): Promise<void> {
   if (!historyEl) return;
   try {
-    historySnapshots = await invoke<SnapshotSummary[]>("snapshots_list");
+    historySnapshots = await snapshotsFor(null);
     const roots = [...new Set(historySnapshots.map((s) => s.root))].sort();
     if (!roots.includes(historyRoot)) historyRoot = roots[0] ?? "";
     if (historyRootEl) {
@@ -496,9 +645,29 @@ function renderHistory(): void {
     return;
   }
   baseBytes = snaps[0].total_bytes;
+  const rows: HistoryRow[] = snaps.map((point, i) => {
+    const prev = i > 0 ? snaps[i - 1] : null;
+    const delta = prev ? point.total_bytes - prev.total_bytes : 0;
+    const elapsed = prev ? Math.max(point.started_at - prev.started_at, 1) : 1;
+    return {
+      point,
+      isBase: i === 0,
+      delta,
+      perDay: Math.round((delta / elapsed) * 86_400),
+      vsBase: point.total_bytes - baseBytes,
+    };
+  });
+  // Cada columna se escala contra su propio máximo: en la misma tabla conviven
+  // saltos de escaneo (GB) y velocidades por día (MB), y compararlos entre sí
+  // no significaría nada.
+  const maxima: DeltaMaxima = {
+    delta: columnMax(rows.map((r) => r.delta)),
+    perDay: columnMax(rows.map((r) => r.perDay)),
+    vsBase: columnMax(rows.map((r) => r.vsBase)),
+  };
   historyEl.innerHTML =
     `<tr class="period"><td colspan="6">Línea base: ${escapeHtml(formatBytes(baseBytes))} · agrupación: ${escapeHtml(group)}</td></tr>` +
-    snaps.map((s, i) => historyRow(s, i > 0 ? snaps[i - 1] : null, i === 0)).join("");
+    rows.map((r) => historyRow(r, maxima)).join("");
 }
 
 /** `true` mientras ya se disparó el escaneo de línea base del primer uso. */
@@ -512,7 +681,7 @@ async function ensureBaseline(): Promise<void> {
   if (baselineTriggered) return;
   baselineTriggered = true; // evita arranques simultáneos
   try {
-    const snaps = await invoke<SnapshotSummary[]>("snapshots_list");
+    const snaps = await snapshotsFor(null);
     if (snaps.length === 0) void startScanAll("scan_all_start");
   } catch (_err) {
     // Fallo transitorio (BD ocupada en el arranque): reintentar una vez en
@@ -533,8 +702,10 @@ function growthPeriodLabel(): string {
 /** Hijos directos de `folder` presentes en el diff (una sola profundidad). */
 function childrenOf(folder: string): GrowthReport[] {
   if (!lastGrowth) return [];
-  // El backend guarda rutas con el separador nativo del SO.
-  const sep = navigator.platform.startsWith("Win") ? "\\" : "/";
+  // El backend guarda rutas con el separador nativo del SO; se deduce de la
+  // propia raíz en lugar de `navigator.platform` (deprecado y congelado), que
+  // además mentiría en cualquier entorno no-Windows.
+  const sep = lastGrowth.new.root.includes("\\") ? "\\" : "/";
   const prefix = `${folder}${sep}`;
   return lastGrowth.rows.filter((row) => {
     if (!row.path.startsWith(prefix)) return false;
@@ -563,12 +734,14 @@ function renderGrowth(): void {
   const period = growthPeriodLabel();
 
   if (drillPath) {
-    const children = childrenOf(drillPath);
+    const children = visibleGrowthRows(childrenOf(drillPath));
     const name = escapeHtml(drillPath);
+    const maxDelta = columnMax(children.map((r) => r.delta_bytes));
+    const maxPerDay = columnMax(children.map(perDayBytes));
     growthEl.innerHTML =
       `<tr class="period"><td colspan="5">${period} · dentro de <strong>${name}</strong> · <a href="#" id="growth-back">↑ volver</a></td></tr>` +
       (children.length > 0
-        ? children.map(growthRow).join("")
+        ? children.map((r) => growthRow(r, maxDelta, maxPerDay)).join("")
         : `<tr><td colspan="5">Sin subcarpetas con cambios medidos aquí</td></tr>`);
     document.querySelector("#growth-back")?.addEventListener("click", (e) => {
       e.preventDefault();
@@ -578,19 +751,31 @@ function renderGrowth(): void {
     return;
   }
 
+  const rows = visibleGrowthRows(lastGrowth.rows);
+  const maxDelta = columnMax(rows.map((r) => r.delta_bytes));
+  const maxPerDay = columnMax(rows.map(perDayBytes));
   growthEl.innerHTML =
-    lastGrowth.rows.length > 0
+    rows.length > 0
       ? `<tr class="period"><td colspan="5">${period}${growthTop3()} · clic en una carpeta para ver sus hijos</td></tr>` +
-        lastGrowth.rows.map(growthRow).join("")
-      : `<tr><td colspan="5">Sin diferencias de tamaño entre los dos escaneos</td></tr>`;
+        rows.map((r) => growthRow(r, maxDelta, maxPerDay)).join("")
+      : `<tr><td colspan="5">${
+          lastGrowth.rows.length > 0
+            ? "Ninguna carpeta entra en el filtro elegido"
+            : "Sin diferencias de tamaño entre los dos escaneos"
+        }</td></tr>`;
+}
+
+/** Filas de crecimiento que la UI debe pintar según el filtro elegido. */
+function visibleGrowthRows(rows: GrowthReport[]): GrowthReport[] {
+  if (growthFilter === "up") return rows.filter((r) => r.delta_bytes > 0);
+  if (growthFilter === "down") return rows.filter((r) => r.delta_bytes < 0);
+  return rows;
 }
 
 async function loadGrowth(): Promise<void> {
   if (!growthEl) return;
   try {
-    growthRootSnapshots = await invoke<SnapshotSummary[]>("snapshots_list", {
-      root: currentScanRoot(),
-    });
+    growthRootSnapshots = await snapshotsFor(currentScanRoot());
     renderGrowthBaseline();
     const diff = await invoke<GrowthDiff | null>("growth_report", {
       root: currentScanRoot(),
@@ -602,6 +787,22 @@ async function loadGrowth(): Promise<void> {
     maybeNotifyGrowth();
   } catch (err) {
     growthEl.innerHTML = `<tr><td colspan="5" class="error">Error: ${escapeHtml(String(err))}</td></tr>`;
+  }
+}
+
+/** Guarda el informe de «¿Qué creció?» como CSV y lo revela en el explorador. */
+async function exportGrowthCsv(): Promise<void> {
+  if (growthExportBtnEl) growthExportBtnEl.disabled = true;
+  try {
+    const path = await invoke<string>("export_growth_csv", {
+      root: currentScanRoot(),
+      baseId: growthBaseId,
+    });
+    await revealItemInDir(path);
+  } catch (err) {
+    window.alert(`No se pudo exportar el informe: ${String(err)}`);
+  } finally {
+    if (growthExportBtnEl) growthExportBtnEl.disabled = false;
   }
 }
 
@@ -722,12 +923,15 @@ async function cancelScan(): Promise<void> {
 
 /** Refresco común tras un escaneo: historial, ¿qué creció? y treemap/timeline. */
 function refreshData(root: string): void {
+  // Los loaders comparten una sola consulta de snapshots dentro del refresco.
+  clearSnapshotsCache();
   void loadSnapshots();
   void loadHistory();
   void loadGrowth();
   void loadLargest();
   void loadLargestDirs();
   void loadBigFiles(bigSearchInputEl?.value.trim() ?? "");
+  void loadDuplicates();
   void refreshTreemapForRoot(root);
 }
 
@@ -754,11 +958,26 @@ function handleQuickScanDone(payload: ScanQuickDonePayload): void {
 
 // ── Treemap ─────────────────────────────────────────────────────────────
 
-/** Color del rectángulo según el delta: verde creció, naranja encogió, gris neutro. */
+/**
+ * Etiqueta accesible de un nodo del treemap: el rectángulo es solo color y dos
+ * textos, así que un lector de pantalla necesita el resumen en prosa.
+ */
+function treemapAria(node: TreemapNodeDto): string {
+  const dir =
+    node.delta_bytes > 0
+      ? "creció"
+      : node.delta_bytes < 0
+        ? "se encogió"
+        : "sin cambios";
+  const delta = node.delta_bytes === 0 ? "" : ` (${formatDelta(node.delta_bytes)})`;
+  return `${node.name}, ${formatBytes(node.size_bytes)}, ${dir}${delta}`;
+}
+
+/** Color del rectángulo según el delta: verde creció, rojo encogió, gris neutro. */
 function treemapFill(delta: number): string {
-  if (delta > 0) return "#3f9d63";
-  if (delta < 0) return "#c47f2e";
-  return "#3a4152";
+  if (delta > 0) return COLOR.alza;
+  if (delta < 0) return COLOR.baja;
+  return COLOR.plano;
 }
 
 /** Etiqueta visible del nodo (recortada si el rectángulo es angosto). */
@@ -780,11 +999,12 @@ async function loadTreemap(folder?: string): Promise<void> {
     treemapEl.innerHTML = nodes
       .map(
         (node) => `
-      <g class="tm-node" data-path="${escapeHtml(node.path)}">
+      <g class="tm-node" data-path="${escapeHtml(node.path)}" tabindex="0" role="button"
+        aria-label="${escapeHtml(treemapAria(node))}">
         <rect x="${node.x + 1}" y="${node.y + 1}" width="${Math.max(node.w - 2, 0)}" height="${Math.max(node.h - 2, 0)}"
           rx="4" fill="${treemapFill(node.delta_bytes)}" />
-        <text x="${node.x + 8}" y="${node.y + 20}" fill="#e6e9ef" font-size="13">${escapeHtml(nodeLabel(node))}</text>
-        <text x="${node.x + 8}" y="${node.y + 38}" fill="#9aa3b2" font-size="11">${formatBytes(node.size_bytes)}</text>
+        <text x="${node.x + 8}" y="${node.y + 20}" fill="${COLOR.text}" font-size="13">${escapeHtml(nodeLabel(node))}</text>
+        <text x="${node.x + 8}" y="${node.y + 38}" fill="${COLOR.textDim}" font-size="11">${formatBytes(node.size_bytes)}</text>
       </g>`,
       )
       .join("");
@@ -826,8 +1046,19 @@ function drillIntoTreemap(path: string): void {
 
 // ── Timeline (gráfico de líneas) ─────────────────────────────────────
 
-/** Paleta de la comparación: hasta 6 series distinguibles. */
-const SERIES_COLORS = ["#4f8cff", "#3f9d63", "#c47f2e", "#b569c9", "#e0c04f", "#9aa3b2"];
+/**
+ * Paleta de la comparación: hasta 6 series distinguibles, también desde
+ * `styles.css` (`--serie-N`). El resto evita el verde y el rojo a propósito,
+ * que en esta app significan dirección y nada más.
+ */
+const SERIES_COLORS = [
+  cssVar("--serie-1", "#f2b23c"),
+  cssVar("--serie-2", "#5aa9ff"),
+  cssVar("--serie-3", "#b58cff"),
+  cssVar("--serie-4", "#4fd1c5"),
+  cssVar("--serie-5", "#e879b9"),
+  cssVar("--serie-6", "#8fa3bf"),
+];
 
 /** Carpeta cuyo timeline se muestra (null = la raíz actual). */
 let timelineFolder: string | null = null;
@@ -851,7 +1082,7 @@ async function loadTimeline(folder?: string): Promise<void> {
 
   const empty = (msg: string): void => {
     if (timelineEl && timelineLegendEl) {
-      timelineEl.innerHTML = `<text x="16" y="40" fill="#9aa3b2" font-size="13">${escapeHtml(msg)}</text>`;
+      timelineEl.innerHTML = `<text x="16" y="40" fill="${COLOR.textDim}" font-size="13">${escapeHtml(msg)}</text>`;
       timelineLegendEl.innerHTML = "";
     }
   };
@@ -902,7 +1133,7 @@ async function loadTimeline(folder?: string): Promise<void> {
     const gridLines = [min, (min + max) / 2, max]
       .map(
         (v) =>
-          `<line x1="${PAD}" y1="${yOf(v).toFixed(1)}" x2="${W - PAD}" y2="${yOf(v).toFixed(1)}" stroke="#262b36" stroke-dasharray="3 4" /><text x="8" y="${(yOf(v) + 4).toFixed(1)}" fill="#9aa3b2" font-size="10">${formatBytes(v)}</text>`,
+          `<line x1="${PAD}" y1="${yOf(v).toFixed(1)}" x2="${W - PAD}" y2="${yOf(v).toFixed(1)}" stroke="${COLOR.borde}" stroke-dasharray="3 4" /><text x="8" y="${(yOf(v) + 4).toFixed(1)}" fill="${COLOR.textDim}" font-size="10">${formatBytes(v)}</text>`,
       )
       .join("");
 
@@ -962,11 +1193,14 @@ window.addEventListener("DOMContentLoaded", () => {
   growthEl = document.querySelector("#growth-table tbody");
   growthThresholdEl = document.querySelector("#growth-alert-threshold");
   growthBaseEl = document.querySelector("#growth-base");
+  growthFilterEl = document.querySelector("#growth-filter");
+  growthExportBtnEl = document.querySelector("#growth-export-btn");
   largestEl = document.querySelector("#largest-table tbody");
   largestDirsEl = document.querySelector("#largest-dirs");
   bigResultsEl = document.querySelector("#big-results");
   bigSearchInputEl = document.querySelector("#big-search-input");
   bigSearchBtnEl = document.querySelector("#big-search-btn");
+  duplicatesEl = document.querySelector("#duplicates");
   treemapEl = document.querySelector("#treemap");
   treemapCrumbEl = document.querySelector("#treemap-crumb");
   timelineEl = document.querySelector("#timeline");
@@ -980,7 +1214,29 @@ window.addEventListener("DOMContentLoaded", () => {
   );
   scanCancelBtnEl?.addEventListener("click", () => void cancelScan());
 
-  growthThresholdEl?.addEventListener("input", () => renderGrowth());
+  // Ajustes recordados entre sesiones: el umbral y el filtro no deberían
+  // reconfigurarse cada vez que se abre la app.
+  const savedThreshold = window.localStorage.getItem("disky.threshold");
+  if (savedThreshold !== null && growthThresholdEl) {
+    growthThresholdEl.value = savedThreshold;
+  }
+  const savedFilter = window.localStorage.getItem("disky.growthFilter");
+  if (savedFilter === "all" || savedFilter === "up" || savedFilter === "down") {
+    growthFilter = savedFilter;
+  }
+  if (growthFilterEl) growthFilterEl.value = growthFilter;
+
+  growthThresholdEl?.addEventListener("input", () => {
+    window.localStorage.setItem("disky.threshold", growthThresholdEl?.value ?? "");
+    renderGrowth();
+  });
+  growthFilterEl?.addEventListener("change", () => {
+    const value = growthFilterEl?.value;
+    growthFilter = value === "up" || value === "down" ? value : "all";
+    window.localStorage.setItem("disky.growthFilter", growthFilter);
+    renderGrowth();
+  });
+  growthExportBtnEl?.addEventListener("click", () => void exportGrowthCsv());
   const baseSelect = growthBaseEl;
   baseSelect?.addEventListener("change", () => {
     growthBaseId = baseSelect.value ? Number(baseSelect.value) : null;
@@ -1001,6 +1257,7 @@ window.addEventListener("DOMContentLoaded", () => {
   wireReveal(largestEl);
   wireReveal(largestDirsEl);
   wireReveal(bigResultsEl);
+  wireReveal(duplicatesEl);
   const runBigSearch = (): void =>
     void loadBigFiles(bigSearchInputEl?.value.trim() ?? "");
   bigSearchBtnEl?.addEventListener("click", runBigSearch);
@@ -1020,6 +1277,7 @@ window.addEventListener("DOMContentLoaded", () => {
     void (async () => {
       try {
         await invoke("delete_snapshot", { snapshotId: id });
+        clearSnapshotsCache();
         await loadSnapshots();
         // largest/growth/historial/treemap podían apuntar al snapshot borrado.
         await loadLargest();
@@ -1037,6 +1295,16 @@ window.addEventListener("DOMContentLoaded", () => {
   treemapEl?.addEventListener("click", (event) => {
     const group = (event.target as Element).closest("g.tm-node");
     if (!group) return;
+    drillIntoTreemap(group.getAttribute("data-path") ?? "");
+  });
+  // Teclado: los nodos son botones, así que Enter/Espacio entran igual que el
+  // clic (el treemap era inalcanzable sin ratón).
+  treemapEl?.addEventListener("keydown", (event) => {
+    const key = (event as KeyboardEvent).key;
+    if (key !== "Enter" && key !== " ") return;
+    const group = (event.target as Element).closest("g.tm-node");
+    if (!group) return;
+    event.preventDefault();
     drillIntoTreemap(group.getAttribute("data-path") ?? "");
   });
 
@@ -1080,5 +1348,6 @@ window.addEventListener("DOMContentLoaded", () => {
   // difieren un tick para que volúmenes y snapshots pinten primero.
   window.setTimeout(() => void loadLargest(), 0);
   window.setTimeout(() => void loadLargestDirs(), 0);
+  window.setTimeout(() => void loadDuplicates(), 0);
   void ensureBaseline();
 });

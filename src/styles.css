@@ -1,15 +1,64 @@
-/* disky — estilos de la vertical slice.
-   Paleta oscura simple; el treemap/timeline reemplazará la tabla después. */
+/* disky — identidad «ticker».
+ *
+ * La idea del producto es que el disco cotiza: cada carpeta es un activo y lo
+ * que importa no es su tamaño, sino su variación. Así que la interfaz se viste
+ * como una cinta de cotizaciones y no como un panel de ajustes:
+ *
+ *   - Casi negro de fondo, para que manden las cifras.
+ *   - TODO número va en monoespaciada con cifras tabulares: se alinean en
+ *     columna y se comparan de un vistazo.
+ *   - El color tiene reglas estrictas: verde y rojo significan SOLO subida y
+ *     bajada. El ámbar es la marca y lo estructural (nunca "creció").
+ *   - La dirección se marca también con ▲ ▼ y el signo, así que la cinta se
+ *     entiende sin depender del color (importa para daltonismo: verde/rojo es
+ *     justo el par que peor se distingue).
+ */
 
 :root {
   color-scheme: dark;
-  --bg: #0f1115;
-  --surface: #171a21;
-  --border: #262b36;
-  --text: #e6e9ef;
-  --text-dim: #9aa3b2;
-  --accent: #4f8cff;
-  --error: #ff6b6b;
+
+  /* Superficies */
+  --bg: #06080b;
+  --surface: #0e1319;
+  --surface-2: #141a22;
+  --border: #1f2833;
+  --border-fuerte: #2e3a4a;
+
+  /* Tinta */
+  --text: #e9eef6;
+  --text-dim: #8996a8;
+  --text-tenue: #5f6b7c;
+
+  /* Dirección del mercado. Solo para el signo del delta. */
+  --alza: #2fdc75;
+  --alza-suave: rgba(47, 220, 117, 0.13);
+  --baja: #ff4d6d;
+  --baja-suave: rgba(255, 77, 109, 0.13);
+  --plano: #3d4959;
+
+  /* Marca: el ámbar de la cinta. Nunca significa "subió". */
+  --acento: #f2b23c;
+  --acento-suave: rgba(242, 178, 60, 0.12);
+  --acento-tinta: #1a1204;
+
+  /* Series del timeline: colores de comparación, no de dirección. Evitan el
+     verde y el rojo a propósito (esos ya significan subida/bajada). El primero
+     es el ámbar de la marca: la carpeta que estás viendo. */
+  --serie-1: #f2b23c;
+  --serie-2: #5aa9ff;
+  --serie-3: #b58cff;
+  --serie-4: #4fd1c5;
+  --serie-5: #e879b9;
+  --serie-6: #8fa3bf;
+
+  /* Errores reales (unidad que no se pudo leer), distinto de "se encogió". */
+  --error: #ff4d4d;
+
+  --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", ui-monospace,
+    monospace;
+
+  --radio: 8px;
 }
 
 * {
@@ -22,82 +71,347 @@ html {
 
 body {
   margin: 0;
-  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
   background: var(--bg);
   color: var(--text);
+  -webkit-font-smoothing: antialiased;
 }
 
 .container {
-  max-width: 720px;
+  max-width: 980px;
   margin: 0 auto;
-  padding: 32px 24px;
+  padding: 28px 24px 64px;
 }
 
-h1 {
-  margin: 0 0 4px;
-  font-size: 28px;
+/* ---------------------------------------------------------------- marca --- */
+
+.marca {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding-bottom: 20px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.marca-mark {
+  width: 52px;
+  height: 52px;
+  flex: none;
+}
+
+.mm-caja {
+  fill: var(--surface-2);
+  stroke: var(--acento);
+  stroke-width: 2;
+}
+
+.mm-b1 {
+  fill: var(--acento);
+}
+
+.mm-b2,
+.mm-b3 {
+  fill: var(--alza);
+}
+
+.mm-flecha {
+  fill: none;
+  stroke: var(--text);
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.marca-texto h1 {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  font-family: var(--mono);
+}
+
+.marca-texto h1::after {
+  content: "▲";
+  margin-left: 8px;
+  font-size: 16px;
+  vertical-align: 6px;
+  color: var(--alza);
 }
 
 .subtitle {
-  margin: 0 0 24px;
+  margin: 2px 0 0;
+  color: var(--text-dim);
+  font-size: 13.5px;
+}
+
+/* ----------------------------------------------------------------- texto --- */
+
+h2,
+h3 {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
   color: var(--text-dim);
 }
 
 h2 {
-  font-size: 16px;
-  margin-bottom: 8px;
+  font-size: 12px;
+  margin: 34px 0 10px;
 }
+
+h3 {
+  font-size: 11.5px;
+  margin: 26px 0 10px;
+}
+
+/* La marca de sección: una astilla ámbar, como el tick de la cinta. */
+h2::before,
+h3::before {
+  content: "";
+  width: 3px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--acento);
+  flex: none;
+  transform: translateY(1px);
+}
+
+.hint {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  margin: 4px 0 12px;
+  max-width: 78ch;
+}
+
+.hint strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.hint-inline {
+  float: right;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--text-dim);
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+
+strong {
+  font-weight: 600;
+}
+
+/* ---------------------------------------------------------------- tablas --- */
 
 .volumes-table {
   width: 100%;
   border-collapse: collapse;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radio);
   overflow: hidden;
-  font-size: 14px;
+  font-size: 13.5px;
 }
 
 .volumes-table th,
 .volumes-table td {
-  padding: 10px 14px;
+  padding: 9px 14px;
   text-align: left;
   border-bottom: 1px solid var(--border);
+  vertical-align: baseline;
 }
 
 .volumes-table thead th {
-  color: var(--text-dim);
+  font-family: var(--mono);
+  color: var(--text-tenue);
   font-weight: 600;
-  font-size: 12px;
+  font-size: 10.5px;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.12em;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border-fuerte);
 }
 
 .volumes-table tbody tr:last-child td {
   border-bottom: none;
 }
 
-.letter {
-  font-weight: 700;
-  color: var(--accent);
+.volumes-table tbody tr:hover td {
+  background: rgba(233, 238, 246, 0.025);
 }
 
+/* Cifras: monoespaciada y tabular, siempre. */
 .num {
+  font-family: var(--mono);
   font-variant-numeric: tabular-nums;
   text-align: right;
+  white-space: nowrap;
+}
+
+.letter {
+  font-family: var(--mono);
+  font-weight: 700;
+  color: var(--acento);
 }
 
 .error {
   color: var(--error);
 }
 
+/* ------------------------------------------------------------------ cinta --- */
+/* La columna Δ es el corazón de la cinta: flecha + signo + barra de magnitud.
+   La barra es un subrayado de 2 px con el color de la dirección. */
+
+td.delta {
+  position: relative;
+  padding-bottom: 13px;
+  font-weight: 600;
+}
+
+.flecha {
+  display: inline-block;
+  width: 1em;
+  margin-right: 2px;
+  font-size: 10px;
+  vertical-align: 1px;
+}
+
+.cinta {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 5px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.cinta-barra {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: currentColor;
+  min-width: 2px;
+}
+
+.sube {
+  color: var(--alza);
+}
+
+.baja {
+  color: var(--baja);
+}
+
+.plano {
+  color: var(--plano);
+}
+
+/* Filas que pasaron el umbral: se marcan en ámbar, que es la voz de la app.
+   Un crecimiento fuerte no es una dirección, es un aviso. */
+tr.grow-alert td {
+  background: var(--acento-suave);
+}
+
+tr.grow-alert td:first-child {
+  box-shadow: inset 3px 0 0 var(--acento);
+  font-weight: 600;
+}
+
+tr.grow-alert td.path {
+  color: var(--acento);
+}
+
+/* Fila de contexto ("2026-09-25 → 2026-09-26 · dentro de ..."). */
+tr.period td {
+  font-family: var(--mono);
+  color: var(--text-tenue);
+  font-size: 11.5px;
+  background: var(--surface-2);
+}
+
+tr.period a {
+  color: var(--acento);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--acento);
+}
+
+tr.period a:hover {
+  border-bottom-style: solid;
+}
+
+tr.clickable {
+  cursor: pointer;
+}
+
+tr.clickable:hover td {
+  background: var(--acento-suave);
+}
+
+/* Rutas: son datos, así que van en monoespaciada y apagadas. */
+td.path {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text-dim);
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+td.period-label {
+  white-space: nowrap;
+}
+
+.row-action {
+  padding: 1px 6px;
+  margin-left: 6px;
+  border: none;
+  background: none;
+  color: var(--text-tenue);
+  cursor: pointer;
+  font-size: 13px;
+  border-radius: 4px;
+}
+
+.row-action:hover {
+  color: var(--acento);
+  background: var(--acento-suave);
+}
+
+/* Duplicados: una celda con varias rutas apiladas. */
+.dup-list {
+  padding-top: 6px;
+  padding-bottom: 6px;
+  vertical-align: top;
+}
+
+.dup-path {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  max-width: 460px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------------------------------------------------------------- inputs --- */
+
 .row {
-  margin-top: 32px;
+  margin-top: 26px;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
-/* La fila de búsqueda va dentro de un <details>: sin tanto margen arriba. */
 .search-row {
   margin-top: 12px;
   margin-bottom: 12px;
@@ -105,68 +419,136 @@ h2 {
 
 .row input {
   flex: 1;
-  padding: 8px 12px;
+  min-width: 200px;
+  padding: 9px 12px;
   border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--surface);
+  border: 1px solid var(--border-fuerte);
+  background: #05070a;
   color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.row input:focus,
+.hint-inline input:focus,
+.hint-inline select:focus {
+  outline: none;
+  border-color: var(--acento);
+  box-shadow: 0 0 0 3px var(--acento-suave);
 }
 
 .row button {
-  padding: 8px 16px;
+  padding: 9px 16px;
   border-radius: 6px;
-  border: none;
-  background: var(--accent);
-  color: white;
+  border: 1px solid var(--border-fuerte);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
   font-weight: 600;
   cursor: pointer;
 }
 
 .row button:hover {
-  filter: brightness(1.1);
+  border-color: var(--text-dim);
 }
 
-.row-action {
-  padding: 2px 6px;
-  border: none;
-  background: none;
-  color: var(--text-dim);
+.row button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* La acción principal es la única en ámbar: escanear es LA acción. */
+#scan-btn,
+#big-search-btn {
+  background: var(--acento);
+  border-color: var(--acento);
+  color: var(--acento-tinta);
+}
+
+#scan-btn:hover,
+#big-search-btn:hover {
+  filter: brightness(1.08);
+}
+
+.hint-inline input,
+.hint-inline select {
+  margin: 0 4px;
+  padding: 3px 7px;
+  border: 1px solid var(--border-fuerte);
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.hint-inline input[type="number"] {
+  width: 6.5em;
+  text-align: right;
+}
+
+/* Acciones compactas dentro de un encabezado (p. ej. Exportar CSV). */
+.hint-inline button {
+  margin-left: 6px;
+  padding: 3px 9px;
+  border: 1px solid var(--border-fuerte);
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11.5px;
   cursor: pointer;
-  font-size: 14px;
 }
 
-.row-action:hover {
-  color: #d9534f;
+.hint-inline button:hover {
+  border-color: var(--acento);
+  color: var(--acento);
+}
+
+.hint-inline button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 #greet-msg {
   color: var(--text-dim);
 }
 
-.hint {
-  color: var(--text-dim);
-  font-size: 13px;
-  margin: 4px 0 12px;
+.badge-base {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 8px;
+  background: var(--acento);
+  color: var(--acento-tinta);
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 
-h3 {
-  font-size: 13px;
-  margin: 24px 0 8px;
-  color: var(--text-dim);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+#growth-back {
+  color: var(--acento);
+  text-decoration: none;
+}
+
+#growth-back:hover {
+  text-decoration: underline;
 }
 
 .hidden {
   display: none;
 }
 
+/* -------------------------------------------------------------- progreso --- */
+
 .scan-progress {
   margin-top: 12px;
 }
 
 .bar {
-  height: 6px;
+  height: 4px;
   background: var(--border);
   border-radius: 999px;
   overflow: hidden;
@@ -176,7 +558,7 @@ h3 {
 .fill {
   height: 100%;
   width: 40%;
-  background: var(--accent);
+  background: var(--acento);
   border-radius: 999px;
   animation: scan-slide 1.2s ease-in-out infinite;
 }
@@ -193,112 +575,20 @@ h3 {
 .scan-progress p {
   margin: 8px 0 0;
   color: var(--text-dim);
-  font-size: 13px;
+  font-family: var(--mono);
+  font-size: 12.5px;
   font-variant-numeric: tabular-nums;
 }
 
-.delta-pos {
-  color: #7bd88f;
-}
+/* ------------------------------------------------------------ treemap/gráficos --- */
 
-.delta-neg {
-  color: #ffb454;
-}
-
-tr.period td {
-  color: var(--text-dim);
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-/* Drill-down: filas navegables y ruta recortada. */
-tr.clickable {
-  cursor: pointer;
-}
-
-tr.clickable:hover td {
-  background: rgba(79, 140, 255, 0.08);
-}
-
-/* Alertas de crecimiento: filas que superaron el umbral. */
-tr.grow-alert td {
-  background: #26303a;
-}
-
-tr.grow-alert td:first-child {
-  box-shadow: inset 3px 0 0 #e18f2c;
-  font-weight: 600;
-}
-
-tr.grow-alert td.path {
-  color: #f0c069;
-}
-
-.hint-inline {
-  float: right;
-  font-size: 13px;
-  font-weight: 400;
-  color: var(--text-dim);
-}
-
-.hint-inline input {
-  width: 6em;
-  margin: 0 4px;
-  padding: 2px 6px;
-  border: 1px solid #3a4152;
-  border-radius: 4px;
-  background: #1c2130;
-  color: var(--text);
-}
-
-.hint-inline select {
-  margin: 0 4px;
-  padding: 2px 6px;
-  border: 1px solid #3a4152;
-  border-radius: 4px;
-  background: #1c2130;
-  color: var(--text);
-}
-
-.badge-base {
-  display: inline-block;
-  margin-left: 6px;
-  padding: 1px 6px;
-  border-radius: 8px;
-  background: var(--accent);
-  color: white;
-  font-size: 11px;
-  font-weight: 600;
-}
-
-td.period-label {
-  white-space: nowrap;
-}
-
-td.path {
-  max-width: 260px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-#growth-back {
-  color: var(--accent);
-  text-decoration: none;
-}
-
-#growth-back:hover {
-  text-decoration: underline;
-}
-
-/* Treemap SVG: rectángulos navegables, breadcrumb y hover. */
-#treemap {
+#treemap,
+#timeline {
   width: 100%;
   height: auto;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radio);
 }
 
 .tm-node {
@@ -306,23 +596,70 @@ td.path {
 }
 
 .tm-node:hover rect {
-  stroke: var(--accent);
+  stroke: var(--acento);
   stroke-width: 2;
+}
+
+/* Navegación por teclado: el nodo es un botón y debe verse cuál tiene el foco. */
+.tm-node:focus {
+  outline: none;
+}
+
+.tm-node:focus-visible rect {
+  stroke: var(--acento);
+  stroke-width: 2.5;
+  stroke-dasharray: 5 3;
 }
 
 #treemap text {
   pointer-events: none;
+  font-family: var(--mono);
 }
+
+#timeline circle {
+  cursor: help;
+}
+
+#timeline text {
+  font-family: var(--mono);
+}
+
+#timeline-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 10px 0 0;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.legend-swatch {
+  width: 14px;
+  height: 3px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+/* ------------------------------------------------------------ breadcrumb --- */
 
 .crumb {
   margin-top: 0;
   align-items: center;
+  margin-bottom: 8px;
 }
 
 .crumb-link {
-  color: var(--accent);
+  color: var(--acento);
   text-decoration: none;
-  font-size: 13px;
+  font-family: var(--mono);
+  font-size: 12px;
 }
 
 .crumb-link:hover {
@@ -330,58 +667,29 @@ td.path {
 }
 
 .crumb-sep {
-  color: var(--text-dim);
+  color: var(--text-tenue);
   margin: 0 6px;
-  font-size: 12px;
+  font-family: var(--mono);
+  font-size: 11px;
 }
 
-/* Timeline: gráfico de líneas del crecimiento. */
-#timeline {
-  width: 100%;
-  height: auto;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-}
+/* ------------------------------------------------------------- plegables --- */
 
-#timeline circle {
-  cursor: help;
-}
-
-#timeline-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 14px;
-  margin: 8px 0 0;
-}
-
-.legend-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--text-dim);
-}
-
-.legend-swatch {
-  width: 12px;
-  height: 4px;
-  border-radius: 2px;
-  display: inline-block;
-}
-
-/* Secciones plegables de los "más pesados" (details/summary nativo). */
 .collapsible {
   border: 1px solid var(--border);
-  border-radius: 8px;
-  margin-top: 20px;
+  border-radius: var(--radio);
+  margin-top: 18px;
+  background: rgba(14, 19, 25, 0.6);
 }
 
 .collapsible > summary {
   cursor: pointer;
   user-select: none;
-  padding: 10px 14px;
+  padding: 12px 16px;
   list-style: none;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
 }
 
 .collapsible > summary::-webkit-details-marker {
@@ -389,18 +697,33 @@ td.path {
 }
 
 .collapsible > summary:hover {
-  background: rgba(79, 140, 255, 0.06);
+  background: var(--acento-suave);
 }
 
 .collapsible > summary h3 {
   display: inline;
   margin: 0;
-  color: var(--text);
-  text-transform: none;
+  flex: 1;
+}
+
+.collapsible > summary::after {
+  content: "▾";
+  color: var(--text-tenue);
+  font-size: 12px;
+}
+
+.collapsible[open] > summary::after {
+  content: "▴";
 }
 
 .collapsible .hint,
-.collapsible .volumes-table {
-  margin: 0 14px 14px;
-  width: calc(100% - 28px);
+.collapsible .volumes-table,
+.collapsible .row {
+  margin-left: 16px;
+  margin-right: 16px;
+  width: calc(100% - 32px);
+}
+
+.collapsible > .volumes-table {
+  margin-bottom: 16px;
 }

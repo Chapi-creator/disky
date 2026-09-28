@@ -7,9 +7,10 @@
 //! "¿qué creció?" sin lógica duplicada: el diff usa las mismas funciones puras
 //! que el resto del dominio.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
-use crate::domain::UsageSample;
+use crate::domain::{growth_between, GrowthReport, UsageSample};
 use crate::platform::path_norm::normalize_path_separators;
 
 /// Estadística roll-up de un directorio, emitida cuando su subárbol terminó.
@@ -176,6 +177,22 @@ pub trait SnapshotStore {
     /// si la consulta falla.
     fn load_dir_samples(&self, snapshot_id: u64) -> Result<Vec<UsageSample>, StoreError>;
 
+    /// Recorre los directorios de un snapshot **en streaming**, en orden
+    /// ascendente de `path`, llamando a `on_sample` por cada uno.
+    ///
+    /// Complementa a [`SnapshotStore::load_dir_samples`] para cuando no hace
+    /// falta tener el snapshot entero en memoria: el diff de crecimiento, por
+    /// ejemplo, solo se queda con el top-N de un lado.
+    ///
+    /// # Errors
+    /// [`StoreError::UnknownSnapshot`] si el id no existe; [`StoreError::Db`]
+    /// si la consulta falla.
+    fn for_each_dir_sample(
+        &self,
+        snapshot_id: u64,
+        on_sample: &mut dyn FnMut(UsageSample),
+    ) -> Result<(), StoreError>;
+
     /// Serie temporal de `folder` bajo `root`: sus tamaños en los últimos
     /// `limit` snapshots, en orden temporal ascendente. Los snapshots donde la
     /// carpeta no existía simplemente no aportan punto.
@@ -293,6 +310,117 @@ pub fn match_by_path<'a>(
         .collect()
 }
 
+/// Acumula el top-`limit` del diff emparejando por ruta cada muestra del
+/// snapshot viejo con el nuevo, **sin materializar el lado viejo**.
+///
+/// Sustituye a [`match_by_path`] + [`crate::domain::growth_ranking`] cuando los
+/// snapshots son grandes: en lugar de dos `Vec` completos más un `HashMap` con
+/// todas las rutas, solo hace falta el lado nuevo (ordenado por ruta, como lo
+/// entrega el store) y un heap de `limit` filas. El resultado es idéntico,
+/// incluido el desempate por el orden de la serie nueva.
+///
+/// El lado nuevo debe venir **ordenado por `path`** (lo que ya garantiza
+/// [`SnapshotStore::load_dir_samples`]); el viejo puede llegar en cualquier
+/// orden, incluso en streaming.
+pub struct GrowthTop<'a> {
+    /// Lado nuevo, ordenado por `path`.
+    new_sorted: &'a [UsageSample],
+    /// Tope de filas conservadas (las de mayor delta).
+    limit: usize,
+    /// Max-heap cuya cima es siempre la peor fila (ver [`HeapEntry::cmp`]).
+    heap: BinaryHeap<HeapEntry>,
+}
+
+/// Entrada del heap interno de [`GrowthTop`].
+///
+/// Compara **solo** por `(delta, orden)`; el `report` viaja dentro para no
+/// tener que reconstruirlo, pero no participa del orden (por eso `Ord` y `Eq`
+/// son manuales y coherentes entre sí).
+#[derive(Debug)]
+struct HeapEntry {
+    /// Delta de la fila (`new − old`).
+    delta: i64,
+    /// Posición en la serie nueva: desempata como el sort estable del ranking.
+    order: usize,
+    /// La fila ya construida.
+    report: GrowthReport,
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Orden invertido a propósito: la cima del max-heap es SIEMPRE la peor
+        // fila (delta más pequeño y, a igual delta, la de orden mayor), así que
+        // `pop()` descarta justo la que no entra en el top-`limit`.
+        other
+            .delta
+            .cmp(&self.delta)
+            .then_with(|| self.order.cmp(&other.order))
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for HeapEntry {}
+
+impl<'a> GrowthTop<'a> {
+    /// Crea el acumulador sobre el lado nuevo ya ordenado por ruta.
+    #[must_use]
+    pub fn new(new_sorted: &'a [UsageSample], limit: usize) -> Self {
+        Self {
+            new_sorted,
+            limit,
+            heap: BinaryHeap::new(),
+        }
+    }
+
+    /// Incorpora una muestra del snapshot viejo.
+    ///
+    /// Las rutas que solo existen en el viejo se descartan, igual que en
+    /// [`match_by_path`].
+    pub fn push(&mut self, old: &UsageSample) {
+        // Bisección en vez de `HashMap`: el lado nuevo ya está ordenado. No hay
+        // ruta duplicada dentro de un snapshot (PK `(snapshot_id, path)`).
+        let Ok(index) = self
+            .new_sorted
+            .binary_search_by(|new| new.path.as_str().cmp(old.path.as_str()))
+        else {
+            return;
+        };
+        let Ok(report) = growth_between(old, &self.new_sorted[index]) else {
+            return;
+        };
+        self.heap.push(HeapEntry {
+            delta: report.delta_bytes,
+            order: index,
+            report,
+        });
+        if self.heap.len() > self.limit {
+            self.heap.pop();
+        }
+    }
+
+    /// Ranking descendente por delta, con el mismo desempate que
+    /// [`crate::domain::growth_ranking`].
+    #[must_use]
+    pub fn finish(self) -> Vec<GrowthReport> {
+        let mut entries = self.heap.into_vec();
+        // El `Ord` de [`HeapEntry`] es «peor = mayor», así que ascendente da
+        // el mejor primero: delta descendente y, a igual delta, orden ascendente.
+        entries.sort();
+        entries.into_iter().map(|entry| entry.report).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::cast_possible_wrap)]
@@ -329,6 +457,57 @@ mod tests {
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0.path, "C:\\A");
         assert_eq!(pairs[1].0.path, "C:\\B");
+    }
+
+    #[test]
+    fn growth_top_matches_the_batch_ranking() {
+        let old = vec![
+            sample("C:\\A", BASE, 100),
+            sample("C:\\B", BASE, 500),
+            sample("C:\\SoloVieja", BASE, 999),
+        ];
+        let mut new = vec![
+            sample("C:\\A", BASE + 60, 700),
+            sample("C:\\B", BASE + 60, 500),
+            sample("C:\\SoloNueva", BASE + 60, 10_000),
+        ];
+        new.sort_by(|a, b| a.path.cmp(&b.path));
+
+        // El atajo en streaming debe dar exactamente lo mismo que la vía por
+        // lotes (mismas filas, orden y descarte de rutas de un solo lado).
+        let expected = growth_ranking(&match_by_path(&old, &new));
+        let mut top = GrowthTop::new(&new, 50);
+        for s in old {
+            top.push(&s);
+        }
+
+        assert_eq!(top.finish(), expected);
+    }
+
+    #[test]
+    fn growth_top_keeps_only_the_biggest_deltas() {
+        let mut new = vec![
+            sample("C:\\A", BASE + 60, 10),
+            sample("C:\\B", BASE + 60, 20),
+            sample("C:\\C", BASE + 60, 30),
+        ];
+        new.sort_by(|a, b| a.path.cmp(&b.path));
+        let old = vec![
+            sample("C:\\A", BASE, 1),
+            sample("C:\\B", BASE, 2),
+            sample("C:\\C", BASE, 3),
+        ];
+
+        // Deltas +9, +18 y +27: con tope 1 solo sobrevive C.
+        let mut top = GrowthTop::new(&new, 1);
+        for s in old {
+            top.push(&s);
+        }
+        let rows = top.finish();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "C:\\C");
+        assert_eq!(rows[0].delta_bytes, 27);
     }
 
     #[test]

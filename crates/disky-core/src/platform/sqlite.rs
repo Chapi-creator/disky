@@ -82,6 +82,28 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Verifica que el snapshot exista.
+    ///
+    /// Un id borrado (podado entre medidas) debe dar un error explícito en vez
+    /// de una lista vacía indistinguible de "escaneo sin carpetas".
+    ///
+    /// # Errors
+    /// [`StoreError::UnknownSnapshot`] si el id no está en la tabla.
+    fn ensure_snapshot(&self, snapshot_id: u64) -> Result<(), StoreError> {
+        let exists: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM snapshots WHERE id = ?1",
+                [to_db(snapshot_id)],
+                |row| row.get(0),
+            )
+            .map_err(db_err("verificando snapshot"))?;
+        if exists == 0 {
+            return Err(StoreError::UnknownSnapshot(snapshot_id));
+        }
+        Ok(())
+    }
+
     /// Crea el esquema si no existe y verifica la versión.
     fn migrate(conn: &Connection) -> Result<(), StoreError> {
         conn.execute_batch(
@@ -224,32 +246,37 @@ impl SnapshotStore for SqliteStore {
     }
 
     fn load_dir_samples(&self, snapshot_id: u64) -> Result<Vec<UsageSample>, StoreError> {
-        let exists: i64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM snapshots WHERE id = ?1",
-                [to_db(snapshot_id)],
-                |row| row.get(0),
-            )
-            .map_err(db_err("verificando snapshot"))?;
-        if exists == 0 {
-            return Err(StoreError::UnknownSnapshot(snapshot_id));
-        }
+        self.ensure_snapshot(snapshot_id)?;
         let mut stmt = self
             .conn
-            .prepare("SELECT path, started_at, size_bytes FROM dirs d JOIN snapshots s ON s.id = d.snapshot_id WHERE d.snapshot_id = ?1 ORDER BY d.path")
+            .prepare(DIRS_BY_PATH_SQL)
             .map_err(db_err("preparando consulta de dirs"))?;
         let rows = stmt
-            .query_map([to_db(snapshot_id)], |row| {
-                Ok(UsageSample {
-                    path: row.get(0)?,
-                    measured_at: row.get(1)?,
-                    size_bytes: non_neg(row.get::<_, i64>(2)?),
-                })
-            })
+            .query_map([to_db(snapshot_id)], map_dir_sample)
             .map_err(db_err("leyendo dirs"))?;
         rows.map(|row| row.map_err(db_err("leyendo fila de dir")))
             .collect()
+    }
+
+    fn for_each_dir_sample(
+        &self,
+        snapshot_id: u64,
+        on_sample: &mut dyn FnMut(UsageSample),
+    ) -> Result<(), StoreError> {
+        self.ensure_snapshot(snapshot_id)?;
+        let mut stmt = self
+            .conn
+            .prepare(DIRS_BY_PATH_SQL)
+            .map_err(db_err("preparando consulta de dirs"))?;
+        let mut rows = stmt
+            .query([to_db(snapshot_id)])
+            .map_err(db_err("leyendo dirs"))?;
+        // Una fila (y su `String`) viva a la vez: el llamador decide qué
+        // conservar, así que el snapshot completo nunca se materializa.
+        while let Some(row) = rows.next().map_err(db_err("leyendo fila de dir"))? {
+            on_sample(map_dir_sample(row).map_err(db_err("leyendo fila de dir"))?);
+        }
+        Ok(())
     }
 
     fn folder_series(
@@ -559,6 +586,24 @@ impl DirWriter for SqliteDirWriter<'_> {
 }
 
 /// Convierte un `i64` de la BD en `u64` (los conteos/tamaños nunca son negativos).
+/// Consulta canónica de los directorios de un snapshot, **ordenada por ruta**.
+///
+/// Ese orden es el contrato que asume [`crate::domain::scan::GrowthTop`] para
+/// emparejar por bisección sin materializar el snapshot.
+const DIRS_BY_PATH_SQL: &str = "SELECT path, started_at, size_bytes FROM dirs d \
+     JOIN snapshots s ON s.id = d.snapshot_id \
+     WHERE d.snapshot_id = ?1 ORDER BY d.path";
+
+/// Mapea una fila de `dirs` a [`UsageSample`] (mismo layout en las dos
+/// consultas de directorios del store).
+fn map_dir_sample(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageSample> {
+    Ok(UsageSample {
+        path: row.get(0)?,
+        measured_at: row.get(1)?,
+        size_bytes: non_neg(row.get::<_, i64>(2)?),
+    })
+}
+
 fn non_neg(value: i64) -> u64 {
     u64::try_from(value).unwrap_or_default()
 }
@@ -881,6 +926,42 @@ mod tests {
             .folder_series("C:/Mix", "C:/Mix/Sub", 10)
             .expect("serie 2");
         assert_eq!(series.len(), 2);
+    }
+
+    #[test]
+    fn for_each_dir_sample_streams_the_same_rows_as_the_full_load() {
+        let (_tmp, mut store) = open_tmp();
+        let mut writer = store.open_writer("C:\\S", 1).expect("writer");
+        writer
+            .write_dirs(&[
+                DirStat {
+                    path: "C:\\S\\B".into(),
+                    size_bytes: 2,
+                    mtime_unix: 0,
+                    files: 1,
+                },
+                DirStat {
+                    path: "C:\\S\\A".into(),
+                    size_bytes: 1,
+                    mtime_unix: 0,
+                    files: 1,
+                },
+            ])
+            .expect("escribir");
+        let id = writer.finish(ScanTotals::default(), 0).expect("finish");
+
+        // El streaming entrega las mismas filas y en el mismo orden por ruta.
+        let mut streamed: Vec<UsageSample> = Vec::new();
+        store
+            .for_each_dir_sample(id, &mut |sample| streamed.push(sample))
+            .expect("streaming");
+        assert_eq!(streamed, store.load_dir_samples(id).expect("carga"));
+
+        // Un id inexistente es un error explícito, no una lista vacía.
+        assert_eq!(
+            store.for_each_dir_sample(id + 99, &mut |_| {}),
+            Err(StoreError::UnknownSnapshot(id + 99))
+        );
     }
 
     #[test]

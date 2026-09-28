@@ -1,6 +1,6 @@
-# disky — ¿qué creció en mi disco?
+<p align="center"><img src="docs/logo/wordmark.png" alt="disky — el disco como bolsa" width="560"></p>
 
-<p align="center"><img src="docs/logo/logo.png" alt="disky" width="160"></p>
+<p align="center"><strong>¿Qué creció en mi disco y por culpa de quién?</strong></p>
 
 WinDirStat te dice cuánto pesa cada carpeta *hoy*. disky te dice **qué creció
 desde la semana pasada y por culpa de quién**: *"Discord creció 6 GB en 3 días"*.
@@ -9,11 +9,48 @@ Solo lectura, 100% local, sin servidores.
 
 ## Capturas
 
+> Las capturas son de la piel anterior (acento azul). La app ya usa la identidad
+> de abajo; para regenerarlas, abre la app y corre `scripts/captura.ps1`.
+
 ![Vista completa de disky](docs/screenshots/app-completa.png)
 
-![Treemap: el área de cada rectángulo es su tamaño; verde creció, naranja se encogió](docs/screenshots/treemap.png)
+![Treemap: el área de cada rectángulo es su tamaño; verde creció, rojo se encogió](docs/screenshots/treemap.png)
 
 ![Timeline de crecimiento comparado](docs/screenshots/timeline-crecimiento.png)
+
+## La identidad: el disco como bolsa
+
+disky no es un panel de ajustes, es una **cinta de cotizaciones**. La idea que
+lo justifica es que el disco cotiza: cada carpeta es un activo, y lo que importa
+no es cuánto pesa, sino **cuánto cambió**. La interfaz entera sale de ahí.
+
+- Casi negro de fondo, para que manden las cifras.
+- **Todo número va en monoespaciada con cifras tabulares**: se alinean en columna
+  y se comparan de un vistazo.
+- La columna **Δ** lleva flecha, signo y una barra de magnitud proporcional al
+  mayor delta de la tabla. Es el corazón de la cinta.
+- El color tiene reglas estrictas, porque un color que significa dos cosas no
+  significa ninguna:
+
+| Token | Color | Qué significa |
+|---|---|---|
+| `--alza` | verde `#2fdc75` | **creció** desde el escaneo anterior |
+| `--baja` | rojo `#ff4d6d` | **se encogió** |
+| `--plano` | gris `#3d4959` | sin cambios medidos |
+| `--acento` | ámbar `#f2b23c` | la marca y lo estructural: la acción principal, la astilla de sección, el logo |
+| `--error` | rojo `#ff4d4d` | un fallo real (unidad ilegible), **no** "se encogió" |
+
+**La dirección nunca depende del color:** siempre va con flecha (`▲`/`▼`) y
+signo. Verde y rojo son justo el par que peor se distingue con daltonismo, y la
+cinta tiene que leerse sin él.
+
+El ámbar tampoco significa "creció": significa *disky*. Una fila que pasó el
+umbral de alerta se pinta en ámbar a propósito, porque un crecimiento fuerte no
+es una dirección, es un aviso de la app.
+
+Todo esto vive en `src/styles.css`, que es la fuente de verdad de la paleta. El
+icono y el banner se generan de la misma geometría con
+`python scripts/gen_marca.py`.
 
 ## Estado
 
@@ -101,7 +138,9 @@ Carpeta                          Antes    Ahora      Δ      Por día
 ...\Temp\disky-demo\Docs         5 B      0 B        −5 B    −2 B
 ```
 
-- Δ en **verde** creció, en **naranja** se encogió.
+- Δ en **verde** creció, en **rojo** se encogió, y siempre con `▲`/`▼` y el
+  signo: la dirección se lee aunque el color no ayude.
+- Bajo cada Δ, la barra de la cinta es proporcional al mayor delta de esa tabla.
 - **Por día** normaliza el delta a la distancia entre escaneos.
 - **Clic en cualquier fila** → drill-down: los hijos directos de esa carpeta,
   con su propio delta (y así en profundidad, con enlace «↑ volver»).
@@ -112,6 +151,34 @@ Carpeta                          Antes    Ahora      Δ      Por día
 - Si la ventana está en segundo plano y algún delta supera el umbral
   configurado (MB), salta una **notificación del sistema** con la carpeta
   culpable.
+- El desplegable **mostrar** filtra a *solo lo que creció* o *solo lo que se
+  encogió* (las barras se re-escalan a lo visible).
+- El botón **Exportar CSV** guarda el informe en Descargas (separador `;`, apto
+  para Excel en español) y lo revela en el explorador. Es la única escritura de
+  disky y nunca toca nada escaneado.
+- El **umbral** de alerta y el **filtro** se recuerdan entre sesiones.
+- El diff se calcula **en streaming**: solo se materializa el escaneo más
+  reciente; el anterior se recorre en orden y se empareja por ruta con
+  bisección (`GrowthTop`). Con un `C:` de 226 000 carpetas el top-50 sale
+  idéntico al cálculo por lotes, gastando mucha menos memoria (antes eran dos
+  snapshots completos más un `HashMap` con todas las rutas para quedarse con 50
+  filas).
+
+### Duplicados probables
+
+```
+Archivo        Tamaño   Copias   Desperdicio   Ubicaciones
+backup.iso     40,0 GB      3        80,0 GB   C:\…\backup.iso
+                                               D:\…\backup.iso
+                                               E:\…\backup.iso
+```
+
+- Criba los **archivos grandes (≥ 32 MiB)** que comparten **nombre y tamaño**
+  exactos: los candidatos obvios a duplicado, ordenados por desperdicio
+  (`(copias − 1) × tamaño`).
+- **No es un hash**: mismo nombre y tamaño *sugiere* el mismo contenido, así que
+  puede haber falsos positivos; por eso la app los llama *probables* y cada
+  copia se revela en el explorador para decidir a mano.
 
 ### Treemap
 
@@ -131,7 +198,7 @@ raíz › Torrents › 2026-09            ← breadcrumb
   *squarify*, rectángulos lo más cuadrados posible).
 - **Clic para entrar** a una carpeta; breadcrumb navegable para volver.
 - El nodo sintético `[archivos]` agrupa los ficheros sueltos de la carpeta.
-- **Verde** = creció desde el escaneo anterior, **naranja** = se encogió,
+- **Verde** = creció desde el escaneo anterior, **rojo** = se encogió,
   gris = sin cambios. Se refresca solo tras cada escaneo.
 
 ### Timeline
@@ -180,6 +247,13 @@ abierta):
 
 ```powershell
 powershell -File scripts/captura.ps1 -Nombre treemap   # → docs/screenshots/treemap.png
+```
+
+El icono, el logo y el banner del README se regeneran desde la misma geometría
+de la marca (una sola fuente para los tres):
+
+```bash
+python scripts/gen_marca.py    # → src-tauri/icons/* y docs/logo/*
 ```
 
 ## Roadmap

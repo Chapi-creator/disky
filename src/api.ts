@@ -113,3 +113,14 @@ export interface TimelinePointDto {
   size_bytes: number;
   delta_bytes: number;
 }
+
+/**
+ * Grupo de archivos grandes candidatos a duplicado: comparten nombre y tamaño
+ * exactos. Es un heurístico de criba, no un hash, así que puede haber falsos
+ * positivos (por eso la UI lo etiqueta como «probable»).
+ */
+export interface DuplicateGroup {
+  name: string;
+  size_bytes: number;
+  paths: string[];
+}

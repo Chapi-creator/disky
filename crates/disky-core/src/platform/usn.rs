@@ -44,8 +44,9 @@ const MFT_ENUM_DATA_V1_LEN: usize = 32;
 /// `VISIBLE` (= `ENUM | EMPTY | TERMS`) filtra a los archivos visibles normales.
 const MFT_ENUM_FLAGS_ZERO_ACCESS: u32 = 0x0000_00E1;
 
-/// Estado del USN Journal de un volumen.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// Estado del USN Journal de un volumen. `Deserialize` lo necesita el hijo
+/// elevado, que devuelve el estado al padre por JSON.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[must_use]
 pub struct UsnStatus {
     /// ID del journal (persistente mientras el journal exista).

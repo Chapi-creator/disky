@@ -18,10 +18,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use disky_core::platform::path_norm::{child_prefix, normalize_path_separators};
 use disky_core::{
-    fixed_volume_roots as core_fixed_volume_roots, growth_ranking,
-    list_volumes as core_list_volumes, match_by_path, squarify, walk_tree, DirStat, DirWriter,
-    GrowthReport, LargestDir, LargestFile, MftError, PlatformError, SnapshotStore as _,
-    SnapshotSummary, SqliteStore, TreemapItem, WalkError,
+    fixed_volume_roots as core_fixed_volume_roots, list_volumes as core_list_volumes, squarify,
+    walk_tree, DirStat, DirWriter, GrowthReport, GrowthTop, LargestDir, LargestFile, MftError,
+    PlatformError, SnapshotStore as _, SnapshotSummary, SqliteStore, TreemapItem, WalkError,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -172,7 +171,7 @@ pub fn treemap_nodes(
                     "[archivos]".to_owned()
                 } else {
                     node.path
-                        .rsplit('\\')
+                        .rsplit(std::path::MAIN_SEPARATOR)
                         .next()
                         .unwrap_or(&node.path)
                         .to_owned()
@@ -472,34 +471,135 @@ pub fn growth_report(
     base_id: Option<u64>,
 ) -> Result<Option<GrowthDiff>, String> {
     let store = lock_store(&state.store);
+    build_growth_diff(&store, &root, base_id)
+}
+
+/// Construye el diff de crecimiento de `root` contra la línea base elegida.
+///
+/// `None` cuando la raíz aún no tiene dos escaneos comparables; un `base_id`
+/// inválido cae al snapshot anterior (misma política que el treemap). Extraído
+/// para compartirlo entre [`growth_report`] y [`export_growth_csv`].
+///
+/// # Errors
+/// `String` si una consulta a la base de datos falla.
+fn build_growth_diff(
+    store: &SqliteStore,
+    root: &str,
+    base_id: Option<u64>,
+) -> Result<Option<GrowthDiff>, String> {
     let Some(new_snapshot) = store
-        .list_snapshots(Some(&root), 2)
+        .list_snapshots(Some(root), 2)
         .map_err(|e| e.to_string())?
         .into_iter()
         .next()
     else {
         return Ok(None);
     };
-    let Some(old_snapshot) = old_snapshot(&store, &root, &new_snapshot, base_id)? else {
+    let Some(old_snapshot) = old_snapshot(store, root, &new_snapshot, base_id)? else {
         return Ok(None);
     };
-    let old_samples = store
-        .load_dir_samples(old_snapshot.id)
-        .map_err(|e| e.to_string())?;
+    // Solo se materializa el lado nuevo (ordenado por ruta); el viejo se
+    // recorre en streaming y se empareja por bisección. Antes esto cargaba los
+    // dos snapshots completos más un `HashMap` con todas las rutas para
+    // quedarse con 50 filas: en un `C:` real eran ~100 MB por llamada, y se
+    // ejecuta tras cada escaneo y por cada unidad.
     let new_samples = store
         .load_dir_samples(new_snapshot.id)
         .map_err(|e| e.to_string())?;
-
-    let rows = growth_ranking(&match_by_path(&old_samples, &new_samples))
-        .into_iter()
-        .take(MAX_GROWTH_ROWS)
-        .collect();
+    let mut top = GrowthTop::new(&new_samples, MAX_GROWTH_ROWS);
+    store
+        .for_each_dir_sample(old_snapshot.id, &mut |sample| top.push(&sample))
+        .map_err(|e| e.to_string())?;
 
     Ok(Some(GrowthDiff {
         old: old_snapshot,
         new: new_snapshot,
-        rows,
+        rows: top.finish(),
     }))
+}
+
+/// Escapa un campo para CSV: solo se entrecomilla si contiene un delimitador,
+/// comilla o salto (las rutas de Windows pueden llevar `;` o comillas en el
+/// nombre de un archivo).
+fn csv_field(value: &str) -> String {
+    if value.contains([';', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Serializa un [`GrowthDiff`] a CSV (separador `;`, apto para Excel en
+/// español). Los tamaños van en bytes crudos y además normalizados por día.
+#[must_use]
+pub fn growth_csv(diff: &GrowthDiff) -> String {
+    // `write!` sobre el `String` ya existente evita una asignación por fila.
+    use std::fmt::Write as _;
+
+    let mut out =
+        String::from("Carpeta;Antes (bytes);Ahora (bytes);Delta (bytes);Segundos;Bytes por dia\n");
+    for row in &diff.rows {
+        // Escribir en un `String` no falla nunca; el resultado se descarta.
+        let _ = writeln!(
+            out,
+            "{};{};{};{};{};{:.0}",
+            csv_field(&row.path),
+            row.old_bytes,
+            row.new_bytes,
+            row.delta_bytes,
+            row.elapsed_seconds,
+            row.bytes_per_day(),
+        );
+    }
+    out
+}
+
+/// Sufijo del nombre del informe: raíz saneada (sin separadores de ruta, que
+/// romperían el nombre en Windows) más la marca de tiempo del momento.
+fn csv_stamp(root: &str) -> String {
+    let safe: String = root
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let safe = safe.trim_matches('-');
+    let stamp = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    format!("{}-{stamp}", if safe.is_empty() { "raiz" } else { safe })
+}
+
+/// Escribe el informe de «¿Qué creció?» como CSV en la carpeta de descargas y
+/// devuelve la ruta del archivo (para revelarlo en el explorador).
+///
+/// Es la única escritura de disky, y nunca toca nada escaneado: el informe sale
+/// a Descargas; si no se puede resolver, a la carpeta temporal.
+///
+/// # Errors
+/// `String` si no hay dos escaneos que comparar o el archivo no se puede escribir.
+#[tauri::command]
+pub fn export_growth_csv(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    root: String,
+    base_id: Option<u64>,
+) -> Result<String, String> {
+    let diff = {
+        let store = lock_store(&state.store);
+        build_growth_diff(&store, &root, base_id)?
+    };
+    let Some(diff) = diff else {
+        return Err("Todavía no hay dos escaneos de esta raíz para comparar".into());
+    };
+    let dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().temp_dir())
+        .map_err(|_| "No se pudo ubicar una carpeta para guardar el informe".to_owned())?;
+    let file = dir.join(format!("disky-informe-{}.csv", csv_stamp(&root)));
+    std::fs::write(&file, growth_csv(&diff))
+        .map_err(|e| format!("No se pudo escribir el informe: {e}"))?;
+    Ok(file.display().to_string())
 }
 
 /// Archivos más pesados de un snapshot (los recogió el walker como top-N).
@@ -532,6 +632,30 @@ pub fn search_big_files(
     store
         .search_big_files(snapshot_id, &query, MAX_BIG_RESULTS)
         .map_err(|e| e.to_string())
+}
+
+/// Duplicados probables entre los archivos grandes (≥ 32 MiB) de un snapshot:
+/// mismo nombre y mismo tamaño, agrupados y ordenados por peso.
+///
+/// Es un heurístico de criba, no un hash: reduce el ruido a un puñado de
+/// candidatos que valen la pena mirar, y la UI los etiqueta como tales.
+///
+/// # Errors
+/// `String` si la consulta a la base de datos falla.
+#[tauri::command]
+pub fn find_duplicates(
+    state: State<'_, AppState>,
+    snapshot_id: u64,
+) -> Result<Vec<disky_core::DuplicateGroup>, String> {
+    let store = lock_store(&state.store);
+    // Consulta vacía = índice completo de archivos grandes, por peso: el tope
+    // es el del propio índice, no el de la búsqueda interactiva.
+    let limit = u32::try_from(disky_core::BIG_FILE_MAX).unwrap_or(u32::MAX);
+    let files = store
+        .search_big_files(snapshot_id, "", limit)
+        .map_err(|e| e.to_string())?;
+    drop(store);
+    Ok(disky_core::duplicate_groups(&files))
 }
 
 /// Carpetas más pesadas de un snapshot (roll-up de su subárbol), ordenadas
@@ -622,11 +746,16 @@ fn perform_scan(
     let mut batch: Vec<DirStat> = Vec::with_capacity(DIR_BATCH);
     // El MFT (rápido, segundos) se usa cuando corremos elevados; si no, el
     // walker. Ambos emiten DirStat en post-orden, así que el margen es idéntico.
-    let use_mft = root
-        .chars()
-        .next()
-        .filter(char::is_ascii_alphabetic)
-        .is_some_and(|c| disky_core::mft_available(c.to_ascii_uppercase()));
+    // El MFT indexa el volumen entero: en una subcarpeta las rutas se
+    // reconstruirían desde el prefijo equivocado. Mismo guard que el hijo
+    // elevado (`src/lib.rs::is_volume_root`), para que ningún camino escanee
+    // una subruta con MFT.
+    let use_mft = root_path.parent().is_none()
+        && root
+            .chars()
+            .next()
+            .filter(char::is_ascii_alphabetic)
+            .is_some_and(|c| disky_core::mft_available(c.to_ascii_uppercase()));
     let mut scan_result = if use_mft {
         disky_core::mft_scan(
             root_path,
@@ -752,26 +881,11 @@ fn run_scan(handle: AppHandle, root: String, root_path: PathBuf) {
 
 /// Comparación de los dos snapshots más recientes de `root`, o `None` si hay
 /// menos de dos. Los errores de store se degradan a "sin comparación".
+///
+/// Delega en [`build_growth_diff`] para no tener dos implementaciones del mismo
+/// diff (antes cada una hacía su propia carga completa).
 fn compute_growth(store: &disky_core::SqliteStore, root: &str) -> Option<GrowthDiff> {
-    let snaps = store.list_snapshots(Some(root), 2).ok()?;
-    if snaps.len() < 2 {
-        return None;
-    }
-    let new_snapshot = snaps[0].clone();
-    let old_snapshot = snaps[1].clone();
-    let old_samples = store.load_dir_samples(old_snapshot.id).ok()?;
-    let new_samples = store.load_dir_samples(new_snapshot.id).ok()?;
-
-    let rows = growth_ranking(&match_by_path(&old_samples, &new_samples))
-        .into_iter()
-        .take(MAX_GROWTH_ROWS)
-        .collect();
-
-    Some(GrowthDiff {
-        old: old_snapshot,
-        new: new_snapshot,
-        rows,
-    })
+    build_growth_diff(store, root, None).ok().flatten()
 }
 
 /// Abre una conexión propia para leer el growth (el hilo llamador puede ser el
@@ -1223,8 +1337,50 @@ fn unix_now() -> i64 {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{append_new_bytes, parse_unit_lines, quote_arg};
+    use super::{append_new_bytes, csv_field, growth_csv, parse_unit_lines, quote_arg, GrowthDiff};
     use crate::{append_unit, UnitResult};
+    use disky_core::{GrowthReport, SnapshotSummary};
+
+    #[test]
+    fn csv_field_quotes_only_when_needed() {
+        // Un `;` o una comilla en el nombre de un archivo rompería las columnas.
+        assert_eq!(csv_field("C:\\Users"), "C:\\Users");
+        assert_eq!(csv_field("C:\\a;b"), "\"C:\\a;b\"");
+        assert_eq!(csv_field("di\"r"), "\"di\"\"r\"");
+    }
+
+    #[test]
+    fn growth_csv_has_header_and_one_row_per_folder() {
+        let summary = |id: u64| SnapshotSummary {
+            id,
+            root: "C:\\".into(),
+            started_at: 0,
+            duration_ms: 0,
+            total_files: 0,
+            total_bytes: 0,
+            read_errors: 0,
+        };
+        let diff = GrowthDiff {
+            old: summary(1),
+            new: summary(2),
+            rows: vec![GrowthReport {
+                path: "C:\\A".into(),
+                old_bytes: 100,
+                new_bytes: 400,
+                delta_bytes: 300,
+                elapsed_seconds: 86_400,
+            }],
+        };
+
+        let csv = growth_csv(&diff);
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next(),
+            Some("Carpeta;Antes (bytes);Ahora (bytes);Delta (bytes);Segundos;Bytes por dia")
+        );
+        assert_eq!(lines.next(), Some("C:\\A;100;400;300;86400;300"));
+        assert_eq!(lines.next(), None);
+    }
 
     #[test]
     fn append_new_bytes_ignores_already_read_data() {

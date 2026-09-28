@@ -25,13 +25,49 @@ struct ElevatedResult {
     error: Option<String>,
 }
 
-/// Traza temporal de diagnóstico del hijo elevado (ver dónde se atasca).
-#[cfg(debug_assertions)]
-fn trace_elevated(msg: &str) {
-    eprintln!("[elev] {msg}");
+/// Traza de diagnóstico del hijo elevado.
+///
+/// En release el proceso elevado no tiene consola (`windows_subsystem`), así que
+/// un fallo del escaneo con admin no dejaba rastro alguno. Este log vive junto a
+/// la base de datos (`elevated-last.log`) y se reescribe en cada corrida: es el
+/// sitio donde mirar cuando «el escaneo con admin no hace nada».
+struct ElevatedLog {
+    /// Archivo de traza; `None` si no se pudo resolver (no es fatal).
+    path: Option<std::path::PathBuf>,
 }
-#[cfg(not(debug_assertions))]
-fn trace_elevated(_msg: &str) {}
+
+impl ElevatedLog {
+    /// Prepara la traza junto a `db`, truncando la corrida anterior.
+    ///
+    /// Interesa la última ejecución, no un histórico que crecería sin control.
+    fn beside_db(db: &str) -> Self {
+        if db.is_empty() {
+            return Self { path: None };
+        }
+        let path = std::path::Path::new(db).with_file_name("elevated-last.log");
+        // Best-effort: si no se puede truncar, el `append` de `write` seguirá
+        // funcionando (solo se acumularían líneas de corridas anteriores).
+        let _ = std::fs::write(&path, b"");
+        Self { path: Some(path) }
+    }
+
+    /// Añade una línea a la traza. Nunca tumba el escaneo: el log es auxiliar.
+    fn write(&self, msg: &str) {
+        #[cfg(debug_assertions)]
+        eprintln!("[elev] {msg}");
+        let Some(path) = &self.path else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write as _;
+            let _ = writeln!(file, "{msg}");
+        }
+    }
+}
 
 /// Modo hijo elevado: escanea `root`, guarda el snapshot en la BD indicada y
 /// escribe el resultado en `out`. Devuelve el código de salida del proceso.
@@ -42,7 +78,8 @@ fn trace_elevated(_msg: &str) {}
 #[must_use]
 #[allow(clippy::expect_used)]
 pub fn elevated_scan(root: &str, out: &str, db: &str, cancel_file: &str) -> i32 {
-    trace_elevated("arranca hijo");
+    let log = ElevatedLog::beside_db(db);
+    log.write(&format!("arranca hijo · raiz={root}"));
     let started_at = unix_now();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     watch_cancel_file(cancel_file, &cancel);
@@ -51,7 +88,7 @@ pub fn elevated_scan(root: &str, out: &str, db: &str, cancel_file: &str) -> i32 
         Ok(store) => store,
         Err(error) => return write_single_fail(out, &error),
     };
-    match scan_one_volume(root, &mut store, started_at, &cancel) {
+    match scan_one_volume(root, &mut store, started_at, &cancel, &log) {
         Ok(volume) => {
             write_result(
                 out,
@@ -100,7 +137,8 @@ fn write_single_fail(out: &str, error: &str) -> i32 {
 /// recuperables) y 2 si la base de datos o la enumeración fallaron.
 #[must_use]
 pub fn elevated_scan_all(out: &str, db: &str, cancel_file: &str) -> i32 {
-    trace_elevated("arranca hijo multiunidad");
+    let log = ElevatedLog::beside_db(db);
+    log.write("arranca hijo multiunidad");
     let started_at = unix_now();
 
     let mut store = match open_store(db) {
@@ -135,9 +173,9 @@ pub fn elevated_scan_all(out: &str, db: &str, cancel_file: &str) -> i32 {
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     watch_cancel_file(cancel_file, &cancel);
     for root in roots {
-        let unit = match scan_one_volume(&root, &mut store, started_at, &cancel) {
+        let unit = match scan_one_volume(&root, &mut store, started_at, &cancel, &log) {
             Ok(volume) => {
-                trace_elevated(&format!(
+                log.write(&format!(
                     "{} ok en {} ms",
                     volume.snapshot_id, volume.duration_ms
                 ));
@@ -147,7 +185,7 @@ pub fn elevated_scan_all(out: &str, db: &str, cancel_file: &str) -> i32 {
                 }
             }
             Err(error) => {
-                trace_elevated(&format!("{root} error: {error}"));
+                log.write(&format!("{root} error: {error}"));
                 UnitResult {
                     letter: root,
                     error: Some(error),
@@ -211,6 +249,7 @@ fn scan_one_volume(
     store: &mut disky_core::SqliteStore,
     started_at: i64,
     cancel: &std::sync::atomic::AtomicBool,
+    log: &ElevatedLog,
 ) -> Result<VolumeScan, String> {
     let root_path = std::path::PathBuf::from(root);
     if !root_path.is_dir() {
@@ -240,10 +279,10 @@ fn scan_one_volume(
     };
 
     let totals = if is_volume_root(&root_path) {
-        trace_elevated("antes de mft_scan");
+        log.write("antes de mft_scan");
         match disky_core::mft_scan(&root_path, cancel, &mut push, &mut |_| {}) {
             Ok(totals) => {
-                trace_elevated("mft_scan OK");
+                log.write("mft_scan OK");
                 totals
             }
             // Cancelación real: caer al walker solo repetiría el mismo error.
@@ -252,7 +291,7 @@ fn scan_one_volume(
                 // Los directorios que el MFT alcanzó a escribir los reemite el
                 // walker y `dirs` es PRIMARY KEY: el REPLACE los pisa.
                 let err_label = e.to_string();
-                trace_elevated(&format!("mft_scan: {err_label}; fallback a walker"));
+                log.write(&format!("mft_scan: {err_label}; fallback a walker"));
                 match disky_core::walk_tree(&root_path, cancel, &mut push, &mut |_| {}) {
                     Ok(totals) => totals,
                     // Cancelado: no adornar el error con el fallo del MFT.
@@ -266,7 +305,7 @@ fn scan_one_volume(
     } else {
         // El MFT solo indexa la unidad entera: escanear una subcarpeta con él
         // daría el volumen completo y costaría lo mismo. Para subrutas, walker.
-        trace_elevated("subruta: solo walker");
+        log.write("subruta: solo walker");
         match disky_core::walk_tree(&root_path, cancel, &mut push, &mut |_| {}) {
             Ok(totals) => totals,
             Err(_) if cancel.load(std::sync::atomic::Ordering::Relaxed) => {
@@ -407,9 +446,11 @@ pub fn run() {
             commands::snapshots_list,
             commands::delete_snapshot,
             commands::growth_report,
+            commands::export_growth_csv,
             commands::largest_files,
             commands::largest_dirs,
             commands::search_big_files,
+            commands::find_duplicates,
             commands::treemap_nodes,
             commands::timeline_series,
         ])

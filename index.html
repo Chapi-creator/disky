@@ -5,15 +5,42 @@
     <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>disky — ¿qué creció en mi disco?</title>
+    <meta
+      name="description"
+      content="El disco como bolsa: qué carpeta creció desde tu último escaneo y por culpa de quién."
+    />
     <script type="module" src="/src/main.ts" defer></script>
   </head>
   <body>
     <main class="container">
-      <h1>🔍 disky</h1>
-      <p class="subtitle">¿Qué creció en mi disco?</p>
+      <header class="marca">
+        <!--
+          El logo: una caja (el disco) con barras que suben y una flecha que
+          rompe el techo. Los rellenos salen de los tokens de styles.css.
+        -->
+        <svg
+          class="marca-mark"
+          viewBox="0 0 52 52"
+          role="img"
+          aria-label="disky"
+        >
+          <rect class="mm-caja" x="4" y="4" width="44" height="44" rx="9" />
+          <rect class="mm-b1" x="12" y="33" width="6" height="8" rx="1.5" />
+          <rect class="mm-b2" x="22" y="29" width="6" height="12" rx="1.5" />
+          <rect class="mm-b3" x="32" y="25" width="6" height="16" rx="1.5" />
+          <path class="mm-flecha" d="M13 24 L22 17.5 L29 20 L39.5 11.5" />
+          <path class="mm-flecha" d="M33.5 11.5 L39.5 11.5 L39.5 17.5" />
+        </svg>
+        <div class="marca-texto">
+          <h1>disky</h1>
+          <p class="subtitle">
+            El disco como bolsa: qué creció y por culpa de quién.
+          </p>
+        </div>
+      </header>
 
       <h2>Volúmenes montados</h2>
-      <table class="volumes-table">
+      <table class="volumes-table" aria-label="Volúmenes montados">
         <thead>
           <tr>
             <th>Unidad</th>
@@ -60,7 +87,8 @@
       <h2>Treemap</h2>
       <p class="hint">
         Cada rectángulo es una carpeta hija (área = tamaño). Clic para entrar;
-        verde = creció, naranja = se encogió desde el escaneo anterior.
+        <strong>verde</strong> = creció, <strong>rojo</strong> = se encogió desde
+        el escaneo anterior, gris = sin cambios.
       </p>
       <div class="row crumb" id="treemap-crumb"></div>
       <svg id="treemap" viewBox="0 0 1000 700" role="img" aria-label="Treemap del disco"></svg>
@@ -70,7 +98,7 @@
       <div id="timeline-legend"></div>
 
       <h3>Escaneos guardados</h3>
-      <table class="volumes-table" id="snapshots-table">
+      <table class="volumes-table" id="snapshots-table" aria-label="Escaneos guardados">
         <thead>
           <tr>
             <th>Raíz</th>
@@ -104,7 +132,7 @@
         (o el último de su período), con el cambio desde el anterior, por día y
         desde tu primer escaneo (la línea base).
       </p>
-      <table class="volumes-table" id="history-table">
+      <table class="volumes-table" id="history-table" aria-label="Historial de almacenamiento">
         <thead>
           <tr>
             <th>Cuándo</th>
@@ -126,12 +154,19 @@
           <select id="growth-base" aria-label="Snapshot de línea base">
             <option value="">Anterior</option>
           </select>
+          · mostrar
+          <select id="growth-filter" aria-label="Filtro de filas">
+            <option value="all">Todo</option>
+            <option value="up">Solo lo que creció</option>
+            <option value="down">Solo lo que se encogió</option>
+          </select>
           · alertar si crecieron más de
           <input id="growth-alert-threshold" type="number" min="0" step="100" value="100" aria-label="Umbral de alerta en MB" />
           MB por scan
+          <button type="button" id="growth-export-btn" title="Guardar este informe como CSV en Descargas">Exportar CSV</button>
         </span>
       </h3>
-      <table class="volumes-table" id="growth-table">
+      <table class="volumes-table" id="growth-table" aria-label="¿Qué creció?">
         <thead>
           <tr>
             <th>Carpeta</th>
@@ -156,7 +191,7 @@
           recorrido, así que no agrandan la base de datos. El botón ⌖ de cada
           fila lo revela en el explorador de Windows.
         </p>
-        <table class="volumes-table" id="largest-table">
+        <table class="volumes-table" id="largest-table" aria-label="Archivos más pesados">
           <thead>
             <tr>
               <th>#</th>
@@ -189,7 +224,7 @@
           />
           <button id="big-search-btn" type="button">Buscar</button>
         </div>
-        <table class="volumes-table" id="big-table">
+        <table class="volumes-table" id="big-table" aria-label="Buscar archivos grandes">
           <thead>
             <tr>
               <th>#</th>
@@ -206,6 +241,33 @@
 
       <details class="collapsible">
         <summary>
+          <h3>Duplicados probables</h3>
+          <span class="hint-inline">≥ 32 MiB · mismo nombre y tamaño</span>
+        </summary>
+        <p class="hint">
+          Archivos grandes que comparten nombre y tamaño exactos: candidatos a
+          duplicado, para cribar copias obvias antes de borrar nada. No es un
+          hash, así que puede haber falsos positivos. El botón ⌖ revela cada
+          copia en el explorador.
+        </p>
+        <table class="volumes-table" id="duplicates-table" aria-label="Duplicados probables">
+          <thead>
+            <tr>
+              <th>Archivo</th>
+              <th>Tamaño</th>
+              <th>Copias</th>
+              <th>Desperdicio</th>
+              <th>Ubicaciones</th>
+            </tr>
+          </thead>
+          <tbody id="duplicates">
+            <tr><td colspan="5">Aún no hay escaneos guardados</td></tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details class="collapsible">
+        <summary>
           <h3>Carpetas más pesadas</h3>
           <span class="hint-inline">Top 50 por tamaño · expandir/contraer</span>
         </summary>
@@ -214,7 +276,7 @@
           carpeta incluye todo su subárbol. El botón ⌖ abre la carpeta en el
           explorador de Windows.
         </p>
-        <table class="volumes-table" id="largest-dirs-table">
+        <table class="volumes-table" id="largest-dirs-table" aria-label="Carpetas más pesadas">
           <thead>
             <tr>
               <th>#</th>

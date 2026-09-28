@@ -10,17 +10,21 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "withGlobalTauri": true,
     "windows": [
       {
         "title": "disky",
         "width": 800,
         "height": 600,
-        "backgroundColor": "#0f1115"
+        "backgroundColor": "#06080b"
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "img-src": "'self' asset: http://asset.localhost data:",
+        "style-src": "'unsafe-inline' 'self'"
+      }
     }
   },
   "bundle": {

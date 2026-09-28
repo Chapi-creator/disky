@@ -10,6 +10,8 @@ pub mod usn;
 
 use std::collections::BTreeMap;
 
+use crate::domain::scan::LargestFile;
+
 /// Tipo de unidad según `GetDriveTypeW`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -208,6 +210,79 @@ pub fn rollup_by_child(prefix: &str, samples: &[UsageSample]) -> BTreeMap<String
     rollup
 }
 
+/// Archivos grandes que comparten nombre y tamaño: candidatos a duplicado.
+///
+/// No es un hash: mismo nombre y mismo tamaño *sugiere* el mismo contenido (una
+/// copia en otra carpeta, una descarga repetida), pero puede haber falsos
+/// positivos. Se etiqueta como candidato en la UI, nunca como certeza.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[must_use]
+pub struct DuplicateGroup {
+    /// Nombre del archivo (último componente de la ruta, la primera vista).
+    pub name: String,
+    /// Tamaño de cada copia, en bytes.
+    pub size_bytes: u64,
+    /// Rutas absolutas de todas las copias del grupo (ordenadas).
+    pub paths: Vec<String>,
+}
+
+impl DuplicateGroup {
+    /// Bytes recuperables si se conserva una sola copia (`(n − 1) × tamaño`).
+    #[must_use]
+    pub fn wasted_bytes(&self) -> u64 {
+        let copies = u64::try_from(self.paths.len()).unwrap_or(u64::MAX);
+        self.size_bytes.saturating_mul(copies.saturating_sub(1))
+    }
+}
+
+/// Agrupa archivos por `(tamaño, nombre sin distinguir mayúsculas)` y devuelve
+/// solo los grupos con **dos o más copias**, ordenados por tamaño descendente
+/// (los duplicados grandes primero, que son los que valen la pena revisar).
+///
+/// El nombre se toma con el separador nativo: en Windows el `\` de una ruta no
+/// es parte del nombre, así que no se confunden dos archivos de carpetas
+/// distintas con nombres iguales.
+#[must_use]
+pub fn duplicate_groups(files: &[LargestFile]) -> Vec<DuplicateGroup> {
+    let mut groups: std::collections::HashMap<(u64, String), (String, Vec<String>)> =
+        std::collections::HashMap::new();
+
+    for file in files {
+        let name = file
+            .path
+            .rsplit(std::path::MAIN_SEPARATOR)
+            .next()
+            .unwrap_or(&file.path);
+        let key = (file.size_bytes, name.to_lowercase());
+        groups
+            .entry(key)
+            .or_insert_with(|| (name.to_owned(), Vec::new()))
+            .1
+            .push(file.path.clone());
+    }
+
+    let mut out: Vec<DuplicateGroup> = groups
+        .into_iter()
+        .filter(|(_, (_, paths))| paths.len() > 1)
+        .map(|((size_bytes, _), (name, mut paths))| {
+            paths.sort();
+            DuplicateGroup {
+                name,
+                size_bytes,
+                paths,
+            }
+        })
+        .collect();
+
+    // A igual tamaño, primero el grupo con más copias (más desperdicio).
+    out.sort_by(|a, b| {
+        b.size_bytes
+            .cmp(&a.size_bytes)
+            .then(b.paths.len().cmp(&a.paths.len()))
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     // En tests, `expect` es idiomático (queremos panic legible) y comparar
@@ -216,6 +291,7 @@ mod tests {
     #![allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
 
     use super::*;
+    use crate::domain::scan::LargestFile;
     use pretty_assertions::assert_eq;
 
     const BASE: i64 = 1_700_000_000;
@@ -346,6 +422,74 @@ mod tests {
             kind: DriveKind::Unknown,
         };
         assert_eq!(empty.usage_percent(), 0.0);
+    }
+
+    #[test]
+    fn duplicates_group_by_name_and_size_ignoring_case() {
+        let files = vec![
+            LargestFile {
+                path: r"C:\A\pelicula.iso".into(),
+                size_bytes: 100,
+                mtime_unix: 0,
+            },
+            LargestFile {
+                path: r"D:\B\PELICULA.ISO".into(),
+                size_bytes: 100,
+                mtime_unix: 0,
+            },
+            // Mismo tamaño, otro nombre: no es duplicado.
+            LargestFile {
+                path: r"C:\A\otro.bin".into(),
+                size_bytes: 100,
+                mtime_unix: 0,
+            },
+            // Único: no forma grupo.
+            LargestFile {
+                path: r"C:\A\unico.iso".into(),
+                size_bytes: 50,
+                mtime_unix: 0,
+            },
+        ];
+
+        let groups = duplicate_groups(&files);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "pelicula.iso");
+        assert_eq!(groups[0].size_bytes, 100);
+        assert_eq!(groups[0].paths.len(), 2);
+        assert_eq!(groups[0].wasted_bytes(), 100);
+    }
+
+    #[test]
+    fn duplicates_sort_biggest_group_first() {
+        let files = vec![
+            LargestFile {
+                path: r"C:\peque.iso".into(),
+                size_bytes: 10,
+                mtime_unix: 0,
+            },
+            LargestFile {
+                path: r"D:\peque.iso".into(),
+                size_bytes: 10,
+                mtime_unix: 0,
+            },
+            LargestFile {
+                path: r"C:\grande.iso".into(),
+                size_bytes: 9_000,
+                mtime_unix: 0,
+            },
+            LargestFile {
+                path: r"D:\grande.iso".into(),
+                size_bytes: 9_000,
+                mtime_unix: 0,
+            },
+        ];
+
+        let groups = duplicate_groups(&files);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].name, "grande.iso");
+        assert_eq!(groups[0].wasted_bytes(), 9_000);
     }
 
     const GB: u64 = 1_073_741_824;
