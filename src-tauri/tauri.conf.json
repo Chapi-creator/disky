@@ -41,7 +41,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYzMTdEMzM1QjQyRDdFQjIKUldTeWZpMjBOZE1YWS9TWjZHMnQ3eVE3ZFR5VjE1WGtWc2VFdTZqOFBScVNMMzZiWDdpQ0hjN3QK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI2QzhFNzk3RkIzNjg5QjUKUldTMWlUYjdsK2ZJdHFhcjEyTWxPbGJGNENOcnlJSm9kQzlNTkpWTEdIL3VQQTlpSjhwUkRMQlgK",
       "endpoints": [
         "https://github.com/Chapi-creator/disky/releases/latest/download/latest.json"
       ]

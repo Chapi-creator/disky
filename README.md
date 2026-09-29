@@ -337,9 +337,10 @@ escritorio.
 npm run tauri build        # genera instalador NSIS + ejecutable
 ```
 
-Artefactos en `target/release/bundle/nsis/`. Nota: sin certificado de firma
-código, SmartScreen mostrará una advertencia la primera vez — es molestia,
-no bloqueo (ver estrategia de costos en el backlog).
+Artefactos en `target/release/bundle/nsis/`. Nota: sin certificado de firma de
+código, SmartScreen mostrará una advertencia la primera vez — es molestia, no
+bloqueo. Eso y el auto-actualizador son cosas distintas: el updater va con
+firma minisign propia y sí es gratis (ver abajo).
 
 ### Releases automáticas (CI)
 
@@ -351,16 +352,28 @@ git tag v0.1.0 && git push origin v0.1.0
 #   disky_0.1.0_x64-setup.exe (NSIS) y disky_0.1.0_x64_en-US.msi
 ```
 
-El workflow (`.github/workflows/release.yml`) valida que el tag coincida con
-la versión de `tauri.conf.json` antes de compilar (fail fast) y genera las
-notas de release automáticamente.
+El workflow (`.github/workflows/release.yml`) valida antes de compilar (fail
+fast) que el tag coincida con la versión de `tauri.conf.json` y que el secret
+con la clave de firma decodifique como clave minisign: así un secret mal pegado
+no se descubre tras diez minutos de compilación.
 
-### Actualizaciones automáticas
+### Actualizaciones automáticas (gratis)
 
 Al arrancar, disky consulta el `latest.json` de la última release y, si hay
 versión nueva, ofrece instalarla en caliente (NSIS, sin reinstalar a mano).
-La app verifica la firma minisign de cada artefacto con la clave pública
+La app verifica la firma **minisign** de cada artefacto con la clave pública
 embebida en `tauri.conf.json`.
+
+Ojo con la confusión de nombres, porque son dos firmas diferentes:
+
+| | Qué evita | Precio |
+|---|---|---|
+| **Firma de código** (Authenticode) | El aviso de SmartScreen al instalar | Certificado anual, **no** se usa aquí |
+| **Firma del updater** (minisign) | Que alguien inyecte un instalador falso | Clave propia en tu máquina, **gratis** |
+
+Solo la primera cuesta dinero. La segunda es la que consume la app al
+actualizarse y basta con que la clave pública del binario y la privada que
+firma en CI sean la misma pareja.
 
 Para que CI pueda firmar hacen falta dos secrets del repositorio
 (**Settings → Secrets and variables → Actions**):
@@ -368,11 +381,19 @@ Para que CI pueda firmar hacen falta dos secrets del repositorio
 | Secret | Valor |
 |---|---|
 | `TAURI_SIGNING_PRIVATE_KEY` | Contenido de `src-tauri/.tauri/disky.key` (nunca al repo) |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Contraseña con la que se generó esa clave |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Su contraseña; **vacío** si la clave se generó sin una |
 
-La clave se genera una vez con `npm run tauri signer generate -w
-src-tauri/.tauri/disky.key`; si se pierde, las actualizaciones firmadas dejan
-de poder publicarse (los instaladores de la release siguen valiendo).
+La clave se genera una vez, sin contraseña (no hay nada que guardar aparte):
+
+```bash
+npx tauri signer generate -w src-tauri/.tauri/disky.key -p "" -f
+```
+
+El `.pub` resultante se copia en `plugins.updater.pubkey` de
+`tauri.conf.json`. Si la clave se pierde hay que regenerar la pareja y
+actualizar el `.pub`: las instalaciones antiguas no podrán verificar las firmas
+nuevas y necesitarán una instalación manual **una sola vez** — los instaladores
+de la release siguen valiendo siempre.
 
 ## Calidad
 
@@ -385,8 +406,9 @@ npx tsc --noEmit                                         # typecheck del fronten
 
 CI (`.github/workflows/ci.yml`): formato, clippy estricto y los tests del core
 en un runner Windows estándar, y el frontend (tsc + build) en uno de Linux.
-Los tests de integración que exigen acesso al dispositivo (`#[ignore]`) se
+Los tests de integración que exigen acceso al dispositivo (`#[ignore]`) se
 corren aparte, en una máquina local elevada: `cargo test -p disky-core --
 --include-ignored`.
 Releases (`.github/workflows/release.yml`): tag `v*` → instaladores NSIS/MSI
-adjuntos a la GitHub Release.
+adjuntos a la GitHub Release, junto con los `.sig` y el `latest.json` que
+consume el auto-actualizador.

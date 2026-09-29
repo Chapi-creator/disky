@@ -44,19 +44,42 @@ jobs:
       - name: Instalar dependencias
         run: npm ci
 
-      # tauri-action: compila, firma (claves en secrets) y sube NSIS + MSI +
-      # los .sig y el latest.json que consume el auto-updater de la app.
+      # La firma que falla en silencio cuando el secret está mal pegado (ruta o
+      # `.pub` en lugar de la clave). Vale más descubrirlo aquí que tras 10 min
+      # de compilación: usa el mismo formato que espera el firmador de Tauri.
+      - name: La clave del auto-actualizador decodifica
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          KEY=$(printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" | tr -d '\r\n')
+          if [ -z "$KEY" ]; then
+            echo "::error::Falta el secret TAURI_SIGNING_PRIVATE_KEY."
+            exit 1
+          fi
+          if ! printf '%s' "$KEY" | base64 -d 2>/dev/null | head -1 | grep -q '^untrusted comment: rsign'; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY no es una clave minisign"
+            echo "::error::(¿pegaste la ruta del archivo, o el contenido de disky.key.pub?)."
+            exit 1
+          fi
+
+      # tauri-action: compila, firma los artefactos del auto-actualizador
+      # (clave minisign en secrets: NO es firma de código Authenticode) y sube
+      # NSIS + MSI + los .sig y el latest.json que consulta la app al arrancar.
       - name: Build de Tauri y publicación (tauri-action)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # Vacío a propósito: la clave se generó sin contraseña.
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: disky ${{ github.ref_name }}
           releaseBody: |
-            Instaladores firmados (NSIS + MSI) y artefactos de auto-actualización.
+            Instaladores NSIS + MSI sin firma de código, así que SmartScreen avisará
+            la primera vez («Más información» → «Ejecutar de todas formas»).
+            Incluye los artefactos firmados que consume el auto-actualizador.
           prerelease: false
           tauriScript: npm run tauri
 
