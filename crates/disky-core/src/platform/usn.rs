@@ -148,11 +148,35 @@ fn pack_read_request(journal_id: u64, start_usn: i64) -> [u8; 44] {
     buf[0..8].copy_from_slice(&start_usn.to_le_bytes()); // StartUsn
     buf[8..12].copy_from_slice(&u32::MAX.to_le_bytes()); // ReasonMask: todos
     buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // ReturnOnlyOnClose: 0
-    buf[16..24].copy_from_slice(&0u64.to_le_bytes()); // Timeout: 0 (no espera)
+    buf[16..24].copy_from_slice(&0i64.to_le_bytes()); // Timeout: 0 (no espera)
     buf[24..32].copy_from_slice(&0u64.to_le_bytes()); // BytesToWaitFor: 0 (ya)
     buf[32..40].copy_from_slice(&journal_id.to_le_bytes()); // UsnJournalID
     buf[40..42].copy_from_slice(&2u16.to_le_bytes()); // MinMajorVersion
     buf[42..44].copy_from_slice(&2u16.to_le_bytes()); // MaxMajorVersion
+    buf
+}
+
+/// Versión parametrizada para el diagnóstico: máscara, espera y versiones
+/// configurables; `versions=false` empaqueta el V0 de 40 bytes.
+fn pack_read_request_ex(
+    journal_id: u64,
+    start_usn: i64,
+    reason_mask: u32,
+    timeout: i64,
+    wait_bytes: u64,
+    versions: bool,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; if versions { 44 } else { 40 }];
+    buf[0..8].copy_from_slice(&start_usn.to_le_bytes()); // StartUsn
+    buf[8..12].copy_from_slice(&reason_mask.to_le_bytes()); // ReasonMask
+    buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // ReturnOnlyOnClose: 0
+    buf[16..24].copy_from_slice(&timeout.to_le_bytes()); // Timeout
+    buf[24..32].copy_from_slice(&wait_bytes.to_le_bytes()); // BytesToWaitFor
+    buf[32..40].copy_from_slice(&journal_id.to_le_bytes()); // UsnJournalID
+    if versions {
+        buf[40..42].copy_from_slice(&2u16.to_le_bytes()); // MinMajorVersion
+        buf[42..44].copy_from_slice(&2u16.to_le_bytes()); // MaxMajorVersion
+    }
     buf
 }
 
@@ -232,7 +256,23 @@ pub fn recent_records(
     let back = i64::try_from(READ_BUFFER_BYTES).unwrap_or(i64::MAX);
     let start_usn = status.first_usn.max(status.next_usn.saturating_sub(back));
     let input = pack_read_request(status.journal_id, start_usn);
-    let mut out = vec![0u8; READ_BUFFER_BYTES];
+    let mut records = read_journal_raw(&handle, letter, &input, READ_BUFFER_BYTES)?;
+    if records.len() > max_records {
+        let drop_count = records.len() - max_records;
+        records.drain(..drop_count);
+    }
+    Ok(records)
+}
+
+/// Ejecuta `FSCTL_READ_USN_JOURNAL` con un input ya empaquetado y devuelve los
+/// registros parseados. El `out_len` dimensiona el buffer de salida.
+fn read_journal_raw(
+    handle: &VolumeHandle,
+    letter: char,
+    input: &[u8],
+    out_len: usize,
+) -> Result<Vec<JournalRecord>, PlatformError> {
+    let mut out = vec![0u8; out_len];
     let mut returned = 0u32;
 
     unsafe {
@@ -254,12 +294,80 @@ pub fn recent_records(
 
     // Solo los bytes que el kernel realmente escribió; el resto es relleno.
     let written = (returned as usize).min(out.len());
-    let (_next_usn, mut records) = parse_usn_batch(&out[..written]);
-    if records.len() > max_records {
-        let drop_count = records.len() - max_records;
-        records.drain(..drop_count);
+    Ok(parse_usn_batch(&out[..written]).1)
+}
+
+/// Diagnóstico de un `FSCTL_READ_USN_JOURNAL` rebelde: el kernel no dice QUÉ
+/// parámetro rechaza con el 87, así que se prueba una matriz de variantes
+/// (tamaño del input, máscara, ventana, espera, buffer) y se reporta cada
+/// resultado. Lo consume el modo `--elevated-diag-usn`.
+#[must_use]
+pub fn diag_usn_variants(letter: char) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let handle = match VolumeHandle::open(letter) {
+        Ok(handle) => handle,
+        Err(error) => {
+            out.push(("open".to_owned(), format!("err:{error}")));
+            return out;
+        }
+    };
+    let status = match query_status(&handle, letter) {
+        Ok(status) => {
+            out.push((
+                "query_56".to_owned(),
+                format!(
+                    "ok:first={} next={} max={} size={}",
+                    status.first_usn, status.next_usn, status.max_usn, status.max_size
+                ),
+            ));
+            status
+        }
+        Err(error) => {
+            out.push(("query_56".to_owned(), format!("err:{error}")));
+            return out;
+        }
+    };
+    let back = i64::try_from(READ_BUFFER_BYTES).unwrap_or(i64::MAX);
+    let tail = status.first_usn.max(status.next_usn.saturating_sub(back));
+    let variants: Vec<(String, Vec<u8>, usize)> = vec![
+        (
+            "read_v1_44_tail".to_owned(),
+            pack_read_request(status.journal_id, tail).to_vec(),
+            READ_BUFFER_BYTES,
+        ),
+        (
+            "read_v0_40_tail".to_owned(),
+            pack_read_request_ex(status.journal_id, tail, u32::MAX, 0, 0, false),
+            READ_BUFFER_BYTES,
+        ),
+        (
+            "read_v1_44_first".to_owned(),
+            pack_read_request(status.journal_id, status.first_usn).to_vec(),
+            READ_BUFFER_BYTES,
+        ),
+        (
+            "read_v1_44_mask0".to_owned(),
+            pack_read_request_ex(status.journal_id, tail, 0, 0, 0, true),
+            READ_BUFFER_BYTES,
+        ),
+        (
+            "read_v1_44_small_out".to_owned(),
+            pack_read_request(status.journal_id, tail).to_vec(),
+            64 * 1024,
+        ),
+        (
+            "read_v1_44_wait".to_owned(),
+            pack_read_request_ex(status.journal_id, tail, u32::MAX, 1000, 1, true),
+            READ_BUFFER_BYTES,
+        ),
+    ];
+    for (name, input, out_len) in variants {
+        match read_journal_raw(&handle, letter, &input, out_len) {
+            Ok(records) => out.push((name, format!("ok:{} registros", records.len()))),
+            Err(error) => out.push((name, format!("err:{error}"))),
+        }
     }
-    Ok(records)
+    out
 }
 
 /// Motivos por los que la lista de cambios recientes no se pudo construir.

@@ -42,6 +42,12 @@ fn main() {
         std::process::exit(disky_lib::elevated_usn(letter, out, limit));
     }
 
+    if args.iter().any(|a| a == "--elevated-diag-usn") {
+        let letter = arg_value(slice, "--elevated-diag-usn").unwrap_or_default();
+        let out = arg_value(slice, "--out").unwrap_or_default();
+        std::process::exit(disky_lib::elevated_diag_usn(letter, out));
+    }
+
     if args.iter().any(|a| a == "--elevated-scan") {
         let root = arg_value(slice, "--elevated-scan").unwrap_or_default();
         let out = arg_value(slice, "--out").unwrap_or_default();

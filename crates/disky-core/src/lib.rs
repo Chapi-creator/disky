@@ -25,6 +25,8 @@ pub use domain::{
 };
 pub use platform::mft::{mft_available, mft_scan, resolve_paths, MftError};
 pub use platform::sqlite::{truncate_wal, SqliteStore};
-pub use platform::usn::{journal_status, recent_changes, recent_records, ChangesError, UsnStatus};
+pub use platform::usn::{
+    diag_usn_variants, journal_status, recent_changes, recent_records, ChangesError, UsnStatus,
+};
 pub use platform::walk::{walk_tree, WalkError};
 pub use platform::{fixed_volume_roots, list_volumes, PlatformError};

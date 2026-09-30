@@ -492,6 +492,22 @@ pub fn elevated_usn(letter: &str, out: &str, limit: usize) -> i32 {
     }
 }
 
+/// Hijo de diagnóstico USN (`--elevated-diag-usn C --out <json>`): corre la
+/// matriz de variantes de parámetros contra el journal y vuelca la tabla de
+/// resultados. El kernel no dice QUÉ parámetro rechaza con el 87, así que se
+/// prueban todos y se lee cuál pasa.
+#[must_use]
+pub fn elevated_diag_usn(letter: &str, out: &str) -> i32 {
+    let letter = letter.chars().next().unwrap_or('C');
+    let variants = disky_core::diag_usn_variants(letter);
+    let rows: Vec<serde_json::Value> = variants
+        .iter()
+        .map(|(name, result)| serde_json::json!({"variant": name, "result": result}))
+        .collect();
+    write_json(out, &rows);
+    0
+}
+
 /// Arranca la aplicación Tauri (punto de entrada real, llamado desde `main`).
 ///
 /// # Panics
