@@ -11,8 +11,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Tamaño mínimo de un registro USN V2: los 64 bytes de campos fijos.
-pub const USN_RECORD_V2_MIN_LEN: usize = 64;
+/// Tamaño mínimo de un registro USN V2: los 60 bytes de campos fijos
+/// (`FileNameLength` y `FileNameOffset` son `u16`, no `u32`: leerlos como u32
+/// devolvía basura y ningún registro real pasaba la validación).
+pub const USN_RECORD_V2_MIN_LEN: usize = 60;
 
 /// Distancia del epoch FILETIME (1601) al epoch UNIX (1970), en unidades de 100 ns.
 /// Referencia: `11_644_473_600` segundos × `10_000_000` unidades/segundo.
@@ -174,8 +176,8 @@ pub fn parse_usn_record_v2(buf: &[u8]) -> Option<(JournalRecord, usize)> {
     let usn = i64::from_le_bytes(buf[24..32].try_into().ok()?);
     let filetime = i64::from_le_bytes(buf[32..40].try_into().ok()?);
     let reasons = u32::from_le_bytes(buf[40..44].try_into().ok()?);
-    let name_len = u32::from_le_bytes(buf[56..60].try_into().ok()?) as usize;
-    let name_off = u32::from_le_bytes(buf[60..64].try_into().ok()?) as usize;
+    let name_len = usize::from(u16::from_le_bytes(buf[56..58].try_into().ok()?));
+    let name_off = usize::from(u16::from_le_bytes(buf[58..60].try_into().ok()?));
 
     let name_end = name_off.checked_add(name_len)?;
     if name_end > record_len || !name_off.is_multiple_of(2) || !name_end.is_multiple_of(2) {
@@ -280,9 +282,9 @@ mod tests {
         buf.extend_from_slice(&0u32.to_le_bytes()); // 44..48 SourceInfo
         buf.extend_from_slice(&0u32.to_le_bytes()); // 48..52 SecurityId
         buf.extend_from_slice(&0u32.to_le_bytes()); // 52..56 FileAttributes
-        let name_len = u32::try_from(name_bytes.len()).expect("nombre de prueba pequeño");
-        buf.extend_from_slice(&name_len.to_le_bytes()); // 56..60
-        buf.extend_from_slice(&64u32.to_le_bytes()); // 60..64 FileNameOffset
+        let name_len = u16::try_from(name_bytes.len()).expect("nombre de prueba pequeño");
+        buf.extend_from_slice(&name_len.to_le_bytes()); // 56..58 (u16, como el kernel)
+        buf.extend_from_slice(&60u16.to_le_bytes()); // 58..60 FileNameOffset
         buf.extend_from_slice(&name_bytes);
         buf
     }
@@ -330,8 +332,8 @@ mod tests {
     #[test]
     fn rejects_name_offset_out_of_bounds() {
         let mut buf = fake_record("a.txt", 1, 1, 1, 0, 0);
-        // FileNameOffset (60..64) más allá del propio registro.
-        buf[60..64].copy_from_slice(&10_000u32.to_le_bytes());
+        // FileNameOffset (58..60, u16) más allá del propio registro.
+        buf[58..60].copy_from_slice(&5000u16.to_le_bytes());
 
         assert_eq!(parse_usn_record_v2(&buf), None);
     }
