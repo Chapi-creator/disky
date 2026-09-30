@@ -28,12 +28,15 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Ioctl::{
-    FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
+    FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, USN_JOURNAL_DATA_V0,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 
-/// Tamaño del struct `USN_JOURNAL_DATA_V0` en bytes (6 campos de 8).
-const USN_JOURNAL_DATA_V0_LEN: usize = 48;
+/// Tamaño del struct `USN_JOURNAL_DATA_V0` en bytes, tomado de la definición
+/// del kernel (7 campos de 8: `MaximumSize` y `AllocationDelta` incluidos). Un
+/// número a mano ya nos costó el error 1784 (`INVALID_USER_BUFFER`): el kernel
+/// rechaza el buffer corto.
+const USN_JOURNAL_DATA_V0_LEN: usize = std::mem::size_of::<USN_JOURNAL_DATA_V0>();
 
 /// Buffer de salida para `FSCTL_READ_USN_JOURNAL` (256 KiB por lote).
 const READ_BUFFER_BYTES: usize = 256 * 1024;
@@ -174,13 +177,21 @@ fn query_status(handle: &VolumeHandle, letter: char) -> Result<UsnStatus, Platfo
         code: win32_code(&e),
     })?;
 
-    Ok(UsnStatus {
-        journal_id: le_u64(&out.0[0..8]),
-        next_usn: le_i64(&out.0[8..16]),
-        first_usn: le_i64(&out.0[16..24]),
-        max_usn: le_i64(&out.0[24..32]),
-        max_size: le_u64(&out.0[32..40]),
-    })
+    Ok(usn_status_from_bytes(&out.0))
+}
+
+/// Lee los campos de `USN_JOURNAL_DATA_V0` en el orden del kernel
+/// (`winioctl.h`): Id, First, Next, Lowest, Max, `MaximumSize`. (Una versión
+/// anterior los leía desplazados un campo y `recent_records` pedía desde el
+/// final del journal: volvía siempre vacío.)
+fn usn_status_from_bytes(out: &[u8]) -> UsnStatus {
+    UsnStatus {
+        journal_id: le_u64(&out[0..8]),
+        first_usn: le_i64(&out[8..16]),
+        next_usn: le_i64(&out[16..24]),
+        max_usn: le_i64(&out[32..40]),
+        max_size: le_u64(&out[40..48]),
+    }
 }
 
 /// Consulta el estado del USN Journal de una unidad (`"C"`, `"d"`, ...).
@@ -355,6 +366,40 @@ mod tests {
     #![allow(clippy::expect_used, clippy::format_push_string, clippy::panic)]
 
     use super::*;
+
+    /// El kernel exige el struct completo (56 bytes): con 48 devolvía 1784
+    /// (`INVALID_USER_BUFFER`) en cada consulta del panel «¿Qué cambió?».
+    #[test]
+    fn journal_data_v0_len_matches_the_kernel_struct() {
+        assert_eq!(USN_JOURNAL_DATA_V0_LEN, 56);
+        assert_eq!(
+            USN_JOURNAL_DATA_V0_LEN,
+            std::mem::size_of::<USN_JOURNAL_DATA_V0>()
+        );
+    }
+
+    /// Orden de campos según `winioctl.h`: Id, First, Next, Lowest, Max,
+    /// `MaximumSize`. Leerlos desplazados (como antes) hacía que
+    /// `recent_records` pidiera desde el final del journal y volviera vacío.
+    #[test]
+    fn status_fields_follow_kernel_order() {
+        let mut out = [0u8; 56];
+        // Id=7, First=100, Next=900, Lowest=50, Max=1000, MaxSize=2MiB.
+        for (i, v) in [7u64, 100, 900, 50, 1000, 2 * 1024 * 1024]
+            .iter()
+            .enumerate()
+        {
+            out[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
+        }
+
+        let status = usn_status_from_bytes(&out);
+
+        assert_eq!(status.journal_id, 7);
+        assert_eq!(status.first_usn, 100);
+        assert_eq!(status.next_usn, 900);
+        assert_eq!(status.max_usn, 1000);
+        assert_eq!(status.max_size, 2 * 1024 * 1024);
+    }
 
     #[test]
     fn recent_changes_rejects_an_invalid_drive_letter() {
