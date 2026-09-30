@@ -375,6 +375,14 @@ fn consider_file_name(attr: &[u8], best: &mut Option<(u8, String, u64, u64, i64)
 
 /// Devuelve los extents (lcn, clusters) del `$MFT` a partir de su registro 0.
 fn mft_extents(rec0: &[u8]) -> Result<Vec<(u64, u64)>, MftError> {
+    let map = data_run_map(rec0)?;
+    parse_runlist(map).ok_or_else(|| MftError::BadMft("run list ilegible".into()))
+}
+
+/// Localiza los mapping pairs del `$DATA` no-residente del registro 0 del
+/// `$MFT`. Separado para poder volcar los bytes crudos en el diagnóstico sin
+/// duplicar el recorrido de atributos.
+fn data_run_map(rec0: &[u8]) -> Result<&[u8], MftError> {
     if rec0.len() < 0x28 || &rec0[0..4] != b"FILE" {
         return Err(MftError::BadMft("registro 0 inválido".into()));
     }
@@ -400,12 +408,9 @@ fn mft_extents(rec0: &[u8]) -> Result<Vec<(u64, u64)>, MftError> {
             let mp_off = usize::from(u16::from_le_bytes(
                 attr[0x20..0x22].try_into().unwrap_or([0; 2]),
             ));
-            let map = attr
+            return attr
                 .get(mp_off..)
-                .ok_or_else(|| MftError::BadMft("run list fuera de rango".into()))?;
-            let runs =
-                parse_runlist(map).ok_or_else(|| MftError::BadMft("run list ilegible".into()))?;
-            return Ok(runs);
+                .ok_or_else(|| MftError::BadMft("run list fuera de rango".into()));
         }
         off += attr_len;
     }
@@ -645,13 +650,26 @@ pub fn diag_mft_index(letter: char) -> Result<String, MftError> {
         "boot={{mft_lcn={} cluster={} record={}}} runs={:?} ",
         info.mft_lcn, info.cluster_bytes, info.record_size, extents
     );
-    // Primeros 64 bytes del primer extent: ¿hay un registro FILE ahí?
+    // Run list crudo (primeros 96 bytes): permite decodificar a mano si los
+    // extents no cuadran con el volumen.
+    if let Ok(map) = data_run_map(&rec0) {
+        let hex: String = map
+            .iter()
+            .take(96)
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = write!(detail, "runhex[{hex}] ");
+    }
+    // Primeros 512 bytes del primer extent (múltiplo de sector, a diferencia
+    // de 64): ¿hay un registro FILE ahí?
     if let Some((lcn, _)) = extents.first() {
-        let mut probe = vec![0u8; 64];
+        let mut probe = vec![0u8; 512];
         let start = lcn.saturating_mul(info.cluster_bytes);
         if read_at(handle.0, start, &mut probe).is_ok() {
             let hex: String = probe
                 .iter()
+                .take(64)
                 .map(|b| format!("{b:02x}"))
                 .collect::<Vec<_>>()
                 .join(" ");
