@@ -265,7 +265,7 @@ fn le_signed(bytes: &[u8]) -> Option<i64> {
 /// Parsea un `FILE_RECORD` y devuelve la entrada si está en uso, no es
 /// extensión y tiene al menos un `$FILE_NAME`. `None` en otro caso.
 #[must_use]
-fn parse_record(raw: &[u8]) -> Option<FileRecord> {
+fn parse_record(raw: &[u8], this_frn: u64) -> Option<FileRecord> {
     if raw.len() < 24 || &raw[0..4] != b"FILE" {
         return None;
     }
@@ -273,9 +273,11 @@ fn parse_record(raw: &[u8]) -> Option<FileRecord> {
     if flags & FLAG_IN_USE == 0 {
         return None;
     }
-    // Registros de extensión (base FRN != -1) pertenecen a otro archivo.
+    // Registro base si apunta a 0 o a sí mismo; cualquier otro valor es un
+    // registro de extensión que pertenece a otro archivo (antes se pedía
+    // `u64::MAX` y no se aceptaba ningún registro real).
     let base = u64::from_le_bytes(raw[0x20..0x28].try_into().ok()?);
-    if base != u64::MAX {
+    if base != 0 && base != this_frn {
         return None;
     }
     let is_dir = flags & FLAG_DIRECTORY != 0;
@@ -330,9 +332,10 @@ fn consider_file_name(attr: &[u8], best: &mut Option<(u8, String, u64, u64, i64)
     let Some(value) = attr.get(value_off..value_off + value_len) else {
         return;
     };
-    // FILE_NAME: Parent(8) Creation(8) LastMod(8) Access(8) Alloc(8) Real(8)
-    //            Flags(4) Reparse(4) NameLen(1) NS(1) Name[]
-    if value.len() < 0x3A {
+    // FILE_NAME: Parent(8) Creation(8) LastMod(8) LastChange(8) LastAccess(8)
+    //            Alloc(8) Real(8) Flags(4) Reparse(4) NameLen(1) NS(1) Name[]:
+    //            fijo de 0x42 bytes; el nombre vive en [0x42..].
+    if value.len() < 0x42 {
         return;
     }
     let Some(parent_bytes) = <[u8; 8]>::try_from(&value[0..8]).ok() else {
@@ -343,16 +346,16 @@ fn consider_file_name(attr: &[u8], best: &mut Option<(u8, String, u64, u64, i64)
         return;
     };
     let mtime = i64::from_le_bytes(mtime_bytes);
-    let Some(size_bytes) = <[u8; 8]>::try_from(&value[0x28..0x30]).ok() else {
+    let Some(size_bytes) = <[u8; 8]>::try_from(&value[0x30..0x38]).ok() else {
         return;
     };
     let size = u64::from_le_bytes(size_bytes);
-    let name_len = usize::from(value[0x38]);
-    let namespace = value[0x39];
-    if name_len == 0 || 0x3A + name_len * 2 > value.len() {
+    let name_len = usize::from(value[0x40]);
+    let namespace = value[0x41];
+    if name_len == 0 || 0x42 + name_len * 2 > value.len() {
         return;
     }
-    let name_u16: Vec<u16> = value[0x3A..0x3A + name_len * 2]
+    let name_u16: Vec<u16> = value[0x42..0x42 + name_len * 2]
         .as_chunks::<2>()
         .0
         .iter()
@@ -467,7 +470,7 @@ fn read_mft_index(letter: char, cancel: &AtomicBool) -> Result<MftIndex, MftErro
             }
             for (i, rec) in chunk[..want].chunks_exact(info.record_size).enumerate() {
                 let this_frn = frn + i as u64;
-                if let Some(file_rec) = parse_record(rec) {
+                if let Some(file_rec) = parse_record(rec, this_frn) {
                     children
                         .entry(file_rec.parent_frn)
                         .or_default()
@@ -478,13 +481,13 @@ fn read_mft_index(letter: char, cancel: &AtomicBool) -> Result<MftIndex, MftErro
                     // usar (borrados/compactación) y registros de extensión
                     // (ficheros con lista de atributos). Solo un registro "en
                     // uso" sin `$FILE_NAME` legible es una lectura defectuosa.
+                    let base = u64::from_le_bytes(rec[0x20..0x28].try_into().unwrap_or([0xFF; 8]));
                     let in_use_base = rec.len() >= 0x28
                         && rec[0..4] == *b"FILE"
                         && u16::from_le_bytes(rec[0x16..0x18].try_into().unwrap_or_default())
                             & FLAG_IN_USE
                             != 0
-                        && u64::from_le_bytes(rec[0x20..0x28].try_into().unwrap_or([0xFF; 8]))
-                            == u64::MAX;
+                        && (base == 0 || base == this_frn);
                     if in_use_base {
                         read_errors += 1;
                     }
@@ -895,10 +898,11 @@ mod tests {
     /// FILETIME (100 ns desde 1601) equivalente a los segundos UNIX.
     const FILETIME_FOR_UNIX: i64 = (1_650_000_000 + 11_644_473_600) * 10_000_000;
 
-    /// Construye un `FILE_RECORD` sintético con un atributo `$FILE_NAME`.
+    /// Construye un `FILE_RECORD` sintético con un atributo `$FILE_NAME` en el
+    /// layout real (nombres en [0x42..], tamaño real en [0x30..0x38]).
     fn fake_record(parent: u64, name: &str, is_dir: bool, size: u64, mtime: i64) -> Vec<u8> {
         let name_u16: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        let value_len = 0x3A + name_u16.len();
+        let value_len = 0x42 + name_u16.len();
         let attr_len = 0x18 + value_len;
         let record_size = 0x40 + attr_len + 4;
         let mut raw = vec![0u8; record_size];
@@ -912,7 +916,7 @@ mod tests {
         };
         raw[0x16..0x18].copy_from_slice(&le_u16(flags));
         raw[0x18..0x1C].copy_from_slice(&le_u32(record_size as u32)); // used size
-        raw[0x20..0x28].copy_from_slice(&le_u64(u64::MAX)); // base = -1 (no extensión)
+        raw[0x20..0x28].copy_from_slice(&le_u64(0)); // base 0 = registro base
 
         let off = 0x40usize;
         raw[off..off + 4].copy_from_slice(&le_u32(ATTR_FILE_NAME));
@@ -923,10 +927,10 @@ mod tests {
         let v = off + 0x18;
         raw[v..v + 8].copy_from_slice(&le_u64(parent));
         raw[v + 0x10..v + 0x18].copy_from_slice(&mtime.to_le_bytes());
-        raw[v + 0x28..v + 0x30].copy_from_slice(&le_u64(size));
-        raw[v + 0x38] = (name_u16.len() / 2) as u8;
-        raw[v + 0x39] = 1; // Win32
-        raw[v + 0x3A..v + 0x3A + name_u16.len()].copy_from_slice(&name_u16);
+        raw[v + 0x30..v + 0x38].copy_from_slice(&le_u64(size));
+        raw[v + 0x40] = (name_u16.len() / 2) as u8;
+        raw[v + 0x41] = 1; // Win32
+        raw[v + 0x42..v + 0x42 + name_u16.len()].copy_from_slice(&name_u16);
         raw
     }
 
@@ -981,7 +985,7 @@ mod tests {
             1_024_000,
             FILETIME_FOR_UNIX,
         );
-        let rec = parse_record(&raw).expect("registro bien formado");
+        let rec = parse_record(&raw, 100).expect("registro bien formado");
         assert!(!rec.is_dir);
         assert_eq!(rec.parent_frn, NTFS_ROOT_FRN);
         assert_eq!(rec.name, "documentos.txt");
@@ -992,7 +996,7 @@ mod tests {
     #[test]
     fn parses_directory_record() {
         let raw = fake_record(NTFS_ROOT_FRN, "Carpeta", true, 0, 1_650_000_000);
-        let rec = parse_record(&raw).expect("directorio");
+        let rec = parse_record(&raw, 101).expect("directorio");
         assert!(rec.is_dir);
         assert_eq!(rec.name, "Carpeta");
     }
@@ -1001,11 +1005,11 @@ mod tests {
     fn skips_extension_and_free_records() {
         let mut raw = fake_record(NTFS_ROOT_FRN, "libre", false, 10, 0);
         raw[0x16] = 0; // no en uso
-        assert_eq!(parse_record(&raw), None);
+        assert_eq!(parse_record(&raw, 102), None);
 
         let mut raw2 = fake_record(NTFS_ROOT_FRN, "base", false, 10, 0);
-        raw2[0x20..0x28].copy_from_slice(&le_u64(42)); // base FRN != -1
-        assert_eq!(parse_record(&raw2), None);
+        raw2[0x20..0x28].copy_from_slice(&le_u64(42)); // base ajena: extensión
+        assert_eq!(parse_record(&raw2, 103), None);
     }
 
     #[test]
@@ -1014,7 +1018,7 @@ mod tests {
         let mut raw = fake_record(NTFS_ROOT_FRN, "DOCUME~1", false, 100, 0);
         // El record va seguido de 4 bytes de relleno; truncarlo para que el
         // segundo atributo quede justo después del primero (sin hueco).
-        let first_len = 0x40 + (0x18 + (0x3A + 16));
+        let first_len = 0x40 + (0x18 + (0x42 + 16));
         raw.truncate(first_len);
         raw[0x18..0x1C].copy_from_slice(&le_u32(first_len as u32)); // used size
 
@@ -1022,7 +1026,7 @@ mod tests {
             .encode_utf16()
             .flat_map(u16::to_le_bytes)
             .collect();
-        let value2_len = 0x3A + name2.len();
+        let value2_len = 0x42 + name2.len();
         let attr2_len = 0x18 + value2_len;
         let base = raw.len();
         raw.resize(base + attr2_len, 0);
@@ -1034,15 +1038,15 @@ mod tests {
         raw[off + 0x14..off + 0x16].copy_from_slice(&le_u16(0x18));
         let v = off + 0x18;
         raw[v..v + 8].copy_from_slice(&le_u64(NTFS_ROOT_FRN));
-        raw[v + 0x28..v + 0x30].copy_from_slice(&le_u64(500));
-        raw[v + 0x38] = (name2.len() / 2) as u8;
-        raw[v + 0x39] = 1; // Win32
-        raw[v + 0x3A..v + 0x3A + name2.len()].copy_from_slice(&name2);
+        raw[v + 0x30..v + 0x38].copy_from_slice(&le_u64(500));
+        raw[v + 0x40] = (name2.len() / 2) as u8;
+        raw[v + 0x41] = 1; // Win32
+        raw[v + 0x42..v + 0x42 + name2.len()].copy_from_slice(&name2);
         // Actualizar "used size" del record para que el parser lo recorra.
         let used = u32::try_from(raw.len()).unwrap_or(u32::MAX);
         raw[0x18..0x1C].copy_from_slice(&le_u32(used));
 
-        let rec = parse_record(&raw).expect("record con dos nombres");
+        let rec = parse_record(&raw, 104).expect("record con dos nombres");
         assert_eq!(rec.name, "documentos.txt");
         assert_eq!(rec.size, 500);
     }
@@ -1218,7 +1222,7 @@ mod tests {
     #[test]
     fn parent_ref_sequence_bits_are_masked() {
         let raw = fake_record(5 | (3u64 << 48), "Usuarios", true, 0, 0);
-        let rec = parse_record(&raw).expect("registro válido");
+        let rec = parse_record(&raw, 105).expect("registro válido");
 
         assert_eq!(rec.parent_frn, 5);
     }
