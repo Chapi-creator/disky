@@ -140,8 +140,11 @@ fn le_i64(bytes: &[u8]) -> i64 {
 /// Solo pedimos registros V2 (`Min/MaxMajorVersion = 2`), que es lo que el
 /// parser del dominio entiende; los volúmenes con FRN de 128 bits (V3) son
 /// raros y quedan fuera del spike.
-fn pack_read_request(journal_id: u64, start_usn: i64) -> [u8; 48] {
-    let mut buf = [0u8; 48];
+/// Empaqueta `READ_USN_JOURNAL_DATA_V1` (layout de `winioctl.h`): 40 bytes base
+/// más `Min/MaxMajorVersion`. El tamaño debe ser EXACTO (40 o 44): con 48 el
+/// kernel devuelve 87 (`INVALID_PARAMETER`).
+fn pack_read_request(journal_id: u64, start_usn: i64) -> [u8; 44] {
+    let mut buf = [0u8; 44];
     buf[0..8].copy_from_slice(&start_usn.to_le_bytes()); // StartUsn
     buf[8..12].copy_from_slice(&u32::MAX.to_le_bytes()); // ReasonMask: todos
     buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // ReturnOnlyOnClose: 0
@@ -399,6 +402,25 @@ mod tests {
         assert_eq!(status.next_usn, 900);
         assert_eq!(status.max_usn, 1000);
         assert_eq!(status.max_size, 2 * 1024 * 1024);
+    }
+
+    /// El kernel valida el tamaño exacto del input (40 o 44): 48 devolvía 87
+    /// (`INVALID_PARAMETER`) en cada lectura del panel «¿Qué cambió?».
+    #[test]
+    fn read_request_is_exactly_v1_sized() {
+        let req = pack_read_request(0x1234, 0x5678);
+
+        assert_eq!(req.len(), 44);
+        let le64 = |r: std::ops::Range<usize>| {
+            u64::from_le_bytes(req[r].try_into().expect("rango exacto de 8"))
+        };
+        let le16 = |r: std::ops::Range<usize>| {
+            u16::from_le_bytes(req[r].try_into().expect("rango exacto de 2"))
+        };
+        assert_eq!(le64(0..8), 0x5678);
+        assert_eq!(le64(32..40), 0x1234);
+        assert_eq!(le16(40..42), 2);
+        assert_eq!(le16(42..44), 2);
     }
 
     #[test]
