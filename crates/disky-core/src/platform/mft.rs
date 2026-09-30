@@ -28,6 +28,7 @@
 //!   real no aportan a ninguna carpeta (coincide con lo que el usuario ve).
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -58,6 +59,12 @@ const MAX_RECORD_SIZE: usize = 64 * 1024;
 
 /// FRN convencional de la raíz de un volumen NTFS.
 const NTFS_ROOT_FRN: u64 = 5;
+
+/// Máscara de los 48 bits bajos de una referencia MFT: los 16 altos son el
+/// número de secuencia (cambia con cada reutilización del registro) y no
+/// forman parte de la identidad. Sin enmascarar, ningún padre coincide con su
+/// hijo y el árbol no se recorre nunca.
+const FRN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 /// Constante de atributo `$FILE_NAME`.
 const ATTR_FILE_NAME: u32 = 0x30;
@@ -247,8 +254,12 @@ fn parse_runlist(data: &[u8]) -> Option<Vec<(u64, u64)>> {
         if header == 0 {
             break;
         }
-        let len_bytes = (header >> 4) as usize;
-        let off_bytes = (header & 0x0F) as usize;
+        // Nibble bajo = tamaño del campo de longitud, nibble alto = tamaño
+        // del campo de desplazamiento (al revés de como estaba: con un run
+        // asimétrico típico como 0x31 los extents salían de otra parte del
+        // disco y el índice volvía vacío).
+        let len_bytes = (header & 0x0F) as usize;
+        let off_bytes = (header >> 4) as usize;
         if i + len_bytes + off_bytes > data.len() {
             return None;
         }
@@ -370,7 +381,7 @@ fn consider_file_name(attr: &[u8], best: &mut Option<(u8, String, u64, u64, i64)
     let Some(parent_bytes) = <[u8; 8]>::try_from(&value[0..8]).ok() else {
         return;
     };
-    let parent_frn = u64::from_le_bytes(parent_bytes);
+    let parent_frn = u64::from_le_bytes(parent_bytes) & FRN_MASK;
     let Some(mtime_bytes) = <[u8; 8]>::try_from(&value[0x10..0x18]).ok() else {
         return;
     };
@@ -598,7 +609,33 @@ pub fn mft_scan(
     let target = resolve_frn(&components, &entries, &children).map_err(MftError::PathNotFound)?;
 
     // Post-orden iterativo sobre los directorios del subárbol.
+    let postorder = postorder_dirs(target, &entries, &children, cancel)?;
+
+    let totals = accumulate(
+        &postorder,
+        target,
+        &s,
+        read_errors,
+        &entries,
+        &children,
+        on_dir,
+    );
+    Ok(totals)
+}
+
+/// Recorrido post-orden iterativo de los directorios del subárbol de `target`.
+///
+/// El `seen` no es optimización: la MFT trae ciclos (la raíz es su propio
+/// padre) y sin él este bucle no termina nunca: la pila y el vector crecen
+/// sin fin hasta tumbar el proceso.
+fn postorder_dirs(
+    target: u64,
+    entries: &HashMap<u64, FileRecord>,
+    children: &HashMap<u64, Vec<u64>>,
+    cancel: &AtomicBool,
+) -> Result<Vec<u64>, MftError> {
     let mut postorder: Vec<u64> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
     let mut visit_stack: Vec<(u64, bool)> = vec![(target, false)];
     while let Some((frn, exit)) = visit_stack.pop() {
         if cancel.load(Ordering::Relaxed) {
@@ -607,6 +644,9 @@ pub fn mft_scan(
         if exit {
             postorder.push(frn);
             continue;
+        }
+        if !seen.insert(frn) {
+            continue; // ciclo: ya visitado
         }
         let Some(entry) = entries.get(&frn) else {
             continue;
@@ -620,17 +660,7 @@ pub fn mft_scan(
             visit_stack.push((kid, false));
         }
     }
-
-    let totals = accumulate(
-        &postorder,
-        target,
-        &s,
-        read_errors,
-        &entries,
-        &children,
-        on_dir,
-    );
-    Ok(totals)
+    Ok(postorder)
 }
 
 /// Resuelve la ruta absoluta de cada FRN pedido leyendo el índice de la MFT.
@@ -687,6 +717,11 @@ fn dir_paths(
     let mut dir_info: HashMap<u64, (String, i64)> = HashMap::new();
     let mut dfs = vec![(start_frn, start_path.to_owned())];
     while let Some((frn, path)) = dfs.pop() {
+        // Como en `postorder_dirs`: la MFT trae ciclos y sin este guard el
+        // DFS crece sin fin hasta tumbar el proceso.
+        if dir_info.contains_key(&frn) {
+            continue;
+        }
         let Some(entry) = entries.get(&frn) else {
             continue;
         };
@@ -1143,6 +1178,50 @@ mod tests {
         let (entries, children) = sample_index();
         let dirs = dir_paths(12, "C:\\Usuarios", &entries, &children);
 
+        assert_eq!(dirs.get(&12).map(|(p, _)| p.as_str()), Some("C:\\Usuarios"));
+    }
+
+    /// Las referencias de la MFT traen 16 bits de secuencia arriba: sin
+    /// máscara ningún padre coincide con su hijo y el árbol no se recorre.
+    #[test]
+    fn parent_ref_sequence_bits_are_masked() {
+        let raw = fake_record(5 | (3u64 << 48), "Usuarios", true, 0, 0);
+        let rec = parse_record(&raw).expect("registro válido");
+
+        assert_eq!(rec.parent_frn, 5);
+    }
+
+    /// Nibbles del run list según spec: bajo = longitud, alto = desplazamiento.
+    /// Con un run asimétrico (0x21) el orden inverso lee otra parte del disco.
+    #[test]
+    fn runlist_nibbles_follow_the_spec() {
+        assert_eq!(
+            parse_runlist(&[0x11, 0x20, 0x05, 0x00]),
+            Some(vec![(5, 0x20)])
+        );
+        assert_eq!(
+            parse_runlist(&[0x21, 0x05, 0x34, 0x12, 0x00]),
+            Some(vec![(0x1234, 5)])
+        );
+    }
+
+    /// Índice con el ciclo de un volumen real (la raíz es su propio padre):
+    /// ambos recorridos terminan y visitan cada directorio una sola vez. Sin
+    /// los guards, estos dos tests no fallan: se cuelgan.
+    #[test]
+    fn traversals_terminate_on_cyclic_index() {
+        let entries = [rec(5, 5, ".", true, 0), rec(12, 5, "Usuarios", true, 0)]
+            .into_iter()
+            .collect();
+        let children = HashMap::from([(5u64, vec![5, 12]), (12u64, vec![])]);
+
+        let order =
+            postorder_dirs(5, &entries, &children, &AtomicBool::new(false)).expect("postorden");
+        assert_eq!(order, vec![12, 5]);
+
+        let dirs = dir_paths(5, "C:\\", &entries, &children);
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs.get(&5).map(|(p, _)| p.as_str()), Some("C:\\"));
         assert_eq!(dirs.get(&12).map(|(p, _)| p.as_str()), Some("C:\\Usuarios"));
     }
 }
