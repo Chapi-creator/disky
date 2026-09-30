@@ -1245,6 +1245,24 @@ async function refreshTreemapForRoot(root: string): Promise<void> {
   await loadTimeline();
 }
 
+/**
+ * Pinta el treemap y el timeline del último escaneo de la raíz actual al
+ * arrancar. Sin esto la app se abría con ambos gráficos en blanco hasta volver
+ * a escanear, aunque ya hubiera escaneos guardados (el resto de paneles sí
+ * cargan solos). Con la raíz sin escaneos no hace nada: se llenará tras el
+ * primer escaneo.
+ */
+async function loadTreemapFromHistory(): Promise<void> {
+  const root = currentScanRoot();
+  try {
+    const snaps = await snapshotsFor(root);
+    if (snaps.length === 0) return;
+    await refreshTreemapForRoot(root);
+  } catch {
+    // Si algo falla se refresca tras el próximo escaneo; no romper el arranque.
+  }
+}
+
 // ── Arranque ─────────────────────────────────────────────────────────────────
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -1429,6 +1447,7 @@ window.addEventListener("DOMContentLoaded", () => {
   void loadVolumes();
   void loadSnapshots();
   void loadHistory();
+  void loadTreemapFromHistory();
   void ensureNotifyPermission();
   // La comprobación de updates va al final: primero pinta la app.
   window.setTimeout(() => void checkForUpdates(), 3000);

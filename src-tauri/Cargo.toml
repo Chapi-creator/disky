@@ -9,7 +9,22 @@ authors.workspace = true
 [lib]
 # El sufijo `_lib` evita conflicto bin/lib en Windows (rust-lang/cargo#8519).
 name = "disky_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Solo `rlib`: el binario de escritorio enlaza la lib y `staticlib`/`cdylib`
+# existen únicamente para móvil (iOS/Android), que disky no compila. Con el
+# toolchain GNU local (mingw 16.1) el `ld` moría al enlazar el cdylib con
+# «export ordinal too large: 125270», y eso tumbaba `cargo test -p disky`
+# entero: sin biblioteca compartida, los tests del shell enlazan y corren.
+crate-type = ["rlib"]
+
+[[bin]]
+name = "disky"
+path = "src/main.rs"
+# El binario no tiene tests unitarios; desactivar su harness evita que el
+# `.rsrc` que `build.rs` enlaza en los tests (`-tests`) se sume al que
+# `tauri-build` ya mete en los bins (`-bins`), que duplicaría manifiesto,
+# iconos y versión en el ejecutable de pruebas. Los tests viven en
+# `disky_lib` y en `tests/`.
+test = false
 
 [lints]
 workspace = true

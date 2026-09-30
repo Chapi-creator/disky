@@ -24,6 +24,12 @@ jobs:
       # local elevada (cargo test -p disky-core -- --include-ignored).
       - name: Tests del core
         run: cargo test -p disky-core
+      # Tests del shell (comandos IPC, JSONL padre↔hijo, modo elevado): puros y
+      # sin ventana, así que corren en el runner. No se ejecutaban antes porque
+      # su harness no arrancaba en Windows sin el manifiesto que ahora enlaza
+      # `src-tauri/build.rs`.
+      - name: Tests del shell
+        run: cargo test -p disky
 
   frontend:
     name: Frontend (tsc · vite build)

@@ -251,12 +251,17 @@ fn scan_one_volume(
     cancel: &std::sync::atomic::AtomicBool,
     log: &ElevatedLog,
 ) -> Result<VolumeScan, String> {
-    let root_path = std::path::PathBuf::from(root);
+    // La raíz canónica (separadores nativos, una sola barra final) se calcula
+    // ANTES de derivar la ruta de escaneo. Si se escanea con una raíz sin
+    // normalizar (`C:\\`), todos los descendientes salen con doble separador:
+    // la clave de la BD sí se normaliza, así que la raíz queda `C:\`
+    // mientras `C:\Users` se guarda como `C:\\Users` y el treemap solo ve la
+    // raíz. Una sola forma para la clave y para el escáner.
+    let root = disky_core::platform::path_norm::normalize_path_separators(root);
+    let root_path = std::path::PathBuf::from(&root);
     if !root_path.is_dir() {
         return Err(format!("La ruta no existe o no es un directorio: `{root}`"));
     }
-    // Clave canónica en la BD: separadores nativos (p. ej. llega `C:/x` desde bash).
-    let root = disky_core::platform::path_norm::normalize_path_separators(root);
     let started = std::time::Instant::now();
     let mut writer = store
         .open_writer(&root, started_at)
@@ -281,6 +286,24 @@ fn scan_one_volume(
     let totals = if is_volume_root(&root_path) {
         log.write("antes de mft_scan");
         match disky_core::mft_scan(&root_path, cancel, &mut push, &mut |_| {}) {
+            // Un `Ok` sin carpetas no es un escaneo: es la lectura del `$MFT`
+            // que volvió en blanco. Antes se aceptaba igual y el guard final
+            // descartaba el snapshot, que es justo «el modo admin no hace
+            // nada». Se trata como un fallo del MFT y se cae al walker.
+            Ok(totals) if totals.collected_nothing() => {
+                log.write("mft_scan sin carpetas; fallback a walker");
+                match disky_core::walk_tree(&root_path, cancel, &mut push, &mut |_| {}) {
+                    Ok(totals) => totals,
+                    Err(_) if cancel.load(std::sync::atomic::Ordering::Relaxed) => {
+                        return Err("Escaneo cancelado".into());
+                    }
+                    Err(walk_err) => {
+                        return Err(format!(
+                            "El MFT no devolvió ninguna carpeta (walk: {walk_err})"
+                        ));
+                    }
+                }
+            }
             Ok(totals) => {
                 log.write("mft_scan OK");
                 totals

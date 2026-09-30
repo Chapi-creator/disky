@@ -120,10 +120,7 @@ pub fn treemap_nodes(
 
     let mut children: Vec<TreemapItem> = samples
         .iter()
-        .filter(|s| {
-            s.path.starts_with(&prefix)
-                && !s.path[prefix.len()..].contains(std::path::MAIN_SEPARATOR)
-        })
+        .filter(|s| is_direct_child(&s.path, &folder_path, &prefix))
         .map(|s| TreemapItem {
             path: s.path.clone(),
             size_bytes: s.size_bytes,
@@ -316,8 +313,7 @@ pub fn scan_all_start(window: tauri::Window, state: State<'_, AppState>) -> Resu
                     total: fixed.len(),
                 },
             );
-            let root_path = PathBuf::from(root);
-            let (snapshot, largest, error) = perform_scan(&handle, &state, root, &root_path);
+            let (snapshot, largest, error) = perform_scan(&handle, &state, root);
             // El evento por unidad: el frontend refresca lo acumulado.
             let growth = if snapshot.is_some() {
                 compute_growth_root(&state, root)
@@ -377,7 +373,7 @@ pub fn scan_start(
     let root = normalize_path_separators(&path.display().to_string());
 
     let handle = window.app_handle().clone();
-    std::thread::spawn(move || run_scan(handle, root, path));
+    std::thread::spawn(move || run_scan(handle, root));
     Ok(())
 }
 
@@ -842,6 +838,32 @@ fn discarded(reason: String) -> (Option<SnapshotSummary>, Vec<LargestFile>, Opti
     (None, Vec::new(), Some(reason))
 }
 
+/// Raíz canónica de un escaneo: la clave de la BD y la ruta del escáner salen
+/// de la **misma** forma normalizada.
+///
+/// Es la invariante que faltaba: normalizar solo la clave mientras el walker/MFT
+/// recibe la raíz cruda (`C:\\`, tal cual llega del frontend) hacía que cada
+/// descendiente se emitiera con doble separador (`C:\\Users`) mientras la raíz
+/// se guardaba como `C:\`. El treemap filtra por prefijo `C:\` y descarta todo
+/// hijo con una barra extra, así que solo veía la raíz.
+fn canonical_scan_root(root: &str) -> (String, PathBuf) {
+    let root = normalize_path_separators(root.trim());
+    let path = PathBuf::from(&root);
+    (root, path)
+}
+
+/// ¿`candidate` es un hijo **directo** de `folder` (no la carpeta misma ni un
+/// nieto)?
+///
+/// El caso de la raíz de volumen es el delicado: ahí `prefix == folder`, así que
+/// sin el `candidate != folder` la fila de la raíz entra como tile y su tamaño
+/// (el volumen entero) se come el treemap.
+fn is_direct_child(candidate: &str, folder: &str, prefix: &str) -> bool {
+    candidate != folder
+        && candidate.starts_with(prefix)
+        && !candidate[prefix.len()..].contains(std::path::MAIN_SEPARATOR)
+}
+
 /// Empuja un dir al búfer y lo vuelca a la BD cada [`DIR_BATCH`] entradas.
 fn flush_dir(writer: &mut dyn DirWriter, batch: &mut Vec<DirStat>, dir: DirStat) {
     batch.push(dir);
@@ -866,15 +888,19 @@ fn perform_scan(
     handle: &AppHandle,
     state: &AppState,
     root: &str,
-    root_path: &Path,
 ) -> (Option<SnapshotSummary>, Vec<LargestFile>, Option<String>) {
+    // La raíz canónica se deriva aquí mismo, no en el llamador: si el escáner
+    // recibe una raíz sin normalizar (`C:\\`), todos los hijos salen con doble
+    // separador mientras la clave de la BD se normaliza a `C:\`, y el treemap
+    // solo vería la raíz. Walker y MFT comparten exactamente esta ruta.
+    let (root, root_path) = canonical_scan_root(root);
     let started_at = unix_now();
     let started = Instant::now();
 
     let Ok(mut store) = SqliteStore::open(&state.db_path) else {
         return discarded("No se pudo abrir la base de datos para guardar el escaneo".into());
     };
-    let Ok(mut writer) = store.open_writer(root, started_at) else {
+    let Ok(mut writer) = store.open_writer(&root, started_at) else {
         return discarded("No se pudo iniciar el snapshot del escaneo".into());
     };
 
@@ -894,7 +920,7 @@ fn perform_scan(
             .is_some_and(|c| disky_core::mft_available(c.to_ascii_uppercase()));
     let mut scan_result = if use_mft {
         disky_core::mft_scan(
-            root_path,
+            &root_path,
             &state.cancel,
             &mut |dir| flush_dir(writer.as_mut(), &mut batch, dir),
             &mut |_| {},
@@ -902,7 +928,7 @@ fn perform_scan(
         .map_err(ScanError::Mft)
     } else {
         walk_tree(
-            root_path,
+            &root_path,
             &state.cancel,
             &mut |dir| flush_dir(writer.as_mut(), &mut batch, dir),
             &mut |progress| {
@@ -914,13 +940,20 @@ fn perform_scan(
 
     // Si el MFT falló (y no fue cancelación), se descarta el intento (rollback
     // al soltar `writer`) y se reintenta con el walker, que siempre funciona.
-    let mft_error = match &scan_result {
+    //
+    // Un `Ok` **sin carpetas** cuenta igual: el MFT devolvió el índice vacío sin
+    // error, así que sin reintento el guard final descartaría el snapshot y el
+    // usuario vería «el modo admin no hace nada». El walker no necesita admin.
+    let mft_retry = match &scan_result {
         Err(ScanError::Mft(err)) if !matches!(err, MftError::Cancelled) => Some(err.to_string()),
+        Ok(totals) if use_mft && totals.collected_nothing() => {
+            Some("El MFT del volumen no devolvió ninguna carpeta".to_owned())
+        }
         _ => None,
     };
-    if let Some(mft_error) = mft_error {
+    if let Some(mft_error) = mft_retry {
         drop(writer);
-        let Ok(new_writer) = store.open_writer(root, started_at) else {
+        let Ok(new_writer) = store.open_writer(&root, started_at) else {
             return discarded(format!(
                 "Falló el MFT ({mft_error}) y tampoco se pudo abrir el snapshot para reintentar"
             ));
@@ -928,7 +961,7 @@ fn perform_scan(
         writer = new_writer;
         batch.clear();
         scan_result = walk_tree(
-            root_path,
+            &root_path,
             &state.cancel,
             &mut |dir| flush_dir(writer.as_mut(), &mut batch, dir),
             &mut |progress| {
@@ -960,7 +993,7 @@ fn perform_scan(
                 Ok(id) => {
                     let snapshot = SnapshotSummary {
                         id,
-                        root: root.to_owned(),
+                        root: root.clone(),
                         started_at,
                         duration_ms,
                         total_files,
@@ -1001,9 +1034,9 @@ impl fmt::Display for ScanError {
 /// Directorios por lote al escribir el snapshot (compromiso latencia/memoria).
 const DIR_BATCH: usize = 512;
 
-fn run_scan(handle: AppHandle, root: String, root_path: PathBuf) {
+fn run_scan(handle: AppHandle, root: String) {
     let state = handle.state::<AppState>();
-    let (snapshot, largest, error) = perform_scan(&handle, &state, &root, &root_path);
+    let (snapshot, largest, error) = perform_scan(&handle, &state, &root);
 
     // Growth fresco para la raíz escaneada (aunque falle, el evento informa).
     let growth = if snapshot.is_some() {
@@ -1473,9 +1506,39 @@ fn unix_now() -> i64 {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{append_new_bytes, csv_field, growth_csv, parse_unit_lines, quote_arg, GrowthDiff};
+    use super::{
+        append_new_bytes, canonical_scan_root, csv_field, growth_csv, is_direct_child,
+        parse_unit_lines, quote_arg, GrowthDiff,
+    };
     use crate::{append_unit, UnitResult};
     use disky_core::{GrowthReport, SnapshotSummary};
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_scan_root_never_doubles_the_volume_separator() {
+        // El frontend manda `C:\\` (dos barras) y antes el escáner recibía esa
+        // raíz cruda: los hijos salían `C:\\Users` y el treemap solo veía la
+        // raíz. La raíz canónica y la ruta del escáner deben coincidir.
+        let (root, path) = canonical_scan_root("C:\\\\");
+        assert_eq!(root, "C:\\");
+        assert_eq!(path.join("Users").display().to_string(), "C:\\Users");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_direct_child_excludes_the_folder_itself_and_grandchildren() {
+        // En la raíz `prefix == folder`: la raíz NO puede ser su propio hijo.
+        assert!(!is_direct_child("C:\\", "C:\\", "C:\\"));
+        assert!(is_direct_child("C:\\Users", "C:\\", "C:\\"));
+        assert!(!is_direct_child("C:\\Users\\Breiner", "C:\\", "C:\\"));
+        // En una subcarpeta el prefijo lleva barra final y la carpeta se excluye.
+        assert!(!is_direct_child("C:\\Users", "C:\\Users", "C:\\Users\\"));
+        assert!(is_direct_child(
+            "C:\\Users\\Breiner",
+            "C:\\Users",
+            "C:\\Users\\"
+        ));
+    }
 
     #[test]
     fn csv_field_quotes_only_when_needed() {

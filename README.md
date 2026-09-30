@@ -81,7 +81,7 @@ icono y el banner se generan de la misma geometría con
   vivo por eventos.
 - ✅ **Snapshots en SQLite** (`rusqlite`, WAL): escritura atómica (invisible
   hasta `finish`; rollback si se cancela), prune de los últimos 10 por raíz,
-  esquema versionado (`user_version = 1`).
+  esquema versionado (`user_version = 3`).
 - ✅ **Diff "¿qué creció?"**: comparación de los dos snapshots de una raíz vía
   `match_by_path` + `growth_ranking` (las mismas funciones puras del dominio).
 ### Escaneo rápido con UAC (lectura vía MFT)
@@ -90,8 +90,8 @@ El escaneo completo se relanza a sí mismo elevado (`--elevated-scan`) y lee el
 **`$MFT` del volumen** (rápido, cubre carpetas protegidas); si el volumen no es
 NTFS o el formato sorprende, cae al walker sin admin. El snapshot se guarda
 desde el hijo y el resultado se reporta por JSON. Los **cambios recientes del
-journal** (`$UsnJrnl`) siguen en el roadmap: exigirían un lector elevado a
-demanda para alimentar un panel "qué cambió" (no solo "qué creció").
+journal** (`$UsnJrnl`) se consultan a demanda desde el panel «¿Qué cambió?». El
+lector elevado reconstruye la ruta desde la MFT (ver «Panel USN» arriba).
 - ✅ **Drill-down**: clic en cualquier carpeta del ranking para ver el crecimiento
   de sus hijos directos (navegable en profundidad, con "volver").
 - ✅ **Treemap squarify** (Bruls et al. 2000): implementación pura en el core
@@ -347,9 +347,9 @@ firma minisign propia y sí es gratis (ver abajo).
 Al empujar un tag de versión se compila y publican los instaladores solos:
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.2.0 && git push origin v0.2.0
 # → GitHub Actions compila en windows-latest y adjunta a la release:
-#   disky_0.1.0_x64-setup.exe (NSIS) y disky_0.1.0_x64_en-US.msi
+#   disky_0.2.0_x64-setup.exe (NSIS) y disky_0.2.0_x64_en-US.msi
 ```
 
 El workflow (`.github/workflows/release.yml`) valida antes de compilar (fail
@@ -401,14 +401,36 @@ de la release siguen valiendo siempre.
 cargo fmt --all -- --check                               # formato
 cargo clippy --workspace --all-targets -- -D warnings    # pedantic + deny
 cargo test -p disky-core                                 # tests (los de integración: --include-ignored, elevado)
+cargo test -p disky                                      # tests del shell: comandos IPC y protocolo padre↔hijo
 npx tsc --noEmit                                         # typecheck del frontend
 ```
 
 CI (`.github/workflows/ci.yml`): formato, clippy estricto y los tests del core
-en un runner Windows estándar, y el frontend (tsc + build) en uno de Linux.
-Los tests de integración que exigen acceso al dispositivo (`#[ignore]`) se
+y del shell en un runner Windows estándar, y el frontend (tsc + build) en uno de
+Linux. Los tests de integración que exigen acceso al dispositivo (`#[ignore]`) se
 corren aparte, en una máquina local elevada: `cargo test -p disky-core --
 --include-ignored`.
+
+La lib del shell se compila solo como `rlib` (`crate-type` de
+`src-tauri/Cargo.toml`): `staticlib`/`cdylib` existen para móvil, que disky no
+compila, y en el toolchain GNU local (mingw 16.1) el `ld` moría enlazando el
+cdylib («export ordinal too large»), dejando `cargo test -p disky` sin forma de
+correr.
+
+Los binarios de test enlazan además el mismo `.rsrc` que `tauri-build` embebe en
+los binarios de la app (`src-tauri/build.rs`). Sin ese recurso el proceso de test
+no lleva manifiesto, Windows lo ata a `comctl32.dll` v5, y como
+`TaskDialogIndirect` solo existe en la v6 el harness no llega a arrancar:
+`STATUS_ENTRYPOINT_NOT_FOUND` (0xc0000139) nada más lanzarlo.
+
+El enlace se hace con `cargo:rustc-link-arg` (todos los targets) y no con
+`rustc-link-arg-tests`: esa directiva solo alcanza a los tests de integración,
+no a los unitarios de la lib, que son justo los que crashean. A cambio el
+binario recibe el recurso dos veces (`-bins` de `tauri-build` más el arg), pero
+es el MISMO archivo: el merge del linker deja cada manifiesto, icono y versión
+una vez y solo emite un aviso de recursos duplicados. El harness de test del
+binario va desactivado (`[[bin]] test = false`, no tiene tests propios) para no
+sumar un duplicado extra por ahí; los tests viven en la lib y en `tests/`.
 Releases (`.github/workflows/release.yml`): tag `v*` → instaladores NSIS/MSI
 adjuntos a la GitHub Release, junto con los `.sig` y el `latest.json` que
 consume el auto-actualizador.
