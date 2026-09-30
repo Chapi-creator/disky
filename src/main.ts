@@ -975,7 +975,7 @@ async function startScan(): Promise<void> {
 async function startQuickScan(): Promise<void> {
   try {
     await invoke("scan_quick_start", { root: currentScanRoot() });
-    setScanBusy(true, "Escaneo elevado en curso — confirma el diálogo de UAC…");
+    setScanBusy(true, "Escaneo elevado en curso…");
   } catch (err) {
     showScanError(String(err));
   }
