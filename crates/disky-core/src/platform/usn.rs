@@ -209,8 +209,9 @@ pub fn recent_records(
     // algo no avanza y hay que parar igual.
     for _ in 0..4096 {
         let input = pack_read_request(status.journal_id, start_usn);
-        let (next_usn, _, batch) = read_journal_batch(&handle, letter, &input, READ_BUFFER_BYTES)?;
-        for record in batch {
+        let batch = read_journal_batch(&handle, letter, &input, READ_BUFFER_BYTES)?;
+        let next_usn = batch.next_usn;
+        for record in batch.records {
             if recent.len() >= max_records.saturating_mul(2).max(2) {
                 recent.pop_front();
             }
@@ -228,15 +229,25 @@ pub fn recent_records(
     Ok(recent.into())
 }
 
-/// Ejecuta `FSCTL_READ_USN_JOURNAL` con un input ya empaquetado y devuelve el
-/// `NextUsn` del lote más los registros parseados. El `out_len` dimensiona el
-/// buffer de salida.
+/// Lote leído del journal: el `NextUsn` para encadenar la siguiente lectura,
+/// cuántos bytes escribió el kernel, los registros parseados y una muestra de
+/// los primeros bytes crudos (para diagnosticar si el layout real no coincide
+/// con el parser: los tests sintéticos no cubren un volumen de verdad).
+struct JournalBatch {
+    next_usn: i64,
+    written: usize,
+    records: Vec<JournalRecord>,
+    head: Vec<u8>,
+}
+
+/// Ejecuta `FSCTL_READ_USN_JOURNAL` con un input ya empaquetado. El `out_len`
+/// dimensiona el buffer de salida.
 fn read_journal_batch(
     handle: &VolumeHandle,
     letter: char,
     input: &[u8],
     out_len: usize,
-) -> Result<(i64, usize, Vec<JournalRecord>), PlatformError> {
+) -> Result<JournalBatch, PlatformError> {
     let mut out = vec![0u8; out_len];
     let mut returned = 0u32;
 
@@ -260,7 +271,13 @@ fn read_journal_batch(
     // Solo los bytes que el kernel realmente escribió; el resto es relleno.
     let written = (returned as usize).min(out.len());
     let (next_usn, records) = parse_usn_batch(&out[..written]);
-    Ok((next_usn, written, records))
+    let head = out[..written.min(128)].to_vec();
+    Ok(JournalBatch {
+        next_usn,
+        written,
+        records,
+        head,
+    })
 }
 
 /// Sigue la cola del journal desde `FirstUsn` encadenando `NextUsn`, y reporta
@@ -288,18 +305,20 @@ pub fn diag_usn_follow(letter: char) -> Vec<(String, String)> {
     for hop in 0..40 {
         let input = pack_read_request(status.journal_id, start_usn);
         match read_journal_batch(&handle, letter, &input, READ_BUFFER_BYTES) {
-            Ok((next_usn, written, records)) => {
+            Ok(batch) => {
                 out.push((
                     format!("follow_hop{hop}"),
                     format!(
-                        "start={start_usn} next={next_usn} written={written} parsed={}",
-                        records.len()
+                        "start={start_usn} next={} written={} parsed={}",
+                        batch.next_usn,
+                        batch.written,
+                        batch.records.len()
                     ),
                 ));
-                if next_usn <= start_usn || start_usn >= status.next_usn {
+                if batch.next_usn <= start_usn || start_usn >= status.next_usn {
                     break;
                 }
-                start_usn = next_usn;
+                start_usn = batch.next_usn;
             }
             Err(error) => {
                 out.push((format!("follow_hop{hop}"), format!("err:{error}")));
@@ -348,19 +367,28 @@ pub fn diag_usn_touch(letter: char) -> Vec<(String, String)> {
     };
     let input = pack_read_request(status.journal_id, anchor);
     match read_journal_batch(&handle, letter, &input, READ_BUFFER_BYTES) {
-        Ok((next_usn, written, records)) => {
+        Ok(batch) => {
             use std::fmt::Write as _;
             let mut summary = format!(
-                "anchor={anchor} next={next_usn} written={written} parsed={}",
-                records.len()
+                "anchor={anchor} next={} written={} parsed={}",
+                batch.next_usn,
+                batch.written,
+                batch.records.len()
             );
-            for record in records.iter().take(8) {
+            for record in batch.records.iter().take(8) {
                 let _ = write!(
                     summary,
                     " | {}:{:?}",
                     record.file_name, record.reason_labels
                 );
             }
+            let head: String = batch
+                .head
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = write!(summary, " || head[{head}]");
             out.push(("touch_read".to_owned(), summary));
         }
         Err(error) => out.push(("touch_read".to_owned(), format!("err:{error}"))),
@@ -376,7 +404,7 @@ fn read_journal_raw(
     input: &[u8],
     out_len: usize,
 ) -> Result<Vec<JournalRecord>, PlatformError> {
-    read_journal_batch(handle, letter, input, out_len).map(|(_, _, records)| records)
+    read_journal_batch(handle, letter, input, out_len).map(|batch| batch.records)
 }
 
 /// Diagnóstico de un `FSCTL_READ_USN_JOURNAL` rebelde: el kernel no dice QUÉ
