@@ -620,6 +620,18 @@ fn postorder_dirs(
     Ok(postorder)
 }
 
+/// Cuenta las entradas del índice MFT sin recorrerlo: diagnóstico para saber
+/// si una resolución vacía es "volumen ilegible" (ceros) o "rutas que no
+/// casan" (millones). Lo consume el modo `--elevated-diag-usn`.
+///
+/// # Errors
+/// [`MftError`] si la unidad no se puede indexar.
+pub fn diag_mft_index(letter: char) -> Result<(usize, usize, u64), MftError> {
+    let cancel = AtomicBool::new(false);
+    read_mft_index(letter, &cancel)
+        .map(|(entries, children, errors)| (entries.len(), children.len(), errors))
+}
+
 /// Resuelve la ruta absoluta de cada FRN pedido leyendo el índice de la MFT.
 ///
 /// El USN Journal solo da FRN + nombre; para saber *dónde* está algo hay que
@@ -635,11 +647,14 @@ pub fn resolve_paths(letter: char, frns: &[u64]) -> Result<HashMap<u64, String>,
 
     let mut out = HashMap::new();
     for &frn in frns {
-        if let Some((path, _)) = dirs.get(&frn) {
+        // Las refs del journal traen número de secuencia arriba; el índice
+        // usa FRN pelados. Sin la máscara no coincide nunca nada.
+        let bare = frn & FRN_MASK;
+        if let Some((path, _)) = dirs.get(&bare) {
             out.insert(frn, path.clone());
             continue;
         }
-        let Some(record) = entries.get(&frn) else {
+        let Some(record) = entries.get(&bare) else {
             continue; // borrado antes del escaneo: sin ruta que dar
         };
         let Some((parent, _)) = dirs.get(&record.parent_frn) else {

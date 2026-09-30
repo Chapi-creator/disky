@@ -502,6 +502,13 @@ pub fn elevated_diag_usn(letter: &str, out: &str) -> i32 {
     let mut variants = disky_core::diag_usn_variants(letter);
     variants.extend(disky_core::diag_usn_follow(letter));
     variants.extend(disky_core::diag_usn_touch(letter));
+    match disky_core::diag_mft_index(letter) {
+        Ok((entries, children, errors)) => variants.push((
+            "mft_index".to_owned(),
+            format!("entries={entries} children={children} read_errors={errors}"),
+        )),
+        Err(error) => variants.push(("mft_index".to_owned(), format!("err:{error}"))),
+    }
     let rows: Vec<serde_json::Value> = variants
         .iter()
         .map(|(name, result)| serde_json::json!({"variant": name, "result": result}))

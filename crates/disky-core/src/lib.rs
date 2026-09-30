@@ -23,7 +23,7 @@ pub use domain::{
     duplicate_groups, growth_between, growth_ranking, DriveKind, DuplicateGroup, GrowthReport,
     UsageSample, Volume,
 };
-pub use platform::mft::{mft_available, mft_scan, resolve_paths, MftError};
+pub use platform::mft::{diag_mft_index, mft_available, mft_scan, resolve_paths, MftError};
 pub use platform::sqlite::{truncate_wal, SqliteStore};
 pub use platform::usn::{
     diag_usn_follow, diag_usn_touch, diag_usn_variants, journal_status, recent_changes,
