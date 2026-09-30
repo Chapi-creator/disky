@@ -18,14 +18,9 @@
 use std::collections::HashMap;
 
 use super::mft::MftError;
-use super::PlatformError;
+use super::{win32_code, PlatformError, VolumeHandle};
 use crate::domain::usn::{
     attach_paths, parse_usn_batch, parse_usn_records, paths_needed, JournalChange, JournalRecord,
-};
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
-use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Ioctl::{
     FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, USN_JOURNAL_DATA_V0,
@@ -69,51 +64,6 @@ pub struct UsnStatus {
     pub max_size: u64,
 }
 
-/// Handle de volumen con cierre automático (RAII).
-struct VolumeHandle(HANDLE);
-
-impl VolumeHandle {
-    /// Abre el volumen con acceso cero (ver docs del módulo).
-    ///
-    /// # Errors
-    /// [`PlatformError::WindowsApi`] si Windows rechaza la apertura.
-    fn open(letter: char) -> Result<Self, PlatformError> {
-        let device = format!(r"\\.\{letter}:");
-        let wide: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
-        let handle = unsafe {
-            CreateFileW(
-                PCWSTR(wide.as_ptr()),
-                GENERIC_READ.0, // los FSCTL exigen acceso de lectura al volumen
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                None, // sin template
-            )
-        }
-        .map_err(|e| PlatformError::WindowsApi {
-            letter: letter.to_string(),
-            code: win32_code(&e),
-        })?;
-        Ok(Self(handle))
-    }
-}
-
-impl Drop for VolumeHandle {
-    fn drop(&mut self) {
-        // Best-effort: si falla, el SO cierra el handle al morir el proceso.
-        let _ = unsafe { CloseHandle(self.0) };
-    }
-}
-
-/// Traduce el código de un `windows::core::Error` (HRESULT) al número Win32.
-/// Los HRESULT de error Win32 son `0x8007xxxx`; `xxxx` es el código original.
-#[allow(clippy::cast_sign_loss)] // la palabra baja de un HRESULT de error es >= 0
-fn win32_code(err: &windows::core::Error) -> u32 {
-    (err.code().0 & 0xFFFF) as u32
-}
-
-/// Convierte el tamaño de un buffer pequeño a `u32` para la API Win32.
 /// Los buffers de este módulo son ≤ 256 KiB, así que nunca trunca.
 #[allow(clippy::cast_possible_truncation)]
 fn len_u32(bytes_len: usize) -> u32 {
@@ -249,29 +199,44 @@ pub fn recent_records(
     let handle = VolumeHandle::open(letter)?;
     let status = query_status(&handle, letter)?;
 
-    // Nunca pedir por debajo de first_usn: el kernel rechazaría la lectura. El
-    // retroceso es lo que cabe en el buffer: pedir una ventana más grande que el
-    // buffer de salida devolvería el tramo MÁS ANTIGUO de la ventana, no el más
-    // reciente (el lote avanza desde `start_usn` hasta llenar el buffer).
-    let back = i64::try_from(READ_BUFFER_BYTES).unwrap_or(i64::MAX);
-    let start_usn = status.first_usn.max(status.next_usn.saturating_sub(back));
-    let input = pack_read_request(status.journal_id, start_usn);
-    let mut records = read_journal_raw(&handle, letter, &input, READ_BUFFER_BYTES)?;
-    if records.len() > max_records {
-        let drop_count = records.len() - max_records;
-        records.drain(..drop_count);
+    // El kernel solo acepta como StartUsn un límite devuelto por él (FirstUsn
+    // o el NextUsn de una lectura previa): un punto arbitrario en mitad del
+    // journal falla con 87. Se avanza desde FirstUsn siguiendo NextUsn y se
+    // conserva solo la cola reciente.
+    let mut start_usn = status.first_usn;
+    let mut recent: std::collections::VecDeque<JournalRecord> = std::collections::VecDeque::new();
+    // Cota de seguridad: el journal cabe en (tamaño / buffer) lotes; más allá
+    // algo no avanza y hay que parar igual.
+    for _ in 0..4096 {
+        let input = pack_read_request(status.journal_id, start_usn);
+        let (next_usn, batch) = read_journal_batch(&handle, letter, &input, READ_BUFFER_BYTES)?;
+        for record in batch {
+            if recent.len() >= max_records.saturating_mul(2).max(2) {
+                recent.pop_front();
+            }
+            recent.push_back(record);
+        }
+        if next_usn <= start_usn || start_usn >= status.next_usn {
+            break;
+        }
+        start_usn = next_usn;
     }
-    Ok(records)
+    let drop_count = recent.len().saturating_sub(max_records);
+    for _ in 0..drop_count {
+        recent.pop_front();
+    }
+    Ok(recent.into())
 }
 
-/// Ejecuta `FSCTL_READ_USN_JOURNAL` con un input ya empaquetado y devuelve los
-/// registros parseados. El `out_len` dimensiona el buffer de salida.
-fn read_journal_raw(
+/// Ejecuta `FSCTL_READ_USN_JOURNAL` con un input ya empaquetado y devuelve el
+/// `NextUsn` del lote más los registros parseados. El `out_len` dimensiona el
+/// buffer de salida.
+fn read_journal_batch(
     handle: &VolumeHandle,
     letter: char,
     input: &[u8],
     out_len: usize,
-) -> Result<Vec<JournalRecord>, PlatformError> {
+) -> Result<(i64, Vec<JournalRecord>), PlatformError> {
     let mut out = vec![0u8; out_len];
     let mut returned = 0u32;
 
@@ -294,7 +259,18 @@ fn read_journal_raw(
 
     // Solo los bytes que el kernel realmente escribió; el resto es relleno.
     let written = (returned as usize).min(out.len());
-    Ok(parse_usn_batch(&out[..written]).1)
+    Ok(parse_usn_batch(&out[..written]))
+}
+
+/// Ejecuta `FSCTL_READ_USN_JOURNAL` con un input ya empaquetado y devuelve los
+/// registros parseados. El `out_len` dimensiona el buffer de salida.
+fn read_journal_raw(
+    handle: &VolumeHandle,
+    letter: char,
+    input: &[u8],
+    out_len: usize,
+) -> Result<Vec<JournalRecord>, PlatformError> {
+    read_journal_batch(handle, letter, input, out_len).map(|(_, records)| records)
 }
 
 /// Diagnóstico de un `FSCTL_READ_USN_JOURNAL` rebelde: el kernel no dice QUÉ
@@ -477,6 +453,13 @@ mod tests {
     #![allow(clippy::expect_used, clippy::format_push_string, clippy::panic)]
 
     use super::*;
+    // Solo el diagnóstico `try_enum` abre el volumen a mano (el resto usa el
+    // `VolumeHandle` compartido de `platform`).
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
 
     /// El kernel exige el struct completo (56 bytes): con 48 devolvía 1784
     /// (`INVALID_USER_BUFFER`) en cada consulta del panel «¿Qué cambió?».

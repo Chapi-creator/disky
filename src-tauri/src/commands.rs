@@ -299,38 +299,54 @@ pub fn scan_all_start(window: tauri::Window, state: State<'_, AppState>) -> Resu
 
     let handle = window.app_handle().clone();
     std::thread::spawn(move || {
-        // State<'_> no puede cruzar al hilo: se re-deriva del handle.
-        let state = handle.state::<AppState>();
-        for (i, root) in fixed.iter().enumerate() {
-            if state.cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let _ = handle.emit(
-                "scan-all-unit",
-                ScanAllUnit {
-                    letter: root.clone(),
-                    index: i + 1,
-                    total: fixed.len(),
-                },
-            );
-            let (snapshot, largest, error) = perform_scan(&handle, &state, root);
-            // El evento por unidad: el frontend refresca lo acumulado.
-            let growth = if snapshot.is_some() {
-                compute_growth_root(&state, root)
-            } else {
-                None
-            };
-            emit_done(&handle, snapshot, growth, largest, error.clone());
-            if error.is_some() {
-                // Falla o cancelación de la unidad: se continúa con la siguiente
-                // salvo que se haya pedido cancelar.
-                if state.cancel.load(Ordering::Relaxed) {
-                    break;
+        guard_scan_thread(
+            || {
+                // State<'_> no puede cruzar al hilo: se re-deriva del handle.
+                let state = handle.state::<AppState>();
+                for (i, root) in fixed.iter().enumerate() {
+                    if state.cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = handle.emit(
+                        "scan-all-unit",
+                        ScanAllUnit {
+                            letter: root.clone(),
+                            index: i + 1,
+                            total: fixed.len(),
+                        },
+                    );
+                    let (snapshot, largest, error) = perform_scan(&handle, &state, root);
+                    // El evento por unidad: el frontend refresca lo acumulado.
+                    let growth = if snapshot.is_some() {
+                        compute_growth_root(&state, root)
+                    } else {
+                        None
+                    };
+                    emit_done(&handle, snapshot, growth, largest, error.clone());
+                    if error.is_some() {
+                        // Falla o cancelación de la unidad: se continúa con la siguiente
+                        // salvo que se haya pedido cancelar.
+                        if state.cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
                 }
-            }
-        }
-        let _ = handle.emit("scan-all-done", ());
-        state.scanning.store(false, Ordering::SeqCst);
+                let _ = handle.emit("scan-all-done", ());
+                state.scanning.store(false, Ordering::SeqCst);
+            },
+            || {
+                let state = handle.state::<AppState>();
+                state.scanning.store(false, Ordering::SeqCst);
+                emit_done(
+                    &handle,
+                    None,
+                    None,
+                    Vec::new(),
+                    Some("El escaneo se interrumpió por un error interno".into()),
+                );
+                let _ = handle.emit("scan-all-done", ());
+            },
+        );
     });
     Ok(())
 }
@@ -373,7 +389,23 @@ pub fn scan_start(
     let root = normalize_path_separators(&path.display().to_string());
 
     let handle = window.app_handle().clone();
-    std::thread::spawn(move || run_scan(handle, root));
+    std::thread::spawn(move || {
+        let handle2 = handle.clone();
+        guard_scan_thread(
+            move || run_scan(handle, root),
+            || {
+                let state = handle2.state::<AppState>();
+                state.scanning.store(false, Ordering::SeqCst);
+                emit_done(
+                    &handle2,
+                    None,
+                    None,
+                    Vec::new(),
+                    Some("El escaneo se interrumpió por un error interno".into()),
+                );
+            },
+        );
+    });
     Ok(())
 }
 
@@ -708,12 +740,26 @@ pub fn usn_changes_start(
 
     let handle = window.app_handle().clone();
     std::thread::spawn(move || {
-        let state = handle.state::<AppState>();
-        match read_changes(&letter) {
-            Ok(changes) => emit_usn(&handle, &letter, changes, None),
-            Err(message) => emit_usn(&handle, &letter, Vec::new(), Some(message)),
-        }
-        state.usn_reading.store(false, Ordering::SeqCst);
+        guard_scan_thread(
+            || {
+                let state = handle.state::<AppState>();
+                match read_changes(&letter) {
+                    Ok(changes) => emit_usn(&handle, &letter, changes, None),
+                    Err(message) => emit_usn(&handle, &letter, Vec::new(), Some(message)),
+                }
+                state.usn_reading.store(false, Ordering::SeqCst);
+            },
+            || {
+                let state = handle.state::<AppState>();
+                state.usn_reading.store(false, Ordering::SeqCst);
+                emit_usn(
+                    &handle,
+                    &letter,
+                    Vec::new(),
+                    Some("La consulta se interrumpió por un error interno".into()),
+                );
+            },
+        );
     });
     Ok(())
 }
@@ -1034,6 +1080,19 @@ impl fmt::Display for ScanError {
 /// Directorios por lote al escribir el snapshot (compromiso latencia/memoria).
 const DIR_BATCH: usize = 512;
 
+/// Envuelve el cuerpo de un hilo de escaneo capturando pánicos: un hilo muerto
+/// sin avisar deja su flag en `true` y la UI rechaza todo hasta reiniciar.
+/// Con esto, el peor caso es un error visible en vez de una UI clavada.
+///
+/// `AssertUnwindSafe`: tras un pánico el estado compartido puede quedar tocado,
+/// pero aquí solo se resetea un flag y se emite un error; el store envenenado
+/// ya lo recupera `lock_store` con `into_inner`.
+fn guard_scan_thread(body: impl FnOnce(), on_panic: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err() {
+        on_panic();
+    }
+}
+
 fn run_scan(handle: AppHandle, root: String) {
     let state = handle.state::<AppState>();
     let (snapshot, largest, error) = perform_scan(&handle, &state, &root);
@@ -1134,54 +1193,66 @@ pub fn scan_quick_start(
     let handle = window.app_handle().clone();
 
     std::thread::spawn(move || {
-        let state = handle.state::<AppState>();
+        guard_scan_thread(
+            || {
+                let state = handle.state::<AppState>();
 
-        let Some(exe) = std::env::current_exe().ok() else {
-            state.scanning.store(false, Ordering::SeqCst);
-            emit_quick_error(&handle, "No se pudo ubicar el ejecutable de disky".into());
-            return;
-        };
+                let Some(exe) = std::env::current_exe().ok() else {
+                    state.scanning.store(false, Ordering::SeqCst);
+                    emit_quick_error(&handle, "No se pudo ubicar el ejecutable de disky".into());
+                    return;
+                };
 
-        // Archivo temporal único para esta corrida.
-        let out_path = elevated_out_path("quick", "json");
-        // El centinela solo existe si el usuario pulsa Cancelar: el hijo lo
-        // sondea y aborta por su cuenta.
-        let cancel_path = elevated_out_path("quick-cancel", "flag");
-        let args = format!(
-            "--elevated-scan {} --out {} --db {} --cancel-file {}",
-            quote_arg(&root),
-            quote_arg(&out_path.display().to_string()),
-            quote_arg(&state.db_path.display().to_string()),
-            quote_arg(&cancel_path.display().to_string()),
+                // Archivo temporal único para esta corrida.
+                let out_path = elevated_out_path("quick", "json");
+                // El centinela solo existe si el usuario pulsa Cancelar: el hijo lo
+                // sondea y aborta por su cuenta.
+                let cancel_path = elevated_out_path("quick-cancel", "flag");
+                let args = format!(
+                    "--elevated-scan {} --out {} --db {} --cancel-file {}",
+                    quote_arg(&root),
+                    quote_arg(&out_path.display().to_string()),
+                    quote_arg(&state.db_path.display().to_string()),
+                    quote_arg(&cancel_path.display().to_string()),
+                );
+                state.set_elevated_sentinel(Some(cancel_path.clone()));
+
+                let launch = disky_core::platform::elevate::run_elevated(&exe, &args, &mut || {});
+                state.set_elevated_sentinel(None);
+                let _ = std::fs::remove_file(&cancel_path);
+
+                match launch {
+                    Ok(()) => finish_quick_scan(&handle, &state, &root, &out_path),
+                    Err(disky_core::platform::elevate::ElevateError::Cancelled) => {
+                        emit_quick_error(&handle, "Elevación cancelada por el usuario".into());
+                    }
+                    Err(err) => {
+                        // El hijo a veces deja el JSON con el motivo real (exit 2):
+                        // priorizar ese detalle sobre "código de salida N".
+                        let detail = std::fs::read_to_string(&out_path)
+                            .ok()
+                            .and_then(|s| serde_json::from_str::<ElevatedJson>(&s).ok())
+                            .and_then(|j| j.error)
+                            .filter(|s| !s.trim().is_empty());
+                        let _ = std::fs::remove_file(&out_path);
+                        let msg = detail.unwrap_or_else(|| err.to_string());
+                        emit_quick_error(&handle, msg);
+                    }
+                }
+                // Liberar recién tras procesar el resultado: si se liberaba antes, el
+                // usuario podía lanzar un segundo escaneo mientras este se leía (doble
+                // escritura en la BD → SQLITE_BUSY espurio).
+                state.scanning.store(false, Ordering::SeqCst);
+            },
+            || {
+                let state = handle.state::<AppState>();
+                state.scanning.store(false, Ordering::SeqCst);
+                emit_quick_error(
+                    &handle,
+                    "El escaneo se interrumpió por un error interno".into(),
+                );
+            },
         );
-        state.set_elevated_sentinel(Some(cancel_path.clone()));
-
-        let launch = disky_core::platform::elevate::run_elevated(&exe, &args, &mut || {});
-        state.set_elevated_sentinel(None);
-        let _ = std::fs::remove_file(&cancel_path);
-
-        match launch {
-            Ok(()) => finish_quick_scan(&handle, &state, &root, &out_path),
-            Err(disky_core::platform::elevate::ElevateError::Cancelled) => {
-                emit_quick_error(&handle, "Elevación cancelada por el usuario".into());
-            }
-            Err(err) => {
-                // El hijo a veces deja el JSON con el motivo real (exit 2):
-                // priorizar ese detalle sobre "código de salida N".
-                let detail = std::fs::read_to_string(&out_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<ElevatedJson>(&s).ok())
-                    .and_then(|j| j.error)
-                    .filter(|s| !s.trim().is_empty());
-                let _ = std::fs::remove_file(&out_path);
-                let msg = detail.unwrap_or_else(|| err.to_string());
-                emit_quick_error(&handle, msg);
-            }
-        }
-        // Liberar recién tras procesar el resultado: si se liberaba antes, el
-        // usuario podía lanzar un segundo escaneo mientras este se leía (doble
-        // escritura en la BD → SQLITE_BUSY espurio).
-        state.scanning.store(false, Ordering::SeqCst);
     });
     Ok(())
 }
@@ -1279,6 +1350,7 @@ fn elevated_out_path(tag: &str, ext: &str) -> PathBuf {
 /// # Errors
 /// `String` si ya hay un escaneo en curso o no hay unidades fijas.
 #[tauri::command]
+#[allow(clippy::too_many_lines)] // orquesta un hilo con polling, drenaje y limpieza; partirlo oscurecería el flujo
 pub fn scan_all_elevated_start(
     window: tauri::Window,
     state: State<'_, AppState>,
@@ -1304,85 +1376,101 @@ pub fn scan_all_elevated_start(
 
     let handle = window.app_handle().clone();
     std::thread::spawn(move || {
-        let state = handle.state::<AppState>();
-        let Some(exe) = std::env::current_exe().ok() else {
-            state.scanning.store(false, Ordering::SeqCst);
-            let _ = handle.emit(
-                "scan-done",
-                ScanDonePayload {
-                    snapshot: None,
-                    growth: None,
-                    largest: Vec::new(),
-                    error: Some("No se pudo ubicar el ejecutable de disky".into()),
-                },
-            );
-            let _ = handle.emit("scan-all-done", ());
-            return;
-        };
+        guard_scan_thread(
+            || {
+                let state = handle.state::<AppState>();
+                let Some(exe) = std::env::current_exe().ok() else {
+                    state.scanning.store(false, Ordering::SeqCst);
+                    let _ = handle.emit(
+                        "scan-done",
+                        ScanDonePayload {
+                            snapshot: None,
+                            growth: None,
+                            largest: Vec::new(),
+                            error: Some("No se pudo ubicar el ejecutable de disky".into()),
+                        },
+                    );
+                    let _ = handle.emit("scan-all-done", ());
+                    return;
+                };
 
-        let out_path = elevated_out_path("all", "jsonl");
-        let cancel_path = elevated_out_path("all-cancel", "flag");
-        let args = format!(
-            "--elevated-scan-all --out {} --db {} --cancel-file {}",
-            quote_arg(&out_path.display().to_string()),
-            quote_arg(&state.db_path.display().to_string()),
-            quote_arg(&cancel_path.display().to_string()),
-        );
-        state.set_elevated_sentinel(Some(cancel_path.clone()));
+                let out_path = elevated_out_path("all", "jsonl");
+                let cancel_path = elevated_out_path("all-cancel", "flag");
+                let args = format!(
+                    "--elevated-scan-all --out {} --db {} --cancel-file {}",
+                    quote_arg(&out_path.display().to_string()),
+                    quote_arg(&state.db_path.display().to_string()),
+                    quote_arg(&cancel_path.display().to_string()),
+                );
+                state.set_elevated_sentinel(Some(cancel_path.clone()));
 
-        let total = fixed.len();
-        let mut pending = String::new();
-        let mut done_units = 0usize;
-        // Cuántos bytes del JSONL del hijo ya se copiaron a `pending`.
-        let mut read_offset = 0usize;
-        // Antes del UAC: la primera unidad ya está "en curso" para la UI.
-        let _ = handle.emit(
-            "scan-all-unit",
-            ScanAllUnit {
-                letter: fixed[0].clone(),
-                index: 1,
-                total,
+                let total = fixed.len();
+                let mut pending = String::new();
+                let mut done_units = 0usize;
+                // Cuántos bytes del JSONL del hijo ya se copiaron a `pending`.
+                let mut read_offset = 0usize;
+                // Antes del UAC: la primera unidad ya está "en curso" para la UI.
+                let _ = handle.emit(
+                    "scan-all-unit",
+                    ScanAllUnit {
+                        letter: fixed[0].clone(),
+                        index: 1,
+                        total,
+                    },
+                );
+
+                let mut tick = || {
+                    // El hijo solo añade al JSONL (append), así que basta con copiar los
+                    // bytes nuevos: releer el archivo entero reemitiría unidades ya
+                    // procesadas.
+                    if let Ok(bytes) = std::fs::read(&out_path) {
+                        append_new_bytes(&bytes, &mut read_offset, &mut pending);
+                        drain_unit_lines(&mut pending, &handle, &state, &fixed, &mut done_units);
+                    }
+                };
+                let launch = disky_core::platform::elevate::run_elevated(&exe, &args, &mut tick);
+                state.set_elevated_sentinel(None);
+                let _ = std::fs::remove_file(&cancel_path);
+
+                // Última pasada con un salto de línea forzado: si el hijo murió entre
+                // el `write` y el `flush` de la última unidad, su línea no contaría.
+                pending.push('\n');
+                drain_unit_lines(&mut pending, &handle, &state, &fixed, &mut done_units);
+                let _ = std::fs::remove_file(&out_path);
+
+                if let Err(err) = launch {
+                    let msg = match err {
+                        disky_core::platform::elevate::ElevateError::Cancelled => {
+                            "Elevación cancelada por el usuario".to_owned()
+                        }
+                        other => other.to_string(),
+                    };
+                    let _ = handle.emit(
+                        "scan-done",
+                        ScanDonePayload {
+                            snapshot: None,
+                            growth: None,
+                            largest: Vec::new(),
+                            error: Some(msg),
+                        },
+                    );
+                }
+                let _ = handle.emit("scan-all-done", ());
+                state.scanning.store(false, Ordering::SeqCst);
+            },
+            || {
+                let state = handle.state::<AppState>();
+                state.scanning.store(false, Ordering::SeqCst);
+                emit_done(
+                    &handle,
+                    None,
+                    None,
+                    Vec::new(),
+                    Some("El escaneo se interrumpió por un error interno".into()),
+                );
+                let _ = handle.emit("scan-all-done", ());
             },
         );
-
-        let mut tick = || {
-            // El hijo solo añade al JSONL (append), así que basta con copiar los
-            // bytes nuevos: releer el archivo entero reemitiría unidades ya
-            // procesadas.
-            if let Ok(bytes) = std::fs::read(&out_path) {
-                append_new_bytes(&bytes, &mut read_offset, &mut pending);
-                drain_unit_lines(&mut pending, &handle, &state, &fixed, &mut done_units);
-            }
-        };
-        let launch = disky_core::platform::elevate::run_elevated(&exe, &args, &mut tick);
-        state.set_elevated_sentinel(None);
-        let _ = std::fs::remove_file(&cancel_path);
-
-        // Última pasada con un salto de línea forzado: si el hijo murió entre
-        // el `write` y el `flush` de la última unidad, su línea no contaría.
-        pending.push('\n');
-        drain_unit_lines(&mut pending, &handle, &state, &fixed, &mut done_units);
-        let _ = std::fs::remove_file(&out_path);
-
-        if let Err(err) = launch {
-            let msg = match err {
-                disky_core::platform::elevate::ElevateError::Cancelled => {
-                    "Elevación cancelada por el usuario".to_owned()
-                }
-                other => other.to_string(),
-            };
-            let _ = handle.emit(
-                "scan-done",
-                ScanDonePayload {
-                    snapshot: None,
-                    growth: None,
-                    largest: Vec::new(),
-                    error: Some(msg),
-                },
-            );
-        }
-        let _ = handle.emit("scan-all-done", ());
-        state.scanning.store(false, Ordering::SeqCst);
     });
     Ok(())
 }

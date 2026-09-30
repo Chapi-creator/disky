@@ -4,6 +4,11 @@
 //! (`windows` crate, user-mode, sin admin) y una banda neutral para tests/CI.
 
 use crate::domain::{DriveKind, Volume};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
 
 pub mod elevate;
 pub mod mft;
@@ -43,6 +48,54 @@ pub fn drive_letter(letter: &str) -> Result<char, PlatformError> {
         }
     }
     Err(PlatformError::InvalidDriveLetter(letter.to_owned()))
+}
+
+/// Handle de volumen (`\\.\C:`) con cierre automático (RAII).
+///
+/// Compartido por [`mft`](mft/index.html) y [`usn`](usn/index.html): abrir con
+/// `GENERIC_READ` exige elevación, y los FSCTL exigen ese acceso.
+pub(crate) struct VolumeHandle(pub(crate) HANDLE);
+
+impl VolumeHandle {
+    /// Abre el volumen con acceso de lectura.
+    ///
+    /// # Errors
+    /// [`PlatformError::WindowsApi`] si Windows rechaza la apertura (p. ej.
+    /// error 5 sin elevación).
+    pub(crate) fn open(letter: char) -> Result<Self, PlatformError> {
+        let device = format!(r"\\.\{letter}:");
+        let wide: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                GENERIC_READ.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        }
+        .map_err(|e| PlatformError::WindowsApi {
+            letter: letter.to_string(),
+            code: win32_code(&e),
+        })?;
+        Ok(Self(handle))
+    }
+}
+
+impl Drop for VolumeHandle {
+    fn drop(&mut self) {
+        // Best-effort: si falla, el SO cierra el handle al morir el proceso.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Traduce el código de un `windows::core::Error` (HRESULT) al número Win32.
+/// Los HRESULT de error Win32 son `0x8007xxxx`; `xxxx` es el código original.
+#[allow(clippy::cast_sign_loss)] // la palabra baja de un HRESULT de error es >= 0
+pub(crate) fn win32_code(err: &windows::core::Error) -> u32 {
+    (err.code().0 & 0xFFFF) as u32
 }
 
 /// Enumera los volúmenes montados con letra de unidad (`C:`, `D:`, ...).

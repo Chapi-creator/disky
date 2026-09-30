@@ -32,15 +32,11 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
-use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
-};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Storage::FileSystem::{ReadFile, FILE_BEGIN};
 use windows::Win32::System::IO::OVERLAPPED;
 
-use super::PlatformError;
+use super::{win32_code, PlatformError, VolumeHandle};
 use crate::domain::scan::{
     DirStat, LargestFile, ScanProgress, ScanTotals, BIG_FILE_BYTES, BIG_FILE_MAX,
 };
@@ -124,45 +120,6 @@ pub enum MftError {
     /// Windows rechazó una operación.
     #[error("error de Windows: {0}")]
     Windows(#[from] PlatformError),
-}
-
-/// Traduce el código de un `windows::core::Error` (HRESULT) al número Win32.
-/// Los HRESULT de error Win32 son `0x8007xxxx`; `xxxx` es el código original.
-#[allow(clippy::cast_sign_loss)] // la palabra baja de un HRESULT de error es >= 0
-fn win32_code(err: &windows::core::Error) -> u32 {
-    (err.code().0 & 0xFFFF) as u32
-}
-
-/// Handle de volumen con cierre automático.
-struct VolumeHandle(HANDLE);
-
-impl VolumeHandle {
-    fn open(letter: char) -> Result<Self, PlatformError> {
-        let device = format!(r"\\.\{letter}:");
-        let wide: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
-        let handle = unsafe {
-            CreateFileW(
-                PCWSTR(wide.as_ptr()),
-                GENERIC_READ.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                None,
-            )
-        }
-        .map_err(|e| PlatformError::WindowsApi {
-            letter: letter.to_string(),
-            code: win32_code(&e),
-        })?;
-        Ok(Self(handle))
-    }
-}
-
-impl Drop for VolumeHandle {
-    fn drop(&mut self) {
-        let _ = unsafe { CloseHandle(self.0) };
-    }
 }
 
 /// Lee exactamente `buf.len()` bytes del volumen desde `offset` (posición
