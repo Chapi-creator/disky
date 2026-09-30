@@ -499,7 +499,9 @@ pub fn elevated_usn(letter: &str, out: &str, limit: usize) -> i32 {
 #[must_use]
 pub fn elevated_diag_usn(letter: &str, out: &str) -> i32 {
     let letter = letter.chars().next().unwrap_or('C');
-    let variants = disky_core::diag_usn_variants(letter);
+    let mut variants = disky_core::diag_usn_variants(letter);
+    variants.extend(disky_core::diag_usn_follow(letter));
+    variants.extend(disky_core::diag_usn_touch(letter));
     let rows: Vec<serde_json::Value> = variants
         .iter()
         .map(|(name, result)| serde_json::json!({"variant": name, "result": result}))

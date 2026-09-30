@@ -209,7 +209,7 @@ pub fn recent_records(
     // algo no avanza y hay que parar igual.
     for _ in 0..4096 {
         let input = pack_read_request(status.journal_id, start_usn);
-        let (next_usn, batch) = read_journal_batch(&handle, letter, &input, READ_BUFFER_BYTES)?;
+        let (next_usn, _, batch) = read_journal_batch(&handle, letter, &input, READ_BUFFER_BYTES)?;
         for record in batch {
             if recent.len() >= max_records.saturating_mul(2).max(2) {
                 recent.pop_front();
@@ -236,7 +236,7 @@ fn read_journal_batch(
     letter: char,
     input: &[u8],
     out_len: usize,
-) -> Result<(i64, Vec<JournalRecord>), PlatformError> {
+) -> Result<(i64, usize, Vec<JournalRecord>), PlatformError> {
     let mut out = vec![0u8; out_len];
     let mut returned = 0u32;
 
@@ -259,7 +259,113 @@ fn read_journal_batch(
 
     // Solo los bytes que el kernel realmente escribió; el resto es relleno.
     let written = (returned as usize).min(out.len());
-    Ok(parse_usn_batch(&out[..written]))
+    let (next_usn, records) = parse_usn_batch(&out[..written]);
+    Ok((next_usn, written, records))
+}
+
+/// Sigue la cola del journal desde `FirstUsn` encadenando `NextUsn`, y reporta
+/// cada salto como `start->next:written:parsed`. Diagnostica si el kernel no
+/// escribe nada o si el parseo pierde registros reales (los tests sintéticos
+/// no cubren el layout de un volumen de verdad).
+#[must_use]
+pub fn diag_usn_follow(letter: char) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let handle = match VolumeHandle::open(letter) {
+        Ok(handle) => handle,
+        Err(error) => {
+            out.push(("follow_open".to_owned(), format!("err:{error}")));
+            return out;
+        }
+    };
+    let status = match query_status(&handle, letter) {
+        Ok(status) => status,
+        Err(error) => {
+            out.push(("follow_query".to_owned(), format!("err:{error}")));
+            return out;
+        }
+    };
+    let mut start_usn = status.first_usn;
+    for hop in 0..40 {
+        let input = pack_read_request(status.journal_id, start_usn);
+        match read_journal_batch(&handle, letter, &input, READ_BUFFER_BYTES) {
+            Ok((next_usn, written, records)) => {
+                out.push((
+                    format!("follow_hop{hop}"),
+                    format!(
+                        "start={start_usn} next={next_usn} written={written} parsed={}",
+                        records.len()
+                    ),
+                ));
+                if next_usn <= start_usn || start_usn >= status.next_usn {
+                    break;
+                }
+                start_usn = next_usn;
+            }
+            Err(error) => {
+                out.push((format!("follow_hop{hop}"), format!("err:{error}")));
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Prueba de ida y vuelta con datos reales: anota el `NextUsn`, toca un
+/// archivo temporal del volumen (crear+escribir+renombrar+borrar generan
+/// registros sí o sí) y lee desde el `NextUsn` anotado, que es un límite
+/// válido devuelto por el kernel. Si esto vuelve vacío, el parseo no entiende
+/// los registros reales.
+#[must_use]
+pub fn diag_usn_touch(letter: char) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let status = match journal_status(&letter.to_string()) {
+        Ok(status) => status,
+        Err(error) => {
+            out.push(("touch_query".to_owned(), format!("err:{error}")));
+            return out;
+        }
+    };
+    let anchor = status.next_usn;
+    let dir = std::env::temp_dir();
+    let base = format!(
+        "disky-touch-{}-{}",
+        std::process::id(),
+        anchor.cast_unsigned()
+    );
+    let path_a = dir.join(format!("{base}-a.tmp"));
+    let path_b = dir.join(format!("{base}-b.tmp"));
+    let touched = std::fs::write(&path_a, vec![0xAB; 4096])
+        .and_then(|()| std::fs::rename(&path_a, &path_b))
+        .and_then(|()| std::fs::remove_file(&path_b))
+        .is_ok();
+    out.push(("touch_fs".to_owned(), format!("ok:{touched}")));
+    let handle = match VolumeHandle::open(letter) {
+        Ok(handle) => handle,
+        Err(error) => {
+            out.push(("touch_open".to_owned(), format!("err:{error}")));
+            return out;
+        }
+    };
+    let input = pack_read_request(status.journal_id, anchor);
+    match read_journal_batch(&handle, letter, &input, READ_BUFFER_BYTES) {
+        Ok((next_usn, written, records)) => {
+            use std::fmt::Write as _;
+            let mut summary = format!(
+                "anchor={anchor} next={next_usn} written={written} parsed={}",
+                records.len()
+            );
+            for record in records.iter().take(8) {
+                let _ = write!(
+                    summary,
+                    " | {}:{:?}",
+                    record.file_name, record.reason_labels
+                );
+            }
+            out.push(("touch_read".to_owned(), summary));
+        }
+        Err(error) => out.push(("touch_read".to_owned(), format!("err:{error}"))),
+    }
+    out
 }
 
 /// Ejecuta `FSCTL_READ_USN_JOURNAL` con un input ya empaquetado y devuelve los
@@ -270,7 +376,7 @@ fn read_journal_raw(
     input: &[u8],
     out_len: usize,
 ) -> Result<Vec<JournalRecord>, PlatformError> {
-    read_journal_batch(handle, letter, input, out_len).map(|(_, records)| records)
+    read_journal_batch(handle, letter, input, out_len).map(|(_, _, records)| records)
 }
 
 /// Diagnóstico de un `FSCTL_READ_USN_JOURNAL` rebelde: el kernel no dice QUÉ
