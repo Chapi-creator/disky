@@ -644,7 +644,7 @@ pub fn mft_scan(
 pub fn resolve_paths(letter: char, frns: &[u64]) -> Result<HashMap<u64, String>, MftError> {
     let cancel = AtomicBool::new(false);
     let (entries, children, _read_errors) = read_mft_index(letter, &cancel)?;
-    let dirs = dir_paths(ROOT_FRN, &format!("{letter}:\\"), &entries, &children);
+    let dirs = dir_paths(NTFS_ROOT_FRN, &format!("{letter}:\\"), &entries, &children);
 
     let mut out = HashMap::new();
     for &frn in frns {
@@ -705,9 +705,6 @@ fn dir_paths(
     }
     dir_info
 }
-
-/// FRN de la raíz del volumen: 5 es el well-known "root directory" de NTFS.
-const ROOT_FRN: u64 = 5;
 
 /// Rutas absolutas, acumulación hijo→padre (post-orden) y emisión de
 /// [`DirStat`]. Separado de [`mft_scan`] para mantenerlo legible.
@@ -1124,15 +1121,18 @@ mod tests {
     }
 
     /// Contrato del escaneo de volumen completo (el uso real de [`mft_scan`]):
-    /// con `start_frn = ROOT_FRN` y `start_path = "C:\\"` la raíz se etiqueta
+    /// con `start_frn = NTFS_ROOT_FRN` y `start_path = "C:\\"` la raíz se etiqueta
     /// `C:\\` y los hijos cuelgan con una sola barra (`crate::platform::path_norm`
     /// nunca debe ver `C:\\Usuarios` duplicado).
     #[test]
     fn dir_paths_from_volume_root_does_not_duplicate_root() {
         let (entries, children) = sample_index();
-        let dirs = dir_paths(ROOT_FRN, "C:\\", &entries, &children);
+        let dirs = dir_paths(NTFS_ROOT_FRN, "C:\\", &entries, &children);
 
-        assert_eq!(dirs.get(&ROOT_FRN).map(|(p, _)| p.as_str()), Some("C:\\"));
+        assert_eq!(
+            dirs.get(&NTFS_ROOT_FRN).map(|(p, _)| p.as_str()),
+            Some("C:\\")
+        );
         assert_eq!(dirs.get(&12).map(|(p, _)| p.as_str()), Some("C:\\Usuarios"));
     }
 

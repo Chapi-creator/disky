@@ -134,8 +134,10 @@ D:       Fija   Datos      1.2 TB / 1.8 TB    67%
   snapshot en SQLite. Muestra progreso en vivo y se puede **cancelar** sin
   dejar rastro (el snapshot nunca se llega a guardar a medias).
 - **Escaneo rápido (admin)**: Windows pide el permiso UAC y disky se relanza
-  elevado para leer también las carpetas protegidas del sistema. No muestra
-  progreso ni se puede cancelar mientras corre (dura poco).
+  elevado para leer también las carpetas protegidas del sistema. El modo de
+  una carpeta no muestra progreso (indexar el `$MFT` tarda minutos); el de
+  todas las unidades avisa unidad a unidad. Ambos se pueden **cancelar**
+  (tarda unos segundos en detener la unidad en curso).
 - Las carpetas sin permiso **no abortan nada**: se cuentan como *errores de
   lectura* y aparecen en la tabla de escaneos guardados.
 - Se conservan los **últimos 10 escaneos por raíz**; los más viejos se podan
