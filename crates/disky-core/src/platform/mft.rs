@@ -624,12 +624,54 @@ fn postorder_dirs(
 /// si una resolución vacía es "volumen ilegible" (ceros) o "rutas que no
 /// casan" (millones). Lo consume el modo `--elevated-diag-usn`.
 ///
+/// Devuelve `entries=X children=Y errors=Z boot={mft_lcn,cluster,record}
+/// runs=[(lcn,clusters)..] runhex=<> magic=<>`: con eso se ve si los extents
+/// apuntan a otra parte del disco (runs basura) o si los chunks no traen
+/// registros `FILE` (lecturas de ceros).
+///
 /// # Errors
 /// [`MftError`] si la unidad no se puede indexar.
-pub fn diag_mft_index(letter: char) -> Result<(usize, usize, u64), MftError> {
+pub fn diag_mft_index(letter: char) -> Result<String, MftError> {
+    use std::fmt::Write as _;
     let cancel = AtomicBool::new(false);
-    read_mft_index(letter, &cancel)
-        .map(|(entries, children, errors)| (entries.len(), children.len(), errors))
+    let handle = VolumeHandle::open(letter).map_err(MftError::from)?;
+    let boot = read_boot_sector(&handle)?;
+    let info = parse_boot(&boot).ok_or(MftError::NotNtfs)?;
+    let mft_base = info.mft_lcn.saturating_mul(info.cluster_bytes);
+    let mut rec0 = vec![0u8; info.record_size];
+    read_at(handle.0, mft_base, &mut rec0).map_err(MftError::from)?;
+    let extents = mft_extents(&rec0)?;
+    let mut detail = format!(
+        "boot={{mft_lcn={} cluster={} record={}}} runs={:?} ",
+        info.mft_lcn, info.cluster_bytes, info.record_size, extents
+    );
+    // Primeros 64 bytes del primer extent: ¿hay un registro FILE ahí?
+    if let Some((lcn, _)) = extents.first() {
+        let mut probe = vec![0u8; 64];
+        let start = lcn.saturating_mul(info.cluster_bytes);
+        if read_at(handle.0, start, &mut probe).is_ok() {
+            let hex: String = probe
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = write!(
+                detail,
+                "probe_lcn={lcn} magic={} head[{hex}]",
+                probe[0..4] == *b"FILE"
+            );
+        } else {
+            let _ = write!(detail, "probe_lcn={lcn} READ_FAIL");
+        }
+    }
+    let (entries, children, errors) = read_mft_index(letter, &cancel)?;
+    let _ = write!(
+        detail,
+        " entries={} children={} read_errors={errors}",
+        entries.len(),
+        children.len()
+    );
+    Ok(detail)
 }
 
 /// Resuelve la ruta absoluta de cada FRN pedido leyendo el índice de la MFT.
