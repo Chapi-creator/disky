@@ -227,23 +227,14 @@ struct VolumeScan {
 /// lo que hay en memoria son 512 filas, no el snapshot entero.
 const DIR_BATCH: usize = 512;
 
-/// ¿Es `path` la raíz de un volumen (`C:\`) y no una subcarpeta?
-///
-/// `Path::parent` devuelve `None` justo cuando la ruta termina en la raíz o el
-/// prefijo (`C:\`, `\`, `\\servidor\recurso\`); cualquier subcarpeta tiene
-/// padre.
-fn is_volume_root(path: &std::path::Path) -> bool {
-    path.parent().is_none()
-}
-
 /// Escanea una unidad y deja su snapshot guardado en `store`.
 ///
 /// Los directorios se persisten en lotes de [`DIR_BATCH`] mientras llegan. La
 /// atomicidad la garantiza el `ROLLBACK` del writer si no se llega a `finish`,
 /// así que un fallo a mitad no deja rastro parcial.
 ///
-/// El MFT es más rápido y corre en el proceso elevado; si el volumen no es
-/// NTFS (o el formato sorprende) se cae al walker, que siempre funciona.
+/// Siempre walker (ver comentario en el cuerpo): el MFT-direct no da tamaños
+/// fiables en volúmenes reales.
 fn scan_one_volume(
     root: &str,
     store: &mut disky_core::SqliteStore,
@@ -283,52 +274,16 @@ fn scan_one_volume(
         }
     };
 
-    let totals = if is_volume_root(&root_path) {
-        log.write("antes de mft_scan");
-        match disky_core::mft_scan(&root_path, cancel, &mut push, &mut |_| {}) {
-            // Un `Ok` sin carpetas no es un escaneo: es la lectura del `$MFT`
-            // que volvió en blanco. Antes se aceptaba igual y el guard final
-            // descartaba el snapshot, que es justo «el modo admin no hace
-            // nada». Se trata como un fallo del MFT y se cae al walker.
-            Ok(totals) if totals.collected_nothing() => {
-                log.write("mft_scan sin carpetas; fallback a walker");
-                match disky_core::walk_tree(&root_path, cancel, &mut push, &mut |_| {}) {
-                    Ok(totals) => totals,
-                    Err(_) if cancel.load(std::sync::atomic::Ordering::Relaxed) => {
-                        return Err("Escaneo cancelado".into());
-                    }
-                    Err(walk_err) => {
-                        return Err(format!(
-                            "El MFT no devolvió ninguna carpeta (walk: {walk_err})"
-                        ));
-                    }
-                }
-            }
-            Ok(totals) => {
-                log.write("mft_scan OK");
-                totals
-            }
-            // Cancelación real: caer al walker solo repetiría el mismo error.
-            Err(disky_core::MftError::Cancelled) => return Err("Escaneo cancelado".into()),
-            Err(e) => {
-                // Los directorios que el MFT alcanzó a escribir los reemite el
-                // walker y `dirs` es PRIMARY KEY: el REPLACE los pisa.
-                let err_label = e.to_string();
-                log.write(&format!("mft_scan: {err_label}; fallback a walker"));
-                match disky_core::walk_tree(&root_path, cancel, &mut push, &mut |_| {}) {
-                    Ok(totals) => totals,
-                    // Cancelado: no adornar el error con el fallo del MFT.
-                    Err(_) if cancel.load(std::sync::atomic::Ordering::Relaxed) => {
-                        return Err("Escaneo cancelado".into());
-                    }
-                    Err(walk_err) => return Err(format!("{err_label} (walk: {walk_err})")),
-                }
-            }
-        }
-    } else {
-        // El MFT solo indexa la unidad entera: escanear una subcarpeta con él
-        // daría el volumen completo y costaría lo mismo. Para subrutas, walker.
-        log.write("subruta: solo walker");
+    let totals = {
+        // Siempre walker, también en raíces y elevado: el MFT-direct da la
+        // estructura perfecta (nombres, jerarquía) pero sus tamaños vienen
+        // rancios del disco en volúmenes reales (ceros y exabytes con nombres
+        // bien), y un snapshot con totales mal envenena crecimiento/treemap.
+        // El walker lee por API del sistema (coherente con el Explorador) y en
+        // caliente tarda ~30 s por C:. El índice MFT se sigue usando para
+        // resolver rutas del USN (nombres y padres, verificados perfectos) y
+        // vive cubierto por tests + diag.
+        log.write("walker");
         match disky_core::walk_tree(&root_path, cancel, &mut push, &mut |_| {}) {
             Ok(totals) => totals,
             Err(_) if cancel.load(std::sync::atomic::Ordering::Relaxed) => {
@@ -577,18 +532,4 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_volume_root;
-
-    #[test]
-    fn volume_root_detection_separates_unit_from_subfolder() {
-        // El MFT solo tiene sentido en la raíz: en una subcarpeta indexaría la
-        // unidad entera.
-        assert!(is_volume_root(std::path::Path::new(r"C:\")));
-        assert!(!is_volume_root(std::path::Path::new(r"C:\Users\Breiner")));
-        assert!(!is_volume_root(std::path::Path::new(r"D:\Datos\cosas")));
-    }
 }

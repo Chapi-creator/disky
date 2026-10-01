@@ -84,12 +84,16 @@ icono y el banner se generan de la misma geometría con
   esquema versionado (`user_version = 3`).
 - ✅ **Diff "¿qué creció?"**: comparación de los dos snapshots de una raíz vía
   `match_by_path` + `growth_ranking` (las mismas funciones puras del dominio).
-### Escaneo rápido con UAC (lectura vía MFT)
+### Escaneo rápido con UAC (walker elevado)
 
-El escaneo completo se relanza a sí mismo elevado (`--elevated-scan`) y lee el
-**`$MFT` del volumen** (rápido, cubre carpetas protegidas); si el volumen no es
-NTFS o el formato sorprende, cae al walker sin admin. El snapshot se guarda
-desde el hijo y el resultado se reporta por JSON. Los **cambios recientes del
+El escaneo completo se relanza a sí mismo elevado (`--elevated-scan`) para leer
+también las carpetas protegidas del sistema. Usa siempre el walker (no el
+`$MFT` directo): en volúmenes reales los tamaños del MFT vienen rancios del
+disco (ceros y basura con nombres bien) y un snapshot así envenenaría el
+crecimiento y el treemap. El índice MFT sí se usa para reconstruir rutas del
+journal (nombres y padres, verificados perfectos). Si el volumen no es NTFS o
+el formato sorprende, cae al walker sin admin. El snapshot se guarda desde el
+hijo y el resultado se reporta por JSON. Los **cambios recientes del
 journal** (`$UsnJrnl`) se consultan a demanda desde el panel «¿Qué cambió?». El
 lector elevado reconstruye la ruta desde la MFT (ver «Panel USN» arriba).
 - ✅ **Drill-down**: clic en cualquier carpeta del ranking para ver el crecimiento
