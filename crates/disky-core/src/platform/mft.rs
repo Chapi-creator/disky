@@ -798,6 +798,18 @@ pub fn diag_mft_value(letter: char, needle: &str) -> Result<String, MftError> {
                 let _ = write!(out, "fn{n_fn}[{value_off}+{value_len}][{hex}] ");
             }
         }
+        if attr_type == ATTR_DATA && rec[off + 9] == 0 {
+            // Primeros 72 bytes del $DATA del stream por defecto: con eso se
+            // ve dónde viven Alloc/Real/Init de verdad.
+            if let Some(hdr) = rec.get(off..off + 72) {
+                let hex: String = hdr
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let _ = write!(out, "data[{hex}] ");
+            }
+        }
         off += attr_len;
     }
     if n_fn == 0 {
