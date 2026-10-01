@@ -45,7 +45,8 @@ fn main() {
     if args.iter().any(|a| a == "--elevated-diag-usn") {
         let letter = arg_value(slice, "--elevated-diag-usn").unwrap_or_default();
         let out = arg_value(slice, "--out").unwrap_or_default();
-        std::process::exit(disky_lib::elevated_diag_usn(letter, out));
+        let needle = arg_value(slice, "--needle").unwrap_or("widevinecdm.dll.sig");
+        std::process::exit(disky_lib::elevated_diag_usn(letter, out, needle));
     }
 
     if args.iter().any(|a| a == "--elevated-scan") {

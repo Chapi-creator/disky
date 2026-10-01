@@ -497,7 +497,7 @@ pub fn elevated_usn(letter: &str, out: &str, limit: usize) -> i32 {
 /// resultados. El kernel no dice QUÉ parámetro rechaza con el 87, así que se
 /// prueban todos y se lee cuál pasa.
 #[must_use]
-pub fn elevated_diag_usn(letter: &str, out: &str) -> i32 {
+pub fn elevated_diag_usn(letter: &str, out: &str, needle: &str) -> i32 {
     let letter = letter.chars().next().unwrap_or('C');
     let mut variants = disky_core::diag_usn_variants(letter);
     variants.extend(disky_core::diag_usn_follow(letter));
@@ -506,8 +506,8 @@ pub fn elevated_diag_usn(letter: &str, out: &str) -> i32 {
         Ok(detail) => variants.push(("mft_index".to_owned(), detail)),
         Err(error) => variants.push(("mft_index".to_owned(), format!("err:{error}"))),
     }
-    // Archivo de tamaño conocido (1389 bytes): calibre para el campo size.
-    match disky_core::diag_mft_value(letter, "widevinecdm.dll.sig") {
+    // Archivo testigo para el campo size (se pasa por --needle).
+    match disky_core::diag_mft_value(letter, needle) {
         Ok(detail) => variants.push(("mft_value".to_owned(), detail)),
         Err(error) => variants.push(("mft_value".to_owned(), format!("err:{error}"))),
     }
