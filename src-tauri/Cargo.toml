@@ -31,6 +31,7 @@ workspace = true
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+embed-resource = "3"
 
 [dependencies]
 disky-core = { path = "../crates/disky-core" }

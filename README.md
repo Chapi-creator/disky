@@ -429,14 +429,13 @@ no lleva manifiesto, Windows lo ata a `comctl32.dll` v5, y como
 `TaskDialogIndirect` solo existe en la v6 el harness no llega a arrancar:
 `STATUS_ENTRYPOINT_NOT_FOUND` (0xc0000139) nada más lanzarlo.
 
-El enlace se hace con `cargo:rustc-link-arg` (todos los targets) y no con
-`rustc-link-arg-tests`: esa directiva solo alcanza a los tests de integración,
-no a los unitarios de la lib, que son justo los que crashean. A cambio el
-binario recibe el recurso dos veces (`-bins` de `tauri-build` más el arg), pero
-es el MISMO archivo: el merge del linker deja cada manifiesto, icono y versión
-una vez y solo emite un aviso de recursos duplicados. El harness de test del
-binario va desactivado (`[[bin]] test = false`, no tiene tests propios) para no
-sumar un duplicado extra por ahí; los tests viven en la lib y en `tests/`.
+El manifiesto viaja aparte (`app-manifest.rc`, solo manifiesto, enlazado en
+todos los targets): `tauri-build` aporta iconos y versión SIN manifiesto
+(`new_without_app_manifest`), así cada binario enlaza cada tipo de recurso una
+sola vez. La vía anterior (el `.rsrc` completo de Tauri también en los tests)
+duplicaba VERSION y tumbaba a MSVC nuevos (CVT1100 + LNK1123; en GNU solo
+avisaba). El harness de test del binario va desactivado (`[[bin]] test =
+false`, no tiene tests propios); los tests viven en la lib y en `tests/`.
 Releases (`.github/workflows/release.yml`): tag `v*` → instaladores NSIS/MSI
 adjuntos a la GitHub Release, junto con los `.sig` y el `latest.json` que
 consume el auto-actualizador.

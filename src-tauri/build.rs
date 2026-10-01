@@ -1,43 +1,34 @@
 //! Build script de Tauri: genera el contexto de la app e integra recursos.
+//!
+//! Reparto de recursos (una sola copia por binario): `tauri-build` embebe
+//! iconos y versión sin manifiesto, y este script compila `app-manifest.rc`
+//! (solo manifiesto comctl32 v6, copia exacta del que trae Tauri) enlazado en
+//! todos los targets. Así el binario suma tipos distintos y los tests obtienen
+//! el manifiesto que necesitan para no morir con `STATUS_ENTRYPOINT_NOT_FOUND`
+//! (comctl32 v5 no exporta `TaskDialogIndirect`). Pasar el `.rsrc` completo de
+//! Tauri a todos los targets duplicaba VERSION y tumbaba a MSVC nuevos
+//! (CVT1100 + LNK1123).
 
 fn main() {
-    tauri_build::build();
-    link_tests_with_app_resource();
+    build_tauri_without_manifest();
+    link_manifest_everywhere();
 }
 
-/// Enlaza en los binarios de test el mismo `.rsrc` (manifiesto, iconos, versión)
-/// que `tauri-build` embebe en los binarios de la aplicación.
-///
-/// Sin ese recurso el proceso de test no lleva manifiesto, así que Windows lo
-/// ata a `comctl32.dll` v5 (`System32`), que no exporta `TaskDialogIndirect`:
-/// cargarlo es `STATUS_ENTRYPOINT_NOT_FOUND` (0xc0000139) y el harness de tests
-/// no llega a arrancar («process didn't exit successfully»). El binario de la
-/// app no lo sufre porque sí lleva el manifiesto de Common Controls v6. Aquí
-/// solo se enlaza el recurso ya compilado, de modo que el manifiesto es
-/// exactamente el mismo que el de la app.
-fn link_tests_with_app_resource() {
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
+/// Corre `tauri-build` con codegen/capacidades/iconos/versión pero SIN el
+/// manifiesto (ya lo aporta `link_manifest_everywhere`).
+fn build_tauri_without_manifest() {
+    let attrs = tauri_build::Attributes::new()
+        .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
+    if tauri_build::try_build(attrs).is_err() {
+        // Si la variante falla por lo que sea, comportamiento histórico exacto.
+        tauri_build::build();
     }
-    let Ok(out_dir) = std::env::var("OUT_DIR") else {
-        return;
-    };
-    // `embed-resource` nombra el recurso según la cadena de herramientas: objeto
-    // COFF con nombre de archivo `.a` en GNU, biblioteca en MSVC.
-    let resource = ["libresource.a", "resource.lib", "resource.o"]
-        .iter()
-        .map(|name| std::path::Path::new(&out_dir).join(name))
-        .find(|path| path.exists());
-    // `rustc-link-arg` (todos los targets) y no `rustc-link-arg-tests`: esta
-    // última solo alcanza a los tests de integración, no a los unitarios de la
-    // lib, que son justo los que crashean sin manifiesto. El binario recibe el
-    // recurso dos veces (`-bins` de `tauri-build` + este arg), pero es el MISMO
-    // archivo, así que el merge del linker deja el manifiesto correcto y solo
-    // emite un aviso de recursos duplicados.
-    match resource {
-        Some(path) => println!("cargo:rustc-link-arg={}", path.display()),
-        None => println!(
-            "cargo:warning=no se encontró el recurso de la app; los tests pueden no arrancar en Windows"
-        ),
+}
+
+/// Compila `app-manifest.rc` y lo enlaza en todos los targets (bins, libs y
+/// tests). Solo en Windows: en otros SO no hay manifiestos ni comctl32.
+fn link_manifest_everywhere() {
+    if std::env::var("TARGET").is_ok_and(|target| target.contains("windows")) {
+        let _ = embed_resource::compile_for_everything("app-manifest.rc", embed_resource::NONE);
     }
 }
