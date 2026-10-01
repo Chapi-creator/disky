@@ -315,8 +315,9 @@ fn parse_record(raw: &[u8], this_frn: u64) -> Option<FileRecord> {
                         s.try_into().unwrap_or([0; 4]),
                     )));
                 }
-            } else if let Some(s) = attr.get(0x30..0x38) {
-                // No-residente: RealSize.
+            } else if let Some(s) = attr.get(0x2C..0x34) {
+                // No-residente: RealSize (estructuras en disco empaquetadas,
+                // sin padding: va justo tras CompressionUnit).
                 data_size = Some(u64::from_le_bytes(s.try_into().unwrap_or([0; 8])));
             }
         }
@@ -1145,6 +1146,41 @@ mod tests {
         raw[0x58 + 0x30..0x58 + 0x38].copy_from_slice(&le_u64(999_999_999));
         let rec = parse_record(&raw, 106).expect("registro con $DATA");
         assert_eq!(rec.size, 1_000);
+    }
+
+    /// `$DATA` no-residente: el `RealSize` va en [0x2C..0x34] (estructuras en
+    /// disco empaquetadas, sin padding). Leerlo en [0x30..0x38] daba basura
+    /// determinista en casi todos los archivos grandes.
+    #[test]
+    fn nonresident_data_size_uses_packed_offsets() {
+        let raw = fake_record(NTFS_ROOT_FRN, "g.bin", false, 0, 0);
+        // Localizar el $DATA residente del fake para sustituirlo por uno
+        // no-residente de 64 bytes con RealSize conocido.
+        let mut off = 0x40usize;
+        let data_off = loop {
+            let attr_type = u32::from_le_bytes(raw[off..off + 4].try_into().expect("tipo de attr"));
+            assert_ne!(attr_type, ATTR_END, "el fake debe traer $DATA");
+            let attr_len =
+                u32::from_le_bytes(raw[off + 4..off + 8].try_into().expect("len")) as usize;
+            if attr_type == ATTR_DATA {
+                break off;
+            }
+            off += attr_len;
+        };
+        let mut raw2 = Vec::with_capacity(raw.len() + 64);
+        raw2.extend_from_slice(&raw[..data_off]);
+        let mut attr = vec![0u8; 64];
+        attr[0..4].copy_from_slice(&le_u32(ATTR_DATA));
+        attr[4..8].copy_from_slice(&le_u32(64));
+        attr[8] = 1; // no-residente
+        attr[0x2C..0x34].copy_from_slice(&le_u64(77_000_000)); // RealSize
+        raw2.extend_from_slice(&attr);
+        raw2.extend_from_slice(&raw[data_off + 0x18..]);
+        let used = u32::try_from(raw2.len()).unwrap_or(u32::MAX);
+        raw2[0x18..0x1C].copy_from_slice(&le_u32(used));
+
+        let rec = parse_record(&raw2, 107).expect("registro con $DATA no-residente");
+        assert_eq!(rec.size, 77_000_000);
     }
 
     #[test]
