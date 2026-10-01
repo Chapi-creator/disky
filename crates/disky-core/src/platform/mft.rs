@@ -695,6 +695,89 @@ pub fn diag_mft_index(letter: char) -> Result<String, MftError> {
     Ok(detail)
 }
 
+/// Vuelca el valor `$FILE_NAME` crudo del primer registro cuyo nombre contenga
+/// `needle`, con la tupla parseada. Diagnostica campos que decodifican mal
+/// (p. ej. tamaños basura con nombres bien) comparando contra el archivo real.
+///
+/// # Errors
+/// [`MftError`] si la unidad no se puede indexar o leer.
+pub fn diag_mft_value(letter: char, needle: &str) -> Result<String, MftError> {
+    use std::fmt::Write as _;
+    let cancel = AtomicBool::new(false);
+    let (entries, _, _) = read_mft_index(letter, &cancel)?;
+    let needle_lower = needle.to_lowercase();
+    let found = entries
+        .iter()
+        .find(|(_, e)| e.name.to_lowercase().contains(&needle_lower));
+    let Some((frn, entry)) = found else {
+        return Ok(format!("sin coincidencias para `{needle}`"));
+    };
+    let mut out = format!(
+        "frn={frn} parsed={{parent={} size={} mtime={} name={}}} ",
+        entry.parent_frn, entry.size, entry.mtime_unix, entry.name
+    );
+    // FRN -> offset en disco caminando los runs (VCN denso del $MFT).
+    let handle = VolumeHandle::open(letter).map_err(MftError::from)?;
+    let boot = read_boot_sector(&handle)?;
+    let info = parse_boot(&boot).ok_or(MftError::NotNtfs)?;
+    let mft_base = info.mft_lcn.saturating_mul(info.cluster_bytes);
+    let mut rec0 = vec![0u8; info.record_size];
+    read_at(handle.0, mft_base, &mut rec0).map_err(MftError::from)?;
+    let extents = mft_extents(&rec0)?;
+    let mut target = frn.saturating_mul(info.record_size as u64);
+    let mut disk_off = None;
+    for (lcn, clusters) in &extents {
+        let run_bytes = clusters.saturating_mul(info.cluster_bytes);
+        if target < run_bytes {
+            disk_off = Some(lcn.saturating_mul(info.cluster_bytes) + target);
+            break;
+        }
+        target = target.saturating_sub(run_bytes);
+    }
+    let Some(disk_off) = disk_off else {
+        return Ok(format!("{out} FRN fuera de los extents"));
+    };
+    let mut rec = vec![0u8; info.record_size];
+    read_at(handle.0, disk_off, &mut rec).map_err(MftError::from)?;
+    // Primer atributo $FILE_NAME residente del registro.
+    let used = u32::from_le_bytes(rec[0x18..0x1C].try_into().unwrap_or([0; 4])) as usize;
+    let mut off = usize::from(u16::from_le_bytes(
+        rec[0x14..0x16].try_into().unwrap_or([0; 2]),
+    ));
+    let end = used.min(rec.len());
+    while off + 8 <= end {
+        let attr_type = u32::from_le_bytes(rec[off..off + 4].try_into().unwrap_or([0; 4]));
+        if attr_type == ATTR_END || attr_type == 0 {
+            break;
+        }
+        let attr_len =
+            u32::from_le_bytes(rec[off + 4..off + 8].try_into().unwrap_or([0; 4])) as usize;
+        if attr_len < 16 || off + attr_len > end {
+            break;
+        }
+        if attr_type == ATTR_FILE_NAME && rec[off + 8] == 0 {
+            let value_off = usize::from(u16::from_le_bytes(
+                rec[off + 0x14..off + 0x16].try_into().unwrap_or([0; 2]),
+            ));
+            let value_len =
+                u32::from_le_bytes(rec[off + 0x10..off + 0x14].try_into().unwrap_or([0; 4]))
+                    as usize;
+            if let Some(value) = rec.get(off + value_off..off + value_off + value_len) {
+                let hex: String = value
+                    .iter()
+                    .take(96)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let _ = write!(out, "value[{value_off}+{value_len}][{hex}]");
+                return Ok(out);
+            }
+        }
+        off += attr_len;
+    }
+    Ok(format!("{out} sin $FILE_NAME residente"))
+}
+
 /// Resuelve la ruta absoluta de cada FRN pedido leyendo el índice de la MFT.
 ///
 /// El USN Journal solo da FRN + nombre; para saber *dónde* está algo hay que

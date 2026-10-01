@@ -506,6 +506,11 @@ pub fn elevated_diag_usn(letter: &str, out: &str) -> i32 {
         Ok(detail) => variants.push(("mft_index".to_owned(), detail)),
         Err(error) => variants.push(("mft_index".to_owned(), format!("err:{error}"))),
     }
+    // Archivo de tamaño conocido (1389 bytes): calibre para el campo size.
+    match disky_core::diag_mft_value(letter, "widevinecdm.dll.sig") {
+        Ok(detail) => variants.push(("mft_value".to_owned(), detail)),
+        Err(error) => variants.push(("mft_value".to_owned(), format!("err:{error}"))),
+    }
     let rows: Vec<serde_json::Value> = variants
         .iter()
         .map(|(name, result)| serde_json::json!({"variant": name, "result": result}))
