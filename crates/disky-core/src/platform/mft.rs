@@ -739,7 +739,10 @@ pub fn diag_mft_value(letter: char, needle: &str) -> Result<String, MftError> {
     };
     let mut rec = vec![0u8; info.record_size];
     read_at(handle.0, disk_off, &mut rec).map_err(MftError::from)?;
-    // Primer atributo $FILE_NAME residente del registro.
+    // Todos los atributos $FILE_NAME residentes: si DOS y Win32 difieren en
+    // tamaños, el `best` puede estar mezclando (aunque no debería: es atómico
+    // por atributo).
+    let mut n_fn = 0usize;
     let used = u32::from_le_bytes(rec[0x18..0x1C].try_into().unwrap_or([0; 4])) as usize;
     let mut off = usize::from(u16::from_le_bytes(
         rec[0x14..0x16].try_into().unwrap_or([0; 2]),
@@ -763,19 +766,23 @@ pub fn diag_mft_value(letter: char, needle: &str) -> Result<String, MftError> {
                 u32::from_le_bytes(rec[off + 0x10..off + 0x14].try_into().unwrap_or([0; 4]))
                     as usize;
             if let Some(value) = rec.get(off + value_off..off + value_off + value_len) {
+                n_fn += 1;
                 let hex: String = value
                     .iter()
-                    .take(96)
+                    .take(104)
                     .map(|b| format!("{b:02x}"))
                     .collect::<Vec<_>>()
                     .join(" ");
-                let _ = write!(out, "value[{value_off}+{value_len}][{hex}]");
-                return Ok(out);
+                let _ = write!(out, "fn{n_fn}[{value_off}+{value_len}][{hex}] ");
             }
         }
         off += attr_len;
     }
-    Ok(format!("{out} sin $FILE_NAME residente"))
+    if n_fn == 0 {
+        Ok(format!("{out} sin $FILE_NAME residente"))
+    } else {
+        Ok(out)
+    }
 }
 
 /// Resuelve la ruta absoluta de cada FRN pedido leyendo el índice de la MFT.
