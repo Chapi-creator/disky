@@ -286,6 +286,10 @@ fn parse_record(raw: &[u8], this_frn: u64) -> Option<FileRecord> {
     let end = used.min(raw.len());
 
     let mut best: Option<(u8, String, u64, u64, i64)> = None; // ns, name, parent, size, mtime
+                                                              // Tamaño autoritativo del stream por defecto: $FILE_NAME puede llevar
+                                                              // tamaños viejos (el kernel sirve el corriente por $DATA/$SI), así que si
+                                                              // hay $DATA manda él.
+    let mut data_size: Option<u64> = None;
 
     let mut off = first_attr;
     // Los atributos terminan en `$END` (0xFFFFFFFF) o en ceros de relleno.
@@ -301,16 +305,30 @@ fn parse_record(raw: &[u8], this_frn: u64) -> Option<FileRecord> {
         let attr = &raw[off..off + attr_len];
         if attr_type == ATTR_FILE_NAME {
             consider_file_name(attr, &mut best);
+        } else if attr_type == ATTR_DATA && attr.get(9) == Some(&0) && data_size.is_none() {
+            // Solo el stream por defecto (sin nombre): los ADS como
+            // Zone.Identifier no cuentan como tamaño del archivo.
+            if attr.get(8) == Some(&0) {
+                // Residente: ContentSize.
+                if let Some(s) = attr.get(0x10..0x14) {
+                    data_size = Some(u64::from(u32::from_le_bytes(
+                        s.try_into().unwrap_or([0; 4]),
+                    )));
+                }
+            } else if let Some(s) = attr.get(0x30..0x38) {
+                // No-residente: RealSize.
+                data_size = Some(u64::from_le_bytes(s.try_into().unwrap_or([0; 8])));
+            }
         }
         off += attr_len;
     }
 
-    let (_, name, parent_frn, size, mtime_unix) = best?;
+    let (_, name, parent_frn, file_size, mtime_unix) = best?;
     Some(FileRecord {
         parent_frn,
         name,
         is_dir,
-        size,
+        size: data_size.unwrap_or(file_size),
         mtime_unix,
     })
 }
@@ -989,12 +1007,15 @@ mod tests {
     const FILETIME_FOR_UNIX: i64 = (1_650_000_000 + 11_644_473_600) * 10_000_000;
 
     /// Construye un `FILE_RECORD` sintético con un atributo `$FILE_NAME` en el
-    /// layout real (nombres en [0x42..], tamaño real en [0x30..0x38]).
+    /// layout real (nombres en [0x42..], tamaño real en [0x30..0x38]) más un
+    /// `$DATA` residente cuyo `ContentSize` manda (es la fuente autoritativa).
     fn fake_record(parent: u64, name: &str, is_dir: bool, size: u64, mtime: i64) -> Vec<u8> {
         let name_u16: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
         let value_len = 0x42 + name_u16.len();
         let attr_len = 0x18 + value_len;
-        let record_size = 0x40 + attr_len + 4;
+        // $DATA residente vacío de contenido pero con ContentSize = size.
+        let data_len = 0x18usize;
+        let record_size = 0x40 + attr_len + data_len + 4;
         let mut raw = vec![0u8; record_size];
 
         raw[0..4].copy_from_slice(b"FILE");
@@ -1021,6 +1042,18 @@ mod tests {
         raw[v + 0x40] = (name_u16.len() / 2) as u8;
         raw[v + 0x41] = 1; // Win32
         raw[v + 0x42..v + 0x42 + name_u16.len()].copy_from_slice(&name_u16);
+        if !is_dir {
+            // $DATA residente del stream por defecto: su ContentSize manda
+            // sobre el tamaño del $FILE_NAME (que puede ir viejo). Sin
+            // contenido: el parser solo lee la cabecera.
+            let off2 = off + attr_len;
+            raw[off2..off2 + 4].copy_from_slice(&le_u32(ATTR_DATA));
+            raw[off2 + 4..off2 + 8].copy_from_slice(&le_u32(data_len as u32));
+            raw[off2 + 8] = 0; // residente
+            raw[off2 + 0x10..off2 + 0x14].copy_from_slice(&le_u32(size as u32));
+            raw[off2 + 0x14..off2 + 0x16].copy_from_slice(&le_u16(0x18));
+            raw[off2 + data_len..off2 + data_len + 4].copy_from_slice(&le_u32(ATTR_END));
+        }
         raw
     }
 
@@ -1100,6 +1133,18 @@ mod tests {
         let mut raw2 = fake_record(NTFS_ROOT_FRN, "base", false, 10, 0);
         raw2[0x20..0x28].copy_from_slice(&le_u64(42)); // base ajena: extensión
         assert_eq!(parse_record(&raw2, 103), None);
+    }
+
+    /// El tamaño autoritativo vive en el `$DATA`: un `$FILE_NAME` con tamaños
+    /// viejos (pasa en volúmenes reales) no debe imponerse.
+    #[test]
+    fn data_size_wins_over_stale_file_name() {
+        let mut raw = fake_record(NTFS_ROOT_FRN, "f.txt", false, 1_000, 0);
+        // Corromper el RealSize del $FILE_NAME (valor en v+0x30, con v=0x58):
+        // el parseado debe seguir dando el ContentSize del $DATA.
+        raw[0x58 + 0x30..0x58 + 0x38].copy_from_slice(&le_u64(999_999_999));
+        let rec = parse_record(&raw, 106).expect("registro con $DATA");
+        assert_eq!(rec.size, 1_000);
     }
 
     #[test]
