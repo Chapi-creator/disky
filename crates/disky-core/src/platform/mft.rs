@@ -760,8 +760,10 @@ pub fn diag_mft_value(letter: char, needle: &str) -> Result<String, MftError> {
     read_at(handle.0, disk_off, &mut rec).map_err(MftError::from)?;
     // Todos los atributos $FILE_NAME residentes: si DOS y Win32 difieren en
     // tamaños, el `best` puede estar mezclando (aunque no debería: es atómico
-    // por atributo).
+    // por atributo). Además se vuelca el mapa (tipo, len, flags) de TODOS los
+    // atributos para ver si el recorrido se desinca antes del $DATA.
     let mut n_fn = 0usize;
+    let mut attrmap = String::new();
     let used = u32::from_le_bytes(rec[0x18..0x1C].try_into().unwrap_or([0; 4])) as usize;
     let mut off = usize::from(u16::from_le_bytes(
         rec[0x14..0x16].try_into().unwrap_or([0; 2]),
@@ -777,6 +779,7 @@ pub fn diag_mft_value(letter: char, needle: &str) -> Result<String, MftError> {
         if attr_len < 16 || off + attr_len > end {
             break;
         }
+        let _ = write!(attrmap, "[{:x}:{}:{}]", attr_type, attr_len, rec[off + 8]);
         if attr_type == ATTR_FILE_NAME && rec[off + 8] == 0 {
             let value_off = usize::from(u16::from_le_bytes(
                 rec[off + 0x14..off + 0x16].try_into().unwrap_or([0; 2]),
@@ -800,6 +803,7 @@ pub fn diag_mft_value(letter: char, needle: &str) -> Result<String, MftError> {
     if n_fn == 0 {
         Ok(format!("{out} sin $FILE_NAME residente"))
     } else {
+        let _ = write!(out, "attrs{attrmap}");
         Ok(out)
     }
 }
