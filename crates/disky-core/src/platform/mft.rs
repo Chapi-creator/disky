@@ -720,14 +720,28 @@ pub fn diag_mft_index(letter: char) -> Result<String, MftError> {
 ///
 /// # Errors
 /// [`MftError`] si la unidad no se puede indexar o leer.
+#[allow(clippy::too_many_lines)] // volcado de diagnóstico: lineal por diseño
 pub fn diag_mft_value(letter: char, needle: &str) -> Result<String, MftError> {
     use std::fmt::Write as _;
     let cancel = AtomicBool::new(false);
-    let (entries, _, _) = read_mft_index(letter, &cancel)?;
+    let (entries, children, _) = read_mft_index(letter, &cancel)?;
     let needle_lower = needle.to_lowercase();
-    let found = entries
-        .iter()
-        .find(|(_, e)| e.name.to_lowercase().contains(&needle_lower));
+    // Con barra es subcadena de RUTA completa (resuelta); sin barra, de nombre.
+    // Hace determinista el diagnóstico cuando hay homónimos en varias carpetas.
+    let found = if needle_lower.contains('\\') {
+        let dirs = dir_paths(NTFS_ROOT_FRN, &format!("{letter}:\\"), &entries, &children);
+        entries.iter().find(|(frn, e)| {
+            dirs.get(frn).is_some_and(|(dir, _)| {
+                format!("{dir}\\{}", e.name)
+                    .to_lowercase()
+                    .contains(&needle_lower)
+            })
+        })
+    } else {
+        entries
+            .iter()
+            .find(|(_, e)| e.name.to_lowercase().contains(&needle_lower))
+    };
     let Some((frn, entry)) = found else {
         return Ok(format!("sin coincidencias para `{needle}`"));
     };
