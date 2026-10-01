@@ -1074,8 +1074,8 @@ async function loadTreemap(folder?: string): Promise<void> {
         aria-label="${escapeHtml(treemapAria(node))}">
         <rect x="${node.x + 1}" y="${node.y + 1}" width="${Math.max(node.w - 2, 0)}" height="${Math.max(node.h - 2, 0)}"
           rx="4" fill="${treemapFill(node.delta_bytes)}" />
-        <text x="${node.x + 8}" y="${node.y + 20}" fill="${COLOR.text}" font-size="13">${escapeHtml(nodeLabel(node))}</text>
-        <text x="${node.x + 8}" y="${node.y + 38}" fill="${COLOR.textDim}" font-size="11">${formatBytes(node.size_bytes)}</text>
+  <text x="${node.x + 8}" y="${node.y + 20}" fill="${COLOR.text}" stroke="rgba(0,0,0,0.6)" stroke-width="3" paint-order="stroke" font-size="13">${escapeHtml(nodeLabel(node))}</text>
+  <text x="${node.x + 8}" y="${node.y + 38}" fill="${COLOR.text}" stroke="rgba(0,0,0,0.6)" stroke-width="3" paint-order="stroke" font-size="11">${formatBytes(node.size_bytes)}</text>
       </g>`,
       )
       .join("");
