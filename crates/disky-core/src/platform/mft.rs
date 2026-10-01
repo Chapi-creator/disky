@@ -731,11 +731,19 @@ pub fn diag_mft_value(letter: char, needle: &str) -> Result<String, MftError> {
     let found = if needle_lower.contains('\\') {
         let dirs = dir_paths(NTFS_ROOT_FRN, &format!("{letter}:\\"), &entries, &children);
         entries.iter().find(|(frn, e)| {
-            dirs.get(frn).is_some_and(|(dir, _)| {
+            // Ruta completa: los directorios ya la traen; los archivos cuelgan
+            // del path de su padre (los FRN de archivo no están en `dirs`).
+            let full = if e.is_dir {
+                match dirs.get(frn) {
+                    Some((p, _)) => p.clone(),
+                    None => e.name.clone(),
+                }
+            } else if let Some((dir, _)) = dirs.get(&e.parent_frn) {
                 format!("{dir}\\{}", e.name)
-                    .to_lowercase()
-                    .contains(&needle_lower)
-            })
+            } else {
+                e.name.clone()
+            };
+            full.to_lowercase().contains(&needle_lower)
         })
     } else {
         entries
